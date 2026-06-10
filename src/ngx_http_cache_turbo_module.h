@@ -47,6 +47,22 @@
  * lock_ttl 5s, stale_mult 4). */
 #define NGX_HTTP_CACHE_TURBO_PRESET_DEFAULT  NGX_HTTP_CACHE_TURBO_PRESET_BALANCED
 
+
+/*
+ * Vary-aware normalize suffix (v3-4). Bitmask in loc_conf.normalize_vary chosen
+ * by `cache_turbo_normalize_vary encoding device`. ENCODING appends an
+ * Accept-Encoding class (br/gzip/identity); DEVICE appends a User-Agent device
+ * class (mobile/desktop). Off by default so v3-1 keys are unchanged.
+ */
+#define NGX_HTTP_CACHE_TURBO_VARY_ENCODING  0x1
+#define NGX_HTTP_CACHE_TURBO_VARY_DEVICE    0x2
+
+/* Worst-case suffix bytes: "\x1Fae=identity" (12) + "\x1Fdev=desktop" (12). The
+ * delimiter is the raw 0x1F (US) byte, which a query string can never contain
+ * (clients percent-encode control bytes), so the suffix cannot collide with a
+ * real arg value. */
+#define NGX_HTTP_CACHE_TURBO_VARY_SUFFIX_MAX  32
+
 /* A preset band: the default value for each preset-controlled knob. */
 typedef struct {
     time_t      valid;       /* fresh TTL (seconds)        */
@@ -158,6 +174,13 @@ typedef struct {
                                                    * deny, added to the built-in
                                                    * defaults; trailing '*' is a
                                                    * prefix match. NULL = none. */
+
+    /* Vary-aware suffix (v3-4). Bitmask of NGX_HTTP_CACHE_TURBO_VARY_* selecting
+     * which buckets are appended to $cache_turbo_normalized_args so responses
+     * that legitimately differ by encoding (br/gzip/identity) or device
+     * (mobile/desktop) get separate cache slots. NGX_CONF_UNSET / 0 = off, so
+     * v3-1 keys are unchanged unless cache_turbo_normalize_vary opts in. */
+    ngx_int_t                normalize_vary;
 } ngx_http_cache_turbo_loc_conf_t;
 
 

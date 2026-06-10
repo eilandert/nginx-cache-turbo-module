@@ -273,6 +273,34 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # Vary-aware suffix (v3-4): a request that differs only by Accept-Encoding
+        # class (br/gzip/identity) gets its own cache slot.
+        location /ve/ {{
+            cache_turbo          main;
+            cache_turbo_key      $uri$cache_turbo_normalized_args;
+            cache_turbo_valid    30s;
+            cache_turbo_normalize_vary encoding;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # device class (mobile/desktop from User-Agent) gets its own slot
+        location /vd/ {{
+            cache_turbo          main;
+            cache_turbo_key      $uri$cache_turbo_normalized_args;
+            cache_turbo_valid    30s;
+            cache_turbo_normalize_vary device;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # both buckets compose: encoding x device = distinct slots
+        location /vb/ {{
+            cache_turbo          main;
+            cache_turbo_key      $uri$cache_turbo_normalized_args;
+            cache_turbo_valid    30s;
+            cache_turbo_normalize_vary encoding device;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # presets (v3-2): one location per preset. Each overrides cache_turbo_valid
         # to 1s so the test runs fast; the only behavioural difference left is the
         # preset-supplied stale multiplier (conservative x2 -> serveable 2s,
@@ -960,6 +988,111 @@ def test_normalize_distinct_args_differ(ng: Nginx, origin: Origin) -> None:
     assert origin.hits == base + 2, "both distinct args should reach origin"
 
 
+# UA strings whose device class is unambiguous for the substring matcher.
+_UA_MOBILE = ("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+              "AppleWebKit/605.1.15 Mobile/15E148 Safari/604.1")
+_UA_DESKTOP = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+               "Chrome/124.0 Safari/537.36")
+
+
+def test_normalize_vary_encoding(ng: Nginx, origin: Origin) -> None:
+    """v3-4: cache_turbo_normalize_vary encoding splits the key by Accept-Encoding
+    CLASS (br/gzip/identity). br and gzip get separate slots (each its own origin
+    fetch); two br requests share one slot. The raw header still collapses to the
+    class, so 'br, deflate' HITs the 'br' entry."""
+    base = origin.hits
+    _, b1, h1 = fetch(ng.port, "/ve/p", headers={"Accept-Encoding": "br"})
+    assert "x-cache" not in h1, "first (br) request should miss to origin"
+    _, b2, h2 = fetch(ng.port, "/ve/p", headers={"Accept-Encoding": "gzip"})
+    assert "x-cache" not in h2, \
+        f"gzip must be a separate slot from br, got X-Cache={h2.get('x-cache')}"
+    assert b2 != b1, "gzip slot served the br body"
+    assert origin.hits == base + 2, "br and gzip should each reach origin once"
+    _, b3, h3 = fetch(ng.port, "/ve/p", headers={"Accept-Encoding": "br, deflate"})
+    assert h3.get("x-cache") == "HIT", \
+        f"second br request should HIT, got X-Cache={h3.get('x-cache')}"
+    assert b3 == b1, "two br requests must share one slot"
+    assert origin.hits == base + 2, "second br request wrongly hit origin"
+
+
+def test_normalize_vary_device(ng: Nginx, origin: Origin) -> None:
+    """v3-4: cache_turbo_normalize_vary device splits the key by User-Agent device
+    class (mobile/desktop). A mobile and a desktop UA get separate slots; a second
+    mobile UA (different mobile token) shares the mobile slot."""
+    base = origin.hits
+    _, b1, h1 = fetch(ng.port, "/vd/p", headers={"User-Agent": _UA_MOBILE})
+    assert "x-cache" not in h1, "first (mobile) request should miss to origin"
+    _, b2, h2 = fetch(ng.port, "/vd/p", headers={"User-Agent": _UA_DESKTOP})
+    assert "x-cache" not in h2, \
+        f"desktop must be a separate slot from mobile, got {h2.get('x-cache')}"
+    assert b2 != b1, "desktop slot served the mobile body"
+    assert origin.hits == base + 2, "mobile and desktop should each reach origin"
+    # a different mobile UA (Android) still classes as mobile -> HIT the slot
+    _, b3, h3 = fetch(ng.port, "/vd/p",
+                      headers={"User-Agent": "Mozilla/5.0 (Linux; Android 13) Mobile"})
+    assert h3.get("x-cache") == "HIT", \
+        f"second mobile UA should HIT the mobile slot, got {h3.get('x-cache')}"
+    assert b3 == b1, "two mobile UAs must share one slot"
+    assert origin.hits == base + 2, "second mobile request wrongly hit origin"
+
+
+def test_normalize_vary_both(ng: Nginx, origin: Origin) -> None:
+    """v3-4: encoding and device compose — (br,mobile) and (gzip,desktop) are two
+    distinct slots, and each repeats as a HIT of its own slot."""
+    base = origin.hits
+    br_mob = {"Accept-Encoding": "br", "User-Agent": _UA_MOBILE}
+    gz_desk = {"Accept-Encoding": "gzip", "User-Agent": _UA_DESKTOP}
+    _, b1, h1 = fetch(ng.port, "/vb/p", headers=br_mob)
+    assert "x-cache" not in h1, "(br,mobile) should miss"
+    _, b2, h2 = fetch(ng.port, "/vb/p", headers=gz_desk)
+    assert "x-cache" not in h2, \
+        f"(gzip,desktop) must be its own slot, got {h2.get('x-cache')}"
+    assert b2 != b1, "(gzip,desktop) served the (br,mobile) body"
+    assert origin.hits == base + 2, "both compose-buckets should reach origin"
+    _, b3, h3 = fetch(ng.port, "/vb/p", headers=br_mob)
+    assert h3.get("x-cache") == "HIT" and b3 == b1, "(br,mobile) repeat should HIT"
+    _, b4, h4 = fetch(ng.port, "/vb/p", headers=gz_desk)
+    assert h4.get("x-cache") == "HIT" and b4 == b2, "(gzip,desktop) repeat should HIT"
+    assert origin.hits == base + 2, "compose-bucket repeats wrongly hit origin"
+
+
+def test_normalize_vary_off_by_default(ng: Nginx, origin: Origin) -> None:
+    """v3-4 regression guard: WITHOUT cache_turbo_normalize_vary (location /n/),
+    differing Accept-Encoding and User-Agent must NOT split the key — the v3-1
+    normalized key is byte-identical, so the second request HITs the first slot."""
+    base = origin.hits
+    _, b1, h1 = fetch(ng.port, "/n/voff",
+                      headers={"Accept-Encoding": "br", "User-Agent": _UA_MOBILE})
+    assert "x-cache" not in h1, "prime should miss to origin"
+    _, b2, h2 = fetch(ng.port, "/n/voff",
+                      headers={"Accept-Encoding": "gzip", "User-Agent": _UA_DESKTOP})
+    assert h2.get("x-cache") == "HIT", \
+        ("vary off: differing encoding/device must still HIT one slot, "
+         f"got X-Cache={h2.get('x-cache')}")
+    assert b2 == b1, "vary off served a different body (key wrongly split)"
+    assert origin.hits == base + 1, "vary off must keep one slot regardless of headers"
+
+
+def test_invalid_normalize_vary_token(ng: Nginx) -> None:
+    """v3-4: an unknown cache_turbo_normalize_vary token is rejected at config
+    time (nginx -t fails) with a clear message, not silently ignored."""
+    bad = ng.root.parent / "bad-vary"
+    (bad / "conf").mkdir(parents=True, exist_ok=True)
+    (bad / "logs").mkdir(parents=True, exist_ok=True)
+    cfg = nginx_config(bad, ng.port, ng.module, ng.origin_port, 1)
+    cfg = cfg.replace("cache_turbo_normalize_vary encoding;",
+                      "cache_turbo_normalize_vary bogus;")
+    (bad / "conf" / "nginx.conf").write_text(cfg, encoding="ascii")
+    cmd = ng.runner + [str(ng.binary), "-p", str(bad),
+                       "-c", str(bad / "conf" / "nginx.conf"), "-t"]
+    r = subprocess.run(cmd, text=True, stdout=subprocess.PIPE,
+                       stderr=subprocess.STDOUT, timeout=20)
+    assert r.returncode != 0, \
+        f"invalid vary token 'bogus' was accepted by nginx -t:\n{r.stdout}"
+    assert "invalid cache_turbo_normalize_vary" in r.stdout, \
+        f"missing/odd diagnostic for bad vary token:\n{r.stdout}"
+
+
 def test_preset_window_differs(ng: Nginx, origin: Origin) -> None:
     """v3-2: a preset sets the stale-window multiplier. With cache_turbo_valid
     pinned to 1s on both locations, the only difference is the preset: the
@@ -1031,6 +1164,11 @@ def run_all(ng: Nginx, origin: Origin,
     test_normalize_strip_custom(ng, origin)
     test_normalize_strip_all(ng, origin)
     test_normalize_distinct_args_differ(ng, origin)
+    test_normalize_vary_encoding(ng, origin)
+    test_normalize_vary_device(ng, origin)
+    test_normalize_vary_both(ng, origin)
+    test_normalize_vary_off_by_default(ng, origin)
+    test_invalid_normalize_vary_token(ng)
     test_preset_window_differs(ng, origin)
     test_invalid_preset_name(ng)
     if redis is not None:
@@ -1085,6 +1223,8 @@ def main() -> int:
           "admin stats/purge/gating, warm (v3-3: populates/multi/no-url), "
           "key normalize (v3-1: order/tracking/"
           "custom-strip/strip-all/distinct), "
+          "vary suffix (v3-4: encoding/device/both/off-by-default, "
+          "invalid-token rejected), "
           "presets (v3-2: conservative/aggressive stale-window differ, "
           "invalid-name rejected)"
           + (", L2 write-through (P4), L2 cross-instance fill (P2), "

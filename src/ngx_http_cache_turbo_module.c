@@ -55,6 +55,8 @@ static ngx_int_t ngx_http_cache_turbo_normalized_args_variable(
     ngx_http_request_t *r, ngx_http_variable_value_t *v, uintptr_t data);
 static char *ngx_http_cache_turbo_normalize_strip(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
+static char *ngx_http_cache_turbo_normalize_vary(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
 static ngx_int_t ngx_http_cache_turbo_init(ngx_conf_t *cf);
 
 
@@ -168,6 +170,13 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
       ngx_conf_set_flag_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_cache_turbo_loc_conf_t, normalize_strip_all),
+      NULL },
+
+    { ngx_string("cache_turbo_normalize_vary"),
+      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_1MORE,
+      ngx_http_cache_turbo_normalize_vary,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0,
       NULL },
 
       ngx_null_command
@@ -1555,12 +1564,135 @@ ngx_http_cache_turbo_tok_cmp(const void *one, const void *two)
 }
 
 
+/* ----- Vary-aware suffix (v3-4) --------------------------------------------- */
+
+/* Accept-Encoding collapsed to a small, stable enum so the cache shards by what
+ * the response actually IS (br/gzip/identity), not by the per-browser raw header.
+ * Priority br > gzip: this mirrors what nginx+brotli/gzip serve when the client
+ * accepts both. Absent/empty header => identity. Case-insensitive substring. */
+static const char *
+ngx_http_cache_turbo_ae_class(ngx_http_request_t *r)
+{
+    ngx_table_elt_t  *ae = r->headers_in.accept_encoding;
+    u_char           *s, *last;
+
+    if (ae == NULL || ae->value.len == 0) {
+        return "identity";
+    }
+
+    s = ae->value.data;
+    last = s + ae->value.len;
+
+    if (ngx_strlcasestrn(s, last, (u_char *) "br", 2 - 1) != NULL) {
+        return "br";
+    }
+    if (ngx_strlcasestrn(s, last, (u_char *) "gzip", 4 - 1) != NULL) {
+        return "gzip";
+    }
+    return "identity";
+}
+
+
+/* Device class from the User-Agent, coarse two-way bucket. Minimal substring
+ * match for the standard mobile UA tokens (no regex: the module builds
+ * --without-http_rewrite_module, no PCRE). Case-insensitive — core only ships a
+ * bounded case-insensitive search (ngx_strlcasestrn); case-folding mobile tokens
+ * is harmless. Tablets fall in desktop by design. */
+static const char *
+ngx_http_cache_turbo_device_class(ngx_http_request_t *r)
+{
+    ngx_table_elt_t  *ua = r->headers_in.user_agent;
+    u_char           *s, *last;
+
+    if (ua == NULL || ua->value.len == 0) {
+        return "desktop";
+    }
+
+    s = ua->value.data;
+    last = s + ua->value.len;
+
+    if (ngx_strlcasestrn(s, last, (u_char *) "mobi", 4 - 1) != NULL
+        || ngx_strlcasestrn(s, last, (u_char *) "android", 7 - 1) != NULL
+        || ngx_strlcasestrn(s, last, (u_char *) "iphone", 6 - 1) != NULL)
+    {
+        return "mobile";
+    }
+    return "desktop";
+}
+
+
+/* Write the Vary suffix selected by the loc_conf bitmask into buf (>= MAX) and
+ * return its byte length. Buckets are emitted in a FIXED order (ae then dev)
+ * regardless of the directive's token order, so the key is deterministic. The
+ * 0x1F (US) delimiter can never appear in a query string, so the suffix cannot
+ * collide with a real arg value. Returns 0 when vary is UNSET/off. */
+static size_t
+ngx_http_cache_turbo_vary_suffix(ngx_http_request_t *r, ngx_int_t vary,
+    u_char *buf)
+{
+    const char  *cls;
+    u_char      *w = buf;
+
+    if (vary == NGX_CONF_UNSET || vary == 0) {
+        return 0;
+    }
+
+    if (vary & NGX_HTTP_CACHE_TURBO_VARY_ENCODING) {
+        cls = ngx_http_cache_turbo_ae_class(r);
+        *w++ = 0x1F;
+        w = ngx_cpymem(w, "ae=", 3);
+        w = ngx_cpymem(w, cls, ngx_strlen(cls));
+    }
+
+    if (vary & NGX_HTTP_CACHE_TURBO_VARY_DEVICE) {
+        cls = ngx_http_cache_turbo_device_class(r);
+        *w++ = 0x1F;
+        w = ngx_cpymem(w, "dev=", 4);
+        w = ngx_cpymem(w, cls, ngx_strlen(cls));
+    }
+
+    return w - buf;
+}
+
+
+/* Set the variable to a pool-owned copy of len bytes of src, or the empty string
+ * when len == 0. Shared "emit these bytes or nothing" tail for the argless output
+ * paths (no args / strip_all / everything denied), where the suffix stands alone
+ * with no leading '?'. */
+static ngx_int_t
+ngx_http_cache_turbo_var_set(ngx_http_request_t *r,
+    ngx_http_variable_value_t *v, u_char *src, size_t len)
+{
+    u_char  *out;
+
+    if (len == 0) {
+        v->len = 0;
+        v->data = (u_char *) "";
+        return NGX_OK;
+    }
+
+    out = ngx_pnalloc(r->pool, len);
+    if (out == NULL) {
+        return NGX_ERROR;
+    }
+
+    ngx_memcpy(out, src, len);
+    v->len = len;
+    v->data = out;
+
+    return NGX_OK;
+}
+
+
 /*
  * $cache_turbo_normalized_args: rebuild r->args dropping denylisted params and
- * sorting what remains, prefixed with '?'. Empty string when there is nothing
- * to keep (no args, strip_all, or everything denied), so the variable can be
- * concatenated straight into a cache key. Computed in r->pool; r->args is left
- * untouched so application logic still sees the original query string.
+ * sorting what remains, prefixed with '?', then append the Vary-aware suffix
+ * (v3-4) if enabled. Empty string when there is nothing to keep AND no suffix, so
+ * the variable can be concatenated straight into a cache key. The suffix is
+ * appended on every path — including the argless ones — so two requests that
+ * differ only by encoding/device still split into separate slots. Computed in
+ * r->pool; r->args is left untouched so application logic still sees the original
+ * query string.
  */
 static ngx_int_t
 ngx_http_cache_turbo_normalized_args_variable(ngx_http_request_t *r,
@@ -1569,7 +1701,8 @@ ngx_http_cache_turbo_normalized_args_variable(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t  *clcf;
     ngx_str_t                        *toks;
     u_char                           *p, *last, *amp, *eq, *out, *w;
-    size_t                            nlen, total;
+    u_char                            vbuf[NGX_HTTP_CACHE_TURBO_VARY_SUFFIX_MAX];
+    size_t                            nlen, total, vlen;
     ngx_uint_t                        n, i, kept;
 
     clcf = ngx_http_get_module_loc_conf(r, ngx_http_cache_turbo_module);
@@ -1578,11 +1711,11 @@ ngx_http_cache_turbo_normalized_args_variable(ngx_http_request_t *r,
     v->no_cacheable = 0;
     v->not_found = 0;
 
-    /* strip_all, or no args at all: the normalized form is the empty string. */
+    vlen = ngx_http_cache_turbo_vary_suffix(r, clcf->normalize_vary, vbuf);
+
+    /* strip_all, or no args at all: output is the Vary suffix alone (no '?'). */
     if (clcf->normalize_strip_all || r->args.len == 0) {
-        v->len = 0;
-        v->data = (u_char *) "";
-        return NGX_OK;
+        return ngx_http_cache_turbo_var_set(r, v, vbuf, vlen);
     }
 
     /* Upper bound on token count = number of '&' + 1. */
@@ -1627,15 +1760,15 @@ ngx_http_cache_turbo_normalized_args_variable(ngx_http_request_t *r,
     }
 
     if (kept == 0) {
-        v->len = 0;
-        v->data = (u_char *) "";
-        return NGX_OK;
+        /* every arg denied: output is the Vary suffix alone (no '?'). */
+        return ngx_http_cache_turbo_var_set(r, v, vbuf, vlen);
     }
 
     /* Stable alpha sort so ?b=2&a=1 and ?a=1&b=2 normalize identically. */
     ngx_sort(toks, kept, sizeof(ngx_str_t), ngx_http_cache_turbo_tok_cmp);
 
     total += 1 + (kept - 1);                  /* leading '?' + '&' separators  */
+    total += vlen;                            /* Vary suffix (v3-4)            */
 
     out = ngx_pnalloc(r->pool, total);        /* raw bytes -> pnalloc is fine  */
     if (out == NULL) {
@@ -1649,6 +1782,9 @@ ngx_http_cache_turbo_normalized_args_variable(ngx_http_request_t *r,
             *w++ = '&';
         }
         w = ngx_cpymem(w, toks[i].data, toks[i].len);
+    }
+    if (vlen) {
+        w = ngx_cpymem(w, vbuf, vlen);
     }
 
     v->len = w - out;
@@ -1709,6 +1845,40 @@ ngx_http_cache_turbo_normalize_strip(ngx_conf_t *cf, ngx_command_t *cmd,
 }
 
 
+/* "cache_turbo_normalize_vary encoding device;" — select which Vary buckets are
+ * appended to $cache_turbo_normalized_args (v3-4). Tokens validated at config
+ * time; an unknown token is rejected (like cache_turbo_preset). Default off. */
+static char *
+ngx_http_cache_turbo_normalize_vary(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf)
+{
+    ngx_http_cache_turbo_loc_conf_t  *clcf = conf;
+    ngx_str_t                        *value;
+    ngx_uint_t                        i;
+    ngx_int_t                         vary = 0;
+
+    value = cf->args->elts;
+    for (i = 1; i < cf->args->nelts; i++) {
+        if (ngx_strcmp(value[i].data, "encoding") == 0) {
+            vary |= NGX_HTTP_CACHE_TURBO_VARY_ENCODING;
+
+        } else if (ngx_strcmp(value[i].data, "device") == 0) {
+            vary |= NGX_HTTP_CACHE_TURBO_VARY_DEVICE;
+
+        } else {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                "invalid cache_turbo_normalize_vary token \"%V\": "
+                "expected encoding and/or device", &value[i]);
+            return NGX_CONF_ERROR;
+        }
+    }
+
+    clcf->normalize_vary = vary;
+
+    return NGX_CONF_OK;
+}
+
+
 static void *
 ngx_http_cache_turbo_create_loc_conf(ngx_conf_t *cf)
 {
@@ -1729,6 +1899,7 @@ ngx_http_cache_turbo_create_loc_conf(ngx_conf_t *cf)
     conf->redis_timeout = NGX_CONF_UNSET_MSEC;
     conf->normalize_strip_all = NGX_CONF_UNSET;
     conf->normalize_strip = NGX_CONF_UNSET_PTR;
+    conf->normalize_vary = NGX_CONF_UNSET;
     /* shm_zone, key, redis_addr, redis_prefix default NULL via pcalloc */
 
     return conf;
@@ -1820,6 +1991,11 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
                          0);
     if (conf->normalize_strip == NGX_CONF_UNSET_PTR) {
         conf->normalize_strip = prev->normalize_strip;
+    }
+    /* Vary suffix bitmask: inherit UNSET-only; the variable handler reads UNSET
+     * as 0 (off), so v3-1 keys are unchanged unless a directive opts in. */
+    if (conf->normalize_vary == NGX_CONF_UNSET) {
+        conf->normalize_vary = prev->normalize_vary;
     }
 
     return NGX_CONF_OK;

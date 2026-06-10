@@ -79,6 +79,7 @@ is a `HIT` served from RAM in microseconds. Let it go stale and you'll see
 | `cache_turbo_admin NAME` | `location` | — | Turn this location into a control endpoint for zone `NAME`. `GET` returns JSON stats; `POST ?all=1` purges the zone, `POST ?key=<string>` purges one key, `POST ?tag=<name>` purges every object carrying that tag, `POST ?url=<path[,path...]>` **warms** the cache for those paths (background prefetch). With `cache_turbo_redis` on the admin location, `?key`/`?tag` drop the entry from **both** L1 and L2. Gate it with `allow`/`deny`. |
 | `cache_turbo_normalize_strip NAME...` | `server`, `location` | — | Extra query-arg names to drop from `$cache_turbo_normalized_args`, **added** to the built-in denylist. A trailing `*` is a prefix match (e.g. `tmp_*`). |
 | `cache_turbo_normalize_strip_all on` | `server`, `location` | `off` | Drop **every** query arg from `$cache_turbo_normalized_args` (the variable becomes the empty string). |
+| `cache_turbo_normalize_vary TOKEN...` | `server`, `location` | — (off) | Append a Vary-aware bucket to `$cache_turbo_normalized_args` so responses that legitimately differ get their own slot. `encoding` adds the Accept-Encoding class (`br`/`gzip`/`identity`); `device` adds the User-Agent device class (`mobile`/`desktop`). Give one or both (`cache_turbo_normalize_vary encoding device`). Off by default — keys are unchanged unless you opt in. See [Vary-aware buckets](#vary-aware-buckets). |
 
 ### Admin endpoint
 
@@ -244,6 +245,35 @@ arg with `cache_turbo_normalize_strip_all on`:
 # strip everything except a curated allow-set you keep via the key itself
 cache_turbo_normalize_strip  sid sessionid "tmp_*";   # + the built-in defaults
 ```
+
+#### Vary-aware buckets
+
+A single URL can have responses that *should* differ — a Brotli body for a
+browser that accepts `br`, a plain body for one that does not; a mobile layout
+vs a desktop one. Caching them under one key serves the wrong variant to half
+your visitors. `cache_turbo_normalize_vary` appends a coarse class to
+`$cache_turbo_normalized_args` so each variant gets its own slot:
+
+```nginx
+location / {
+    cache_turbo      main;
+    cache_turbo_key  $scheme$host$uri$cache_turbo_normalized_args;
+    cache_turbo_normalize_vary encoding device;   # split by both
+    proxy_pass       http://backend;
+}
+```
+
+- **`encoding`** collapses `Accept-Encoding` to `br`, `gzip`, or `identity` — the
+  *class*, not the raw header (which varies per browser and would shard the cache
+  into hundreds of near-identical slots). `br` wins when the client accepts both.
+- **`device`** collapses the `User-Agent` to `mobile` or `desktop` (a substring
+  match for the usual mobile tokens; tablets count as desktop).
+
+The bucket is appended with a delimiter that can never appear in a real query
+string, so it cannot collide with an arg value. Buckets are emitted in a fixed
+order, so `encoding device` and `device encoding` produce the same key. The
+suffix is added even when there are no query args, so two argless requests that
+differ only by encoding/device still split correctly.
 
 ## How it works
 
