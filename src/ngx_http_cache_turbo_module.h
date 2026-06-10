@@ -21,12 +21,39 @@
 #include <ngx_md5.h>
 
 
-/* Stale window = fresh TTL * (STALE_MULTIPLIER - 1), matching wp-redis. */
+/* Stale window = fresh TTL * (STALE_MULTIPLIER - 1), matching wp-redis. This is
+ * the BALANCED-preset stale multiplier; presets override it per-band (v3-2) via
+ * the runtime ngx_http_cache_turbo_loc_conf_t.stale_mult field. */
 #define NGX_HTTP_CACHE_TURBO_STALE_MULTIPLIER  4
 
 /* Default SWR aggressiveness (beta). 1.0 = refresh probability tracks the
  * elapsed fraction of the stale window directly. */
 #define NGX_HTTP_CACHE_TURBO_DEFAULT_BETA      1000   /* fixed-point /1000 */
+
+
+/*
+ * Autotune presets (#10, v3-2). One directive `cache_turbo_preset
+ * conservative|balanced|aggressive` sets the default tuning bundle; an explicit
+ * knob directive still wins. Vocab matches wp-redis (BALANCED, not "normal").
+ * Values are 1-based so they index ngx_http_cache_turbo_bands[] directly; 0 is
+ * unused so a zeroed/UNSET field is never a valid preset.
+ */
+#define NGX_HTTP_CACHE_TURBO_PRESET_CONSERVATIVE  1
+#define NGX_HTTP_CACHE_TURBO_PRESET_BALANCED      2
+#define NGX_HTTP_CACHE_TURBO_PRESET_AGGRESSIVE    3
+
+/* Default-of-defaults: an unconfigured location resolves to BALANCED, whose band
+ * values equal the historical hardcoded merge fallbacks (valid 60s, beta 1000,
+ * lock_ttl 5s, stale_mult 4). */
+#define NGX_HTTP_CACHE_TURBO_PRESET_DEFAULT  NGX_HTTP_CACHE_TURBO_PRESET_BALANCED
+
+/* A preset band: the default value for each preset-controlled knob. */
+typedef struct {
+    time_t      valid;       /* fresh TTL (seconds)        */
+    ngx_int_t   beta;        /* SWR aggressiveness, /1000  */
+    time_t      lock_ttl;    /* single-flight lock window  */
+    ngx_int_t   stale_mult;  /* stale window multiplier    */
+} ngx_http_cache_turbo_band_t;
 
 
 /*
@@ -82,9 +109,27 @@ typedef struct {
     ngx_flag_t               enable;
     ngx_shm_zone_t          *shm_zone;
     ngx_http_complex_value_t *key;        /* cache key expression           */
-    time_t                   valid;       /* fresh TTL (seconds)            */
-    ngx_int_t                beta;        /* SWR aggressiveness, /1000       */
-    time_t                   lock_ttl;    /* hard single-flight lock window */
+
+    /*
+     * Preset + the knobs it controls (v3-2). The *_raw fields hold the explicit
+     * directive value (or NGX_CONF_UNSET); they are what the directive slots
+     * write and what merge inherits down the tree WITHOUT a literal default, so
+     * a knob stays UNSET until a real directive sets it at some level. The
+     * non-raw fields (valid/beta/lock_ttl/stale_mult) are the EFFECTIVE values
+     * the request path reads: in merge_loc_conf each resolves to its *_raw value
+     * if set, else the resolved preset's band value. Keeping raw separate from
+     * effective is what lets a location's preset still win when an ancestor only
+     * resolved the effective default — see the note in merge_loc_conf.
+     */
+    ngx_int_t                preset;      /* one of PRESET_* or UNSET       */
+    time_t                   valid_raw;   /* explicit cache_turbo_valid      */
+    ngx_int_t                beta_raw;    /* explicit cache_turbo_beta       */
+    time_t                   lock_ttl_raw;/* explicit cache_turbo_lock_ttl   */
+
+    time_t                   valid;       /* fresh TTL (seconds), effective */
+    ngx_int_t                beta;        /* SWR aggressiveness /1000, eff  */
+    time_t                   lock_ttl;    /* single-flight lock window, eff */
+    ngx_int_t                stale_mult;  /* stale window multiplier, eff   */
     size_t                   max_size;    /* max single response to cache   */
     ngx_flag_t               admin;       /* this location is an admin endpoint */
     ngx_shm_zone_t          *admin_zone;  /* zone the admin endpoint manages */
@@ -166,7 +211,7 @@ ngx_http_cache_turbo_node_t *
 
 ngx_int_t ngx_http_cache_turbo_shm_store(ngx_http_cache_turbo_zone_t *z,
     u_char *key_hash, uint32_t hash, u_char *data, size_t len,
-    ngx_uint_t status, time_t fresh_ttl);
+    ngx_uint_t status, time_t fresh_ttl, ngx_int_t stale_mult);
 
 /* Purge a single entry by key hash. Returns 1 if an entry was removed, 0 if
  * not present. */
@@ -178,7 +223,7 @@ ngx_uint_t ngx_http_cache_turbo_shm_purge_all(ngx_http_cache_turbo_zone_t *z);
 
 
 /* ---- swr.c ---- */
-time_t    ngx_http_cache_turbo_stale_ttl(time_t fresh_ttl);
+time_t    ngx_http_cache_turbo_stale_ttl(time_t fresh_ttl, ngx_int_t stale_mult);
 ngx_int_t ngx_http_cache_turbo_should_refresh(u_char *key_hash,
     time_t fresh_until, time_t stale_window, ngx_int_t beta_milli);
 

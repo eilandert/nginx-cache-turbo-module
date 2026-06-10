@@ -69,9 +69,10 @@ is a `HIT` served from RAM in microseconds. Let it go stale and you'll see
 | `cache_turbo_zone name=NAME SIZE` | `http` | — | Declare a shared-memory cache zone (min 8 pages). |
 | `cache_turbo NAME` / `off` | `server`, `location` | `off` | Enable caching in this block and bind it to a zone. |
 | `cache_turbo_key STRING` | `server`, `location` | `$uri` | The cache key (any nginx variables). |
-| `cache_turbo_valid TIME` | `server`, `location` | `60s` | Fresh TTL. After this the entry is *stale* (still served). |
-| `cache_turbo_beta N` | `server`, `location` | `1000` | SWR refresh aggressiveness, fixed-point ×1000 (1000 = 1.0). Higher → refresh earlier/more often. |
-| `cache_turbo_lock_ttl TIME` | `server`, `location` | `5s` | Hard single-flight window: once a refresh is claimed, all readers serve stale (skip the dice) until this expires or the refresh completes. Caps origin regens to ~one per stale cycle. |
+| `cache_turbo_preset NAME` | `server`, `location` | `balanced` | Tuning preset: `conservative`, `balanced`, or `aggressive`. Sets the defaults for `cache_turbo_valid`, `cache_turbo_beta`, `cache_turbo_lock_ttl` and the stale-window multiplier in one shot. An explicit knob directive still wins over the preset. See [Presets](#presets). |
+| `cache_turbo_valid TIME` | `server`, `location` | preset (`60s` balanced) | Fresh TTL. After this the entry is *stale* (still served). |
+| `cache_turbo_beta N` | `server`, `location` | preset (`1000` balanced) | SWR refresh aggressiveness, fixed-point ×1000 (1000 = 1.0). Higher → refresh earlier/more often. |
+| `cache_turbo_lock_ttl TIME` | `server`, `location` | preset (`5s` balanced) | Hard single-flight window: once a refresh is claimed, all readers serve stale (skip the dice) until this expires or the refresh completes. Caps origin regens to ~one per stale cycle. |
 | `cache_turbo_max_size SIZE` | `server`, `location` | `1m` | Largest single response to cache. |
 | `cache_turbo_redis HOST:PORT [prefix=STR] [timeout=TIME]` | `http`, `server`, `location` | — | Add a shared **L2 Redis** tier behind the L1 shm cache. Stores write through asynchronously; an L1 miss does one synchronous Redis `GET` (off the hot path — L1 hits never touch Redis) and fills L1 on a hit. `prefix` defaults to `ct:`, `timeout` to `250ms`. Native client, no hiredis. |
 | `cache_turbo_tag EXPR` | `server`, `location` | — | Tag stored objects so they can be purged as a group. `EXPR` (any nginx variables) yields a whitespace/comma list of tags — e.g. `cache_turbo_tag $upstream_http_x_cache_tags`. Each tag set is kept in L2, so this needs `cache_turbo_redis`. Purge with `POST ?tag=<name>`. |
@@ -107,8 +108,38 @@ Add `cache_turbo_redis` to the admin location (inherited from `server`/`http`
 is fine) so `?key` and `?tag` purges clear the **L2** tier too — otherwise a
 purged entry just refills from Redis on the next miss.
 
-The **stale window** is `cache_turbo_valid × 3` (the entry lives `× 4` total),
-so a `10s` fresh TTL keeps serving stale for another `30s` while it refreshes.
+The **stale window** is `cache_turbo_valid × (stale_mult − 1)` (the entry lives
+`× stale_mult` total), where `stale_mult` comes from the preset (`4` for the
+default `balanced`). So a `balanced` `10s` fresh TTL keeps serving stale for
+another `30s` while it refreshes.
+
+### Presets
+
+`cache_turbo_preset` sets the whole tuning bundle at once — handy when you want
+"cache hard" or "cache cautiously" without spelling out four knobs. The vocab
+matches [wp-redis](https://github.com/eilandert/wp-redis): `conservative`,
+`balanced` (default), `aggressive`.
+
+| Knob | `conservative` | `balanced` | `aggressive` |
+|---|---|---|---|
+| `cache_turbo_valid` (fresh TTL) | `30s` | `60s` | `300s` |
+| `cache_turbo_beta` (×1000) | `500` | `1000` | `3000` |
+| `cache_turbo_lock_ttl` | `10s` | `5s` | `3s` |
+| stale-window multiplier | `×2` | `×4` | `×8` |
+
+```nginx
+location / {
+    cache_turbo        main;
+    cache_turbo_preset aggressive;   # long TTL, wide stale window, eager refresh
+    cache_turbo_valid  120s;         # explicit knob overrides the preset's 300s
+    proxy_pass http://backend;
+}
+```
+
+An explicit `cache_turbo_valid` / `_beta` / `_lock_ttl` always beats the preset.
+A nearer preset beats a farther one (a `location` preset overrides a `server`
+preset). `balanced` equals the historical built-in defaults, so adding presets
+changes nothing for configs that don't mention them.
 
 ### L2 Redis (shared tier)
 
@@ -235,8 +266,9 @@ The resulting `objs/ngx_http_cache_turbo_module.so` is loaded with
 - [x] Redis L2 backend (shared/persistent, multi-node) — **native nginx client, no hiredis**
 - [x] Tag-based purge (purge by tag, L1 + L2) + L2-aware key/expired purge
 - [x] Smart cache-key normalisation — strip tracking params + sort args (`$cache_turbo_normalized_args`); Vary-aware suffix still to come
+- [x] `conservative` / `balanced` / `aggressive` tuning presets (`cache_turbo_preset`)
 - [ ] Cache (re)warming — sitemap walk + TTL-extension
-- [ ] `conservative` / `balanced` / `aggressive` autotune presets
+- [ ] Live autotune within preset bands (presets are the static version of this)
 - [ ] Slashdot protection (widen stale + harden single-flight under load spikes)
 
 ## See also

@@ -12,18 +12,24 @@
 
 
 /*
- * Compute the stale-TTL given a fresh-TTL. A fresh-TTL of 0 ("forever") stays
- * 0; otherwise multiply by STALE_MULTIPLIER so the slab entry survives the
- * whole stale window before it is evicted.
+ * Compute the stale-TTL given a fresh-TTL and the (preset-resolved) stale
+ * multiplier. A fresh-TTL of 0 ("forever") stays 0; otherwise multiply by the
+ * multiplier so the slab entry survives the whole stale window before it is
+ * evicted. A non-positive multiplier falls back to the BALANCED default so a
+ * mis-resolved band can never collapse the stale window to zero.
  */
 time_t
-ngx_http_cache_turbo_stale_ttl(time_t fresh_ttl)
+ngx_http_cache_turbo_stale_ttl(time_t fresh_ttl, ngx_int_t stale_mult)
 {
     if (fresh_ttl <= 0) {
         return 0;
     }
 
-    return fresh_ttl * NGX_HTTP_CACHE_TURBO_STALE_MULTIPLIER;
+    if (stale_mult <= 0) {
+        stale_mult = NGX_HTTP_CACHE_TURBO_STALE_MULTIPLIER;
+    }
+
+    return fresh_ttl * stale_mult;
 }
 
 

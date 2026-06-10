@@ -41,6 +41,8 @@ static char *ngx_http_cache_turbo_redis_conf(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
 static char *ngx_http_cache_turbo_tag(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
+static char *ngx_http_cache_turbo_preset(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
 static ngx_int_t ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r);
 static ngx_int_t ngx_http_cache_turbo_tag_purge_complete(ngx_http_request_t *r,
     void *data, ngx_str_t *members, ngx_uint_t nmembers);
@@ -54,6 +56,21 @@ static ngx_int_t ngx_http_cache_turbo_init(ngx_conf_t *cf);
 
 static ngx_http_output_header_filter_pt  ngx_http_next_header_filter;
 static ngx_http_output_body_filter_pt    ngx_http_next_body_filter;
+
+
+/*
+ * Preset bands (v3-2). Indexed by NGX_HTTP_CACHE_TURBO_PRESET_* (1-based; slot 0
+ * is a never-used placeholder so an UNSET/zero preset can't silently index a
+ * real band). BALANCED equals the historical hardcoded merge fallbacks. Tune by
+ * feel; the chosen values are documented in
+ * memory/eilandert/nginx-cache-turbo-module/history.md.
+ */
+static const ngx_http_cache_turbo_band_t  ngx_http_cache_turbo_bands[] = {
+    /* [0] unused placeholder           */ {   0,    0,  0, 0 },
+    /* [1] CONSERVATIVE: correctness     */ {  30,  500, 10, 2 },
+    /* [2] BALANCED: current defaults    */ {  60, 1000,  5, 4 },
+    /* [3] AGGRESSIVE: max hit-rate      */ { 300, 3000,  3, 8 },
+};
 
 
 static ngx_command_t  ngx_http_cache_turbo_commands[] = {
@@ -83,14 +100,14 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
       NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
       ngx_conf_set_sec_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
-      offsetof(ngx_http_cache_turbo_loc_conf_t, valid),
+      offsetof(ngx_http_cache_turbo_loc_conf_t, valid_raw),
       NULL },
 
     { ngx_string("cache_turbo_beta"),
       NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
       ngx_conf_set_num_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
-      offsetof(ngx_http_cache_turbo_loc_conf_t, beta),
+      offsetof(ngx_http_cache_turbo_loc_conf_t, beta_raw),
       NULL },
 
     { ngx_string("cache_turbo_max_size"),
@@ -104,7 +121,14 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
       NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
       ngx_conf_set_sec_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
-      offsetof(ngx_http_cache_turbo_loc_conf_t, lock_ttl),
+      offsetof(ngx_http_cache_turbo_loc_conf_t, lock_ttl_raw),
+      NULL },
+
+    { ngx_string("cache_turbo_preset"),
+      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
+      ngx_http_cache_turbo_preset,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0,
       NULL },
 
     { ngx_string("cache_turbo_admin"),
@@ -271,7 +295,8 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
 
         if (stale_until == 0 || now < stale_until) {
             /* stale-but-serveable */
-            stale_window = ngx_http_cache_turbo_stale_ttl(clcf->valid)
+            stale_window = ngx_http_cache_turbo_stale_ttl(clcf->valid,
+                               clcf->stale_mult)
                            - clcf->valid;
             if (stale_window <= 0) {
                 stale_window = 1;
@@ -350,7 +375,7 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
             if (bh.magic == NGX_HTTP_CACHE_TURBO_BLOB_MAGIC) {
                 (void) ngx_http_cache_turbo_shm_store(z, ctx->key_hash, hash,
                            ctx->l2_blob, ctx->l2_blob_len, bh.status,
-                           clcf->valid);
+                           clcf->valid, clcf->stale_mult);
                 (void) ngx_atomic_fetch_add(&z->sh->hits, 1);
                 return ngx_http_cache_turbo_serve(r, ctx->l2_blob,
                            ctx->l2_blob_len, 0);
@@ -702,7 +727,8 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
             hash = ngx_crc32_short(ctx->key_hash, 32);
 
             (void) ngx_http_cache_turbo_shm_store(z, ctx->key_hash, hash,
-                       blob, blob_len, r->headers_out.status, clcf->valid);
+                       blob, blob_len, r->headers_out.status, clcf->valid,
+                       clcf->stale_mult);
 
             /* L2 write-through (async, fire-and-forget). Copies the blob into
              * its own pool, so it is safe even though `blob` lives in r->pool. */
@@ -721,7 +747,8 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
                     time_t   stale_ttl;
                     u_char  *s, *e, *tok;
 
-                    stale_ttl = ngx_http_cache_turbo_stale_ttl(clcf->valid);
+                    stale_ttl = ngx_http_cache_turbo_stale_ttl(clcf->valid,
+                                    clcf->stale_mult);
                     s = tagval.data;
                     e = tagval.data + tagval.len;
 
@@ -893,6 +920,39 @@ ngx_http_cache_turbo_tag(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     ccv.complex_value = clcf->tag;
 
     if (ngx_http_compile_complex_value(&ccv) != NGX_OK) {
+        return NGX_CONF_ERROR;
+    }
+
+    return NGX_CONF_OK;
+}
+
+
+/* "cache_turbo_preset conservative|balanced|aggressive;" stores the preset enum
+ * (and validates the name here, at config time). The enum only selects the band
+ * of default knob values used in merge_loc_conf; an explicit knob directive
+ * (cache_turbo_valid/_beta/_lock_ttl) still wins because those write the *_raw
+ * fields, which take precedence over the band in the merge. */
+static char *
+ngx_http_cache_turbo_preset(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_http_cache_turbo_loc_conf_t  *clcf = conf;
+
+    ngx_str_t  *value = cf->args->elts;
+
+    if (ngx_strcmp(value[1].data, "conservative") == 0) {
+        clcf->preset = NGX_HTTP_CACHE_TURBO_PRESET_CONSERVATIVE;
+
+    } else if (ngx_strcmp(value[1].data, "balanced") == 0) {
+        clcf->preset = NGX_HTTP_CACHE_TURBO_PRESET_BALANCED;
+
+    } else if (ngx_strcmp(value[1].data, "aggressive") == 0) {
+        clcf->preset = NGX_HTTP_CACHE_TURBO_PRESET_AGGRESSIVE;
+
+    } else {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            "invalid cache_turbo_preset \"%V\": "
+            "expected conservative, balanced, or aggressive",
+            &value[1]);
         return NGX_CONF_ERROR;
     }
 
@@ -1504,9 +1564,10 @@ ngx_http_cache_turbo_create_loc_conf(ngx_conf_t *cf)
     }
 
     conf->enable = NGX_CONF_UNSET;
-    conf->valid = NGX_CONF_UNSET;
-    conf->beta = NGX_CONF_UNSET;
-    conf->lock_ttl = NGX_CONF_UNSET;
+    conf->preset = NGX_CONF_UNSET;
+    conf->valid_raw = NGX_CONF_UNSET;
+    conf->beta_raw = NGX_CONF_UNSET;
+    conf->lock_ttl_raw = NGX_CONF_UNSET;
     conf->max_size = NGX_CONF_UNSET_SIZE;
     conf->redis_enable = NGX_CONF_UNSET;
     conf->redis_timeout = NGX_CONF_UNSET_MSEC;
@@ -1525,11 +1586,52 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_http_cache_turbo_loc_conf_t  *conf = child;
 
     ngx_conf_merge_value(conf->enable, prev->enable, 0);
-    ngx_conf_merge_sec_value(conf->valid, prev->valid, 60);
-    ngx_conf_merge_value(conf->beta, prev->beta,
-                         NGX_HTTP_CACHE_TURBO_DEFAULT_BETA);
-    ngx_conf_merge_sec_value(conf->lock_ttl, prev->lock_ttl, 5);
     ngx_conf_merge_size_value(conf->max_size, prev->max_size, 1024 * 1024);
+
+    /*
+     * Presets (v3-2). Two-stage so a location's preset can still set the band
+     * defaults even when an ANCESTOR already resolved its own effective knobs:
+     *
+     *  1. Inherit the preset enum down the tree.
+     *  2. Inherit the *explicit* (raw) knob values with NGX_CONF_UNSET as the
+     *     fallback — NOT a literal. A knob therefore stays UNSET unless a real
+     *     cache_turbo_valid/_beta/_lock_ttl directive set it at some level. This
+     *     is the crucial bit: if we filled a literal/band default here, that
+     *     value would no longer look UNSET to a descendant, so the descendant's
+     *     own preset could never override it (the classic merge-poisoning trap).
+     *  3. Resolve the effective knob: explicit raw value if set, else this
+     *     level's resolved-preset band value. stale_mult is preset-only (no
+     *     directive yet), so it always takes the band value.
+     *
+     * Net effect: an explicit directive beats a preset; a nearer preset beats a
+     * farther one; nothing leaks a band default into the inheritance chain.
+     */
+    if (conf->preset == NGX_CONF_UNSET) {
+        conf->preset = prev->preset;
+    }
+
+    {
+        ngx_int_t                          p;
+        const ngx_http_cache_turbo_band_t  *band;
+
+        p = (conf->preset == NGX_CONF_UNSET)
+                ? NGX_HTTP_CACHE_TURBO_PRESET_DEFAULT : conf->preset;
+        band = &ngx_http_cache_turbo_bands[p];
+
+        ngx_conf_merge_sec_value(conf->valid_raw, prev->valid_raw,
+                                 NGX_CONF_UNSET);
+        ngx_conf_merge_value(conf->beta_raw, prev->beta_raw, NGX_CONF_UNSET);
+        ngx_conf_merge_sec_value(conf->lock_ttl_raw, prev->lock_ttl_raw,
+                                 NGX_CONF_UNSET);
+
+        conf->valid = (conf->valid_raw == NGX_CONF_UNSET)
+                          ? band->valid : conf->valid_raw;
+        conf->beta = (conf->beta_raw == NGX_CONF_UNSET)
+                          ? band->beta : conf->beta_raw;
+        conf->lock_ttl = (conf->lock_ttl_raw == NGX_CONF_UNSET)
+                          ? band->lock_ttl : conf->lock_ttl_raw;
+        conf->stale_mult = band->stale_mult;
+    }
 
     if (conf->shm_zone == NULL) {
         conf->shm_zone = prev->shm_zone;

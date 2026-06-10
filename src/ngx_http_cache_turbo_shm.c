@@ -214,14 +214,14 @@ ngx_http_cache_turbo_shm_purge_all(ngx_http_cache_turbo_zone_t *z)
 ngx_int_t
 ngx_http_cache_turbo_shm_store(ngx_http_cache_turbo_zone_t *z,
     u_char *key_hash, uint32_t hash, u_char *data, size_t len,
-    ngx_uint_t status, time_t fresh_ttl)
+    ngx_uint_t status, time_t fresh_ttl, ngx_int_t stale_mult)
 {
     u_char                       *body;
     time_t                        now, stale_ttl;
     ngx_http_cache_turbo_node_t  *ctn;
 
     now = ngx_time();
-    stale_ttl = ngx_http_cache_turbo_stale_ttl(fresh_ttl);
+    stale_ttl = ngx_http_cache_turbo_stale_ttl(fresh_ttl, stale_mult);
 
     ngx_shmtx_lock(&z->shpool->mutex);
 

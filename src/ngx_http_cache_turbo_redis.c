@@ -207,7 +207,7 @@ ngx_http_cache_turbo_redis_set(ngx_http_request_t *r,
     }
 
     /* L2 entry lives as long as the L1 copy could be served stale. */
-    stale_ttl = ngx_http_cache_turbo_stale_ttl(fresh_ttl);
+    stale_ttl = ngx_http_cache_turbo_stale_ttl(fresh_ttl, clcf->stale_mult);
     if (stale_ttl <= 0) {
         return;
     }

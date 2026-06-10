@@ -273,6 +273,33 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # presets (v3-2): one location per preset. Each overrides cache_turbo_valid
+        # to 1s so the test runs fast; the only behavioural difference left is the
+        # preset-supplied stale multiplier (conservative x2 -> serveable 2s,
+        # balanced x4 -> 4s, aggressive x8 -> 8s). The explicit valid also proves
+        # an explicit knob beats the preset's band value.
+        location /pc/ {{
+            cache_turbo          main;
+            cache_turbo_key      $uri;
+            cache_turbo_preset   conservative;
+            cache_turbo_valid    1s;     # stale_mult=2 -> expires at 2s
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+        location /pb/ {{
+            cache_turbo          main;
+            cache_turbo_key      $uri;
+            cache_turbo_preset   balanced;
+            cache_turbo_valid    1s;     # stale_mult=4 -> expires at 4s
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+        location /pa/ {{
+            cache_turbo          main;
+            cache_turbo_key      $uri;
+            cache_turbo_preset   aggressive;
+            cache_turbo_valid    1s;     # stale_mult=8 -> expires at 8s
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # uncached passthrough, lets us read the raw origin
         location /raw/ {{
             proxy_pass http://127.0.0.1:{origin_port}/;
@@ -882,6 +909,57 @@ def test_normalize_distinct_args_differ(ng: Nginx, origin: Origin) -> None:
     assert origin.hits == base + 2, "both distinct args should reach origin"
 
 
+def test_preset_window_differs(ng: Nginx, origin: Origin) -> None:
+    """v3-2: a preset sets the stale-window multiplier. With cache_turbo_valid
+    pinned to 1s on both locations, the only difference is the preset: the
+    conservative band (x2) makes the entry serveable for 2s, the aggressive band
+    (x8) for 8s. At t=3s the conservative copy is hard-expired (a MISS, re-fetch)
+    while the aggressive copy is still serveable as stale. This asserts the
+    PRESET'S effect, not its stored value, and proves the band reaches the
+    runtime stale math (stale_mult threaded through shm_store)."""
+    fetch(ng.port, "/pc/win")                          # prime conservative
+    fetch(ng.port, "/pa/win")                          # prime aggressive
+    time.sleep(3.0)                                     # cons expired, aggr stale
+
+    # conservative: past stale_until -> a true MISS (no X-Cache, hits origin)
+    sc, bc, hc = fetch(ng.port, "/pc/win")
+    assert sc == 200, f"conservative re-read status {sc}"
+    assert "x-cache" not in hc, \
+        ("conservative (stale_mult=2) should hard-expire by t=3s and MISS, "
+         f"got X-Cache={hc.get('x-cache')}")
+
+    # aggressive: still within its 8s window. Burst so single-flight forces the
+    # losers to serve stale (the lone dice-winner may regenerate); at least one
+    # STALE proves the entry is still serveable, i.e. the wider band took effect.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
+        results = list(pool.map(lambda _: fetch(ng.port, "/pa/win"), range(16)))
+    assert {r[0] for r in results} == {200}, \
+        f"aggressive stale burst returned {set(r[0] for r in results)}"
+    assert any(h.get("x-cache") == "STALE" for _, _, h in results), \
+        ("aggressive (stale_mult=8) should still serve STALE at t=3s; "
+         "got " + repr(sorted({h.get('x-cache') for _, _, h in results})))
+
+
+def test_invalid_preset_name(ng: Nginx) -> None:
+    """v3-2: an unknown cache_turbo_preset value is rejected at config time
+    (nginx -t fails) with a clear message, not silently ignored."""
+    bad = ng.root.parent / "bad-preset"
+    (bad / "conf").mkdir(parents=True, exist_ok=True)
+    (bad / "logs").mkdir(parents=True, exist_ok=True)
+    cfg = nginx_config(bad, ng.port, ng.module, ng.origin_port, 1)
+    cfg = cfg.replace("cache_turbo_preset   conservative;",
+                      "cache_turbo_preset   bogus;")
+    (bad / "conf" / "nginx.conf").write_text(cfg, encoding="ascii")
+    cmd = ng.runner + [str(ng.binary), "-p", str(bad),
+                       "-c", str(bad / "conf" / "nginx.conf"), "-t"]
+    r = subprocess.run(cmd, text=True, stdout=subprocess.PIPE,
+                       stderr=subprocess.STDOUT, timeout=20)
+    assert r.returncode != 0, \
+        f"invalid preset 'bogus' was accepted by nginx -t:\n{r.stdout}"
+    assert "invalid cache_turbo_preset" in r.stdout, \
+        f"missing/odd diagnostic for bad preset:\n{r.stdout}"
+
+
 def run_all(ng: Nginx, origin: Origin,
             redis: RedisServer | None = None) -> None:
     test_miss_then_hit(ng)
@@ -899,6 +977,8 @@ def run_all(ng: Nginx, origin: Origin,
     test_normalize_strip_custom(ng, origin)
     test_normalize_strip_all(ng, origin)
     test_normalize_distinct_args_differ(ng, origin)
+    test_preset_window_differs(ng, origin)
+    test_invalid_preset_name(ng)
     if redis is not None:
         test_l2_write_through(ng, origin, redis)
         test_l2_cross_instance_fill(ng, origin, redis)
@@ -949,7 +1029,9 @@ def main() -> int:
     print("OK: miss/hit, header fidelity, max_size, concurrency (R1), "
           "LRU eviction (R6), stale serve (R3), single-flight (R4), "
           "admin stats/purge/gating, key normalize (v3-1: order/tracking/"
-          "custom-strip/strip-all/distinct)"
+          "custom-strip/strip-all/distinct), "
+          "presets (v3-2: conservative/aggressive stale-window differ, "
+          "invalid-name rejected)"
           + (", L2 write-through (P4), L2 cross-instance fill (P2), "
              "L2-aware key purge (P6), expired-L1 consults L2 (P6), "
              "tag index add (v2c), tag purge both tiers (P4)"
