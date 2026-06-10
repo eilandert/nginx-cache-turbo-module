@@ -64,12 +64,16 @@ def wait_port(port: int, timeout: float = 15.0) -> None:
     raise RuntimeError(f"port 127.0.0.1:{port} never came up")
 
 
-def fetch(port: int, path: str, headers: dict | None = None):
+def fetch(port: int, path: str, headers: dict | None = None,
+          method: str | None = None):
     """Return (status, body_str, response_headers_dict)."""
     req = urllib.request.Request(
         f"http://127.0.0.1:{port}{path}",
         headers={"Connection": "close", **(headers or {})},
+        method=method,
     )
+    if method in ("POST", "PUT", "DELETE"):
+        req.data = b""
     try:
         with urllib.request.urlopen(req, timeout=5) as r:
             body = r.read().decode("utf-8", "replace")
@@ -192,6 +196,19 @@ http {{
         # uncached passthrough, lets us read the raw origin
         location /raw/ {{
             proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # admin endpoint for the "main" zone, localhost-only
+        location = /_cache {{
+            cache_turbo_admin main;
+            allow 127.0.0.1;
+            deny all;
+        }}
+        # same endpoint but reachable only from a (non-loopback) address we
+        # can't be, to prove the deny path returns 403
+        location = /_cache_denied {{
+            cache_turbo_admin main;
+            deny all;
         }}
     }}
 }}
@@ -385,14 +402,64 @@ def test_concurrent_hits_no_deadlock(ng: Nginx) -> None:
     assert elapsed < 10, f"concurrent HITs took {elapsed:.1f}s (possible lock stall)"
 
 
+def test_admin_stats(ng: Nginx) -> None:
+    """GET /_cache returns JSON counters that reflect observed traffic."""
+    import json
+    fetch(ng.port, "/c/stat1")           # miss
+    fetch(ng.port, "/c/stat1")           # hit
+    s, b, h = fetch(ng.port, "/_cache")
+    assert s == 200, f"admin stats status {s}"
+    assert "application/json" in h.get("content-type", ""), h.get("content-type")
+    data = json.loads(b)
+    for field in ("hits", "misses", "stale_serves", "refreshes", "evictions"):
+        assert field in data, f"stats missing {field}: {data}"
+    assert data["hits"] >= 1 and data["misses"] >= 1, f"counters look wrong: {data}"
+
+
+def test_admin_purge_key(ng: Nginx) -> None:
+    """POST /_cache?key=<uri> drops that entry; next read is a MISS again."""
+    import json
+    fetch(ng.port, "/c/purgeme")                       # miss -> cached
+    _, _, h = fetch(ng.port, "/c/purgeme")
+    assert h.get("x-cache") == "HIT", "should be cached before purge"
+    # key is the cache_turbo_key for this location, which is $uri
+    s, b, _ = fetch(ng.port, "/_cache?key=/c/purgeme", method="POST")
+    assert s == 200, f"purge status {s}"
+    assert json.loads(b)["purged"] == 1, f"purge count: {b}"
+    _, _, h2 = fetch(ng.port, "/c/purgeme")
+    assert "x-cache" not in h2, "entry should be gone after purge (a MISS)"
+
+
+def test_admin_purge_all(ng: Nginx) -> None:
+    """POST /_cache?all=1 empties the zone."""
+    import json
+    fetch(ng.port, "/c/a1"); fetch(ng.port, "/c/a2"); fetch(ng.port, "/c/a3")
+    s, b, _ = fetch(ng.port, "/_cache?all=1", method="POST")
+    assert s == 200, f"purge-all status {s}"
+    assert json.loads(b)["purged"] >= 1, f"purge-all count: {b}"
+    # everything is now a miss
+    _, _, h = fetch(ng.port, "/c/a1")
+    assert "x-cache" not in h, "purge-all should have emptied the zone"
+
+
+def test_admin_gating(ng: Nginx) -> None:
+    """A deny-all admin location returns 403 (gating works)."""
+    s, _, _ = fetch(ng.port, "/_cache_denied")
+    assert s == 403, f"deny-all admin returned {s}, expected 403"
+
+
 def run_all(ng: Nginx, origin: Origin) -> None:
     test_miss_then_hit(ng)
     test_header_fidelity(ng)
     test_max_size_not_cached(ng)
     test_concurrent_hits_no_deadlock(ng)
     test_lru_eviction(ng)
+    test_admin_stats(ng)
+    test_admin_purge_key(ng)
+    test_admin_gating(ng)
     test_stale_serves_stale(ng, origin)
     test_single_flight(ng, origin)
+    test_admin_purge_all(ng)   # last: it empties the zone
 
 
 def main() -> int:
@@ -424,7 +491,8 @@ def main() -> int:
             origin.stop()
 
     print("OK: miss/hit, header fidelity, max_size, concurrency (R1), "
-          "LRU eviction (R6), stale serve (R3), single-flight (R4)")
+          "LRU eviction (R6), stale serve (R3), single-flight (R4), "
+          "admin stats/purge/gating")
     return 0
 
 

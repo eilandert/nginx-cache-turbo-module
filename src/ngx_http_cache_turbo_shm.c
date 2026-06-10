@@ -159,6 +159,58 @@ ngx_http_cache_turbo_shm_evict_one(ngx_http_cache_turbo_zone_t *z)
 }
 
 
+/* Remove one node from rbtree + LRU and free its slab memory. Caller holds the
+ * shpool mutex. */
+static void
+ngx_http_cache_turbo_shm_drop_locked(ngx_http_cache_turbo_zone_t *z,
+    ngx_http_cache_turbo_node_t *ctn)
+{
+    ngx_queue_remove(&ctn->lru);
+    ngx_rbtree_delete(&z->sh->rbtree, &ctn->node);
+    if (ctn->data) {
+        ngx_slab_free_locked(z->shpool, ctn->data);
+    }
+    ngx_slab_free_locked(z->shpool, ctn);
+}
+
+
+ngx_int_t
+ngx_http_cache_turbo_shm_purge_key(ngx_http_cache_turbo_zone_t *z,
+    u_char *key_hash, uint32_t hash)
+{
+    ngx_http_cache_turbo_node_t  *ctn;
+
+    ngx_shmtx_lock(&z->shpool->mutex);
+    ctn = ngx_http_cache_turbo_shm_lookup(z, key_hash, hash);
+    if (ctn == NULL) {
+        ngx_shmtx_unlock(&z->shpool->mutex);
+        return 0;
+    }
+    ngx_http_cache_turbo_shm_drop_locked(z, ctn);
+    ngx_shmtx_unlock(&z->shpool->mutex);
+    return 1;
+}
+
+
+ngx_uint_t
+ngx_http_cache_turbo_shm_purge_all(ngx_http_cache_turbo_zone_t *z)
+{
+    ngx_uint_t                    n = 0;
+    ngx_queue_t                  *q;
+    ngx_http_cache_turbo_node_t  *ctn;
+
+    ngx_shmtx_lock(&z->shpool->mutex);
+    while (!ngx_queue_empty(&z->sh->lru)) {
+        q = ngx_queue_head(&z->sh->lru);
+        ctn = ngx_queue_data(q, ngx_http_cache_turbo_node_t, lru);
+        ngx_http_cache_turbo_shm_drop_locked(z, ctn);
+        n++;
+    }
+    ngx_shmtx_unlock(&z->shpool->mutex);
+    return n;
+}
+
+
 ngx_int_t
 ngx_http_cache_turbo_shm_store(ngx_http_cache_turbo_zone_t *z,
     u_char *key_hash, uint32_t hash, u_char *data, size_t len,

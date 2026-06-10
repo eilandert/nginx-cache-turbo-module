@@ -35,6 +35,9 @@ static char *ngx_http_cache_turbo(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 static char *ngx_http_cache_turbo_key(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
+static char *ngx_http_cache_turbo_admin(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
+static ngx_int_t ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r);
 static ngx_int_t ngx_http_cache_turbo_init(ngx_conf_t *cf);
 
 
@@ -91,6 +94,13 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
       ngx_conf_set_sec_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_cache_turbo_loc_conf_t, lock_ttl),
+      NULL },
+
+    { ngx_string("cache_turbo_admin"),
+      NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_http_cache_turbo_admin,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0,
       NULL },
 
       ngx_null_command
@@ -747,6 +757,146 @@ ngx_http_cache_turbo_key(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     }
 
     return NGX_CONF_OK;
+}
+
+
+/* "cache_turbo_admin <zone>;" turns this location into a control endpoint for
+ * the named zone. Gate it with the usual allow/deny. */
+static char *
+ngx_http_cache_turbo_admin(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_http_cache_turbo_loc_conf_t  *clcf = conf;
+
+    ngx_str_t                 *value;
+    ngx_http_core_loc_conf_t  *core;
+
+    value = cf->args->elts;
+
+    clcf->admin_zone = ngx_shared_memory_add(cf, &value[1], 0,
+                                             &ngx_http_cache_turbo_module);
+    if (clcf->admin_zone == NULL) {
+        return NGX_CONF_ERROR;
+    }
+
+    clcf->admin = 1;
+
+    core = ngx_http_conf_get_module_loc_conf(cf, ngx_http_core_module);
+    core->handler = ngx_http_cache_turbo_admin_handler;
+
+    return NGX_CONF_OK;
+}
+
+
+/* GET  -> JSON stats for the zone.
+ * POST -> purge: ?all=1 purges the whole zone; ?key=<string> purges one key
+ *         (hashed the same way the cache hashes its key).
+ * Gating is the caller's responsibility (allow/deny in the location). */
+static ngx_int_t
+ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
+{
+    ngx_http_cache_turbo_loc_conf_t  *clcf;
+    ngx_http_cache_turbo_zone_t      *z;
+    ngx_buf_t                        *b;
+    ngx_chain_t                       out;
+    ngx_str_t                         body, type;
+    u_char                           *p;
+    ngx_int_t                         rc;
+    size_t                            len;
+
+    clcf = ngx_http_get_module_loc_conf(r, ngx_http_cache_turbo_module);
+    if (!clcf->admin || clcf->admin_zone == NULL) {
+        return NGX_HTTP_NOT_FOUND;
+    }
+
+    z = clcf->admin_zone->data;
+
+    if (r->method & (NGX_HTTP_POST|NGX_HTTP_PUT|NGX_HTTP_DELETE)) {
+        ngx_str_t  arg;
+        ngx_uint_t purged = 0;
+        ngx_uint_t all = 0;
+
+        if (r->args.len
+            && ngx_http_arg(r, (u_char *) "all", 3, &arg) == NGX_OK)
+        {
+            all = 1;
+        }
+
+        if (all) {
+            purged = ngx_http_cache_turbo_shm_purge_all(z);
+
+        } else if (r->args.len
+                   && ngx_http_arg(r, (u_char *) "key", 3, &arg) == NGX_OK)
+        {
+            ngx_md5_t  md5;
+            u_char     key_hash[32];
+            uint32_t   hash;
+
+            ngx_memzero(key_hash, sizeof(key_hash));
+            ngx_md5_init(&md5);
+            ngx_md5_update(&md5, arg.data, arg.len);
+            ngx_md5_final(key_hash, &md5);
+            hash = ngx_crc32_short(key_hash, 32);
+
+            purged = ngx_http_cache_turbo_shm_purge_key(z, key_hash, hash);
+
+        } else {
+            ngx_str_set(&type, "application/json");
+            ngx_str_set(&body,
+                "{\"error\":\"specify ?all=1 or ?key=<string>\"}\n");
+            r->headers_out.status = NGX_HTTP_BAD_REQUEST;
+            goto send;
+        }
+
+        p = ngx_pnalloc(r->pool, sizeof("{\"purged\":4294967295}\n"));
+        if (p == NULL) {
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
+        body.data = p;
+        body.len = ngx_sprintf(p, "{\"purged\":%ui}\n", purged) - p;
+        ngx_str_set(&type, "application/json");
+        r->headers_out.status = NGX_HTTP_OK;
+        goto send;
+    }
+
+    /* GET / HEAD -> stats */
+    len = sizeof("{\"hits\":,\"misses\":,\"stale_serves\":,\"refreshes\":,"
+                 "\"evictions\":}\n") + 6 * NGX_ATOMIC_T_LEN;
+    p = ngx_pnalloc(r->pool, len);
+    if (p == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+    body.data = p;
+    body.len = ngx_sprintf(p,
+        "{\"hits\":%uA,\"misses\":%uA,\"stale_serves\":%uA,"
+        "\"refreshes\":%uA,\"evictions\":%uA}\n",
+        z->sh->hits, z->sh->misses, z->sh->stale_serves,
+        z->sh->refreshes, z->sh->evictions) - p;
+    ngx_str_set(&type, "application/json");
+    r->headers_out.status = NGX_HTTP_OK;
+
+send:
+
+    r->headers_out.content_type = type;
+    r->headers_out.content_type_len = type.len;
+    r->headers_out.content_length_n = body.len;
+
+    rc = ngx_http_send_header(r);
+    if (rc == NGX_ERROR || rc > NGX_OK || r->header_only) {
+        return rc;
+    }
+
+    b = ngx_create_temp_buf(r->pool, body.len);
+    if (b == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+    ngx_memcpy(b->pos, body.data, body.len);
+    b->last = b->pos + body.len;
+    b->last_buf = 1;
+    b->last_in_chain = 1;
+
+    out.buf = b;
+    out.next = NULL;
+    return ngx_http_output_filter(r, &out);
 }
 
 

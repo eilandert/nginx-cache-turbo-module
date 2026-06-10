@@ -86,6 +86,8 @@ typedef struct {
     ngx_int_t                beta;        /* SWR aggressiveness, /1000       */
     time_t                   lock_ttl;    /* hard single-flight lock window */
     size_t                   max_size;    /* max single response to cache   */
+    ngx_flag_t               admin;       /* this location is an admin endpoint */
+    ngx_shm_zone_t          *admin_zone;  /* zone the admin endpoint manages */
 } ngx_http_cache_turbo_loc_conf_t;
 
 
@@ -135,6 +137,14 @@ ngx_http_cache_turbo_node_t *
 ngx_int_t ngx_http_cache_turbo_shm_store(ngx_http_cache_turbo_zone_t *z,
     u_char *key_hash, uint32_t hash, u_char *data, size_t len,
     ngx_uint_t status, time_t fresh_ttl);
+
+/* Purge a single entry by key hash. Returns 1 if an entry was removed, 0 if
+ * not present. */
+ngx_int_t ngx_http_cache_turbo_shm_purge_key(ngx_http_cache_turbo_zone_t *z,
+    u_char *key_hash, uint32_t hash);
+
+/* Purge every entry in the zone. Returns the number removed. */
+ngx_uint_t ngx_http_cache_turbo_shm_purge_all(ngx_http_cache_turbo_zone_t *z);
 
 
 /* ---- swr.c ---- */

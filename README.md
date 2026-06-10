@@ -72,6 +72,28 @@ is a `HIT` served from RAM in microseconds. Let it go stale and you'll see
 | `cache_turbo_beta N` | `server`, `location` | `1000` | SWR refresh aggressiveness, fixed-point ×1000 (1000 = 1.0). Higher → refresh earlier/more often. |
 | `cache_turbo_lock_ttl TIME` | `server`, `location` | `5s` | Hard single-flight window: once a refresh is claimed, all readers serve stale (skip the dice) until this expires or the refresh completes. Caps origin regens to ~one per stale cycle. |
 | `cache_turbo_max_size SIZE` | `server`, `location` | `1m` | Largest single response to cache. |
+| `cache_turbo_admin NAME` | `location` | — | Turn this location into a control endpoint for zone `NAME`. `GET` returns JSON stats; `POST ?all=1` purges the zone, `POST ?key=<string>` purges one key. Gate it with `allow`/`deny`. |
+
+### Admin endpoint
+
+```nginx
+location = /_cache {
+    cache_turbo_admin main;
+    allow 127.0.0.1;
+    deny all;
+}
+```
+
+```console
+$ curl localhost/_cache
+{"hits":1240,"misses":83,"stale_serves":12,"refreshes":11,"evictions":0}
+
+$ curl -X POST 'localhost/_cache?key=/blog/post-42'
+{"purged":1}
+
+$ curl -X POST 'localhost/_cache?all=1'
+{"purged":204}
+```
 
 The **stale window** is `cache_turbo_valid × 3` (the entry lives `× 4` total),
 so a `10s` fresh TTL keeps serving stale for another `30s` while it refreshes.
@@ -115,8 +137,9 @@ The resulting `objs/ngx_http_cache_turbo_module.so` is loaded with
 - [x] L1 shared-memory cache (rbtree + LRU eviction)
 - [x] Stale-while-revalidate + probabilistic single-flight refresh
 - [x] Full header fidelity + `X-Cache` debug header
-- [ ] Redis L2 backend (shared/persistent, multi-node) via async hiredis
-- [ ] Tag-based purge + REST admin API (`/_cache/purge`, `/_cache/stats`)
+- [x] REST admin endpoint: JSON stats + purge by key / purge all (`cache_turbo_admin`)
+- [ ] Redis L2 backend (shared/persistent, multi-node) — **native nginx client, no hiredis**
+- [ ] Tag-based purge (purge by tag, L1 + L2)
 - [ ] Smart cache-key normalisation (strip tracking params, sort args, Vary-aware)
 - [ ] Cache (re)warming — sitemap walk + TTL-extension
 - [ ] `conservative` / `balanced` / `aggressive` autotune presets
