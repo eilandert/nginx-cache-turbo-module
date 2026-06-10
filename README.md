@@ -70,6 +70,7 @@ is a `HIT` served from RAM in microseconds. Let it go stale and you'll see
 | `cache_turbo_key STRING` | `server`, `location` | `$uri` | The cache key (any nginx variables). |
 | `cache_turbo_valid TIME` | `server`, `location` | `60s` | Fresh TTL. After this the entry is *stale* (still served). |
 | `cache_turbo_beta N` | `server`, `location` | `1000` | SWR refresh aggressiveness, fixed-point ×1000 (1000 = 1.0). Higher → refresh earlier/more often. |
+| `cache_turbo_lock_ttl TIME` | `server`, `location` | `5s` | Hard single-flight window: once a refresh is claimed, all readers serve stale (skip the dice) until this expires or the refresh completes. Caps origin regens to ~one per stale cycle. |
 | `cache_turbo_max_size SIZE` | `server`, `location` | `1m` | Largest single response to cache. |
 
 The **stale window** is `cache_turbo_valid × 3` (the entry lives `× 4` total),

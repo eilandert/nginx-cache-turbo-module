@@ -198,6 +198,7 @@ ngx_http_cache_turbo_shm_store(ngx_http_cache_turbo_zone_t *z,
         ctn->fresh_until = now + fresh_ttl;
         ctn->stale_until = stale_ttl ? now + stale_ttl : 0;
         ctn->refreshing = 0;
+        ctn->refresh_lock_until = 0;
 
         ngx_queue_remove(&ctn->lru);
         ngx_queue_insert_head(&z->sh->lru, &ctn->lru);
@@ -241,6 +242,7 @@ ngx_http_cache_turbo_shm_store(ngx_http_cache_turbo_zone_t *z,
     ctn->fresh_until = now + fresh_ttl;
     ctn->stale_until = stale_ttl ? now + stale_ttl : 0;
     ctn->refreshing = 0;
+    ctn->refresh_lock_until = 0;
 
     ngx_rbtree_insert(&z->sh->rbtree, &ctn->node);
     ngx_queue_insert_head(&z->sh->lru, &ctn->lru);

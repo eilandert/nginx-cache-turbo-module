@@ -1,0 +1,436 @@
+#!/usr/bin/env python3
+"""End-to-end tests for ngx_http_cache_turbo_module.
+
+Covers v1/v1.1 features and the regressions logged in
+memory/nginx+angie/cache-turbo/issues.md:
+
+  R1  serve must not hold the shm lock (concurrency does not serialise/deadlock)
+  R2  header fidelity: Content-Type + arbitrary headers survive a HIT
+  R3  background refresh subrequest reaches origin (origin counter advances)
+  R4  single-flight: many readers of a stale key cause ~one origin regen
+  R6  LRU eviction under a full zone
+  B*  build issues are covered by the build job (strict -Werror compile)
+
+Each request to the origin returns a unique, monotonic body so a HIT (same
+body) is distinguishable from a MISS/regen (new body). The origin also counts
+how many times it was actually hit, which is how we assert single-flight.
+"""
+
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import http.server
+import pathlib
+import shlex
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.request
+
+
+SANITIZER_MARKERS = (
+    "AddressSanitizer",
+    "UndefinedBehaviorSanitizer",
+    "runtime error:",
+    "ERROR SUMMARY:",
+)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--nginx-binary", required=True)
+    parser.add_argument("--module")
+    parser.add_argument("--runner", default="")
+    parser.add_argument("--single-process", action="store_true")
+    parser.add_argument("--port", type=int, default=18880)
+    parser.add_argument("--redis-server")  # accepted; used by v2 L2 tests
+    return parser.parse_args()
+
+
+def wait_port(port: int, timeout: float = 15.0) -> None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", port), 0.25):
+                return
+        except OSError:
+            time.sleep(0.05)
+    raise RuntimeError(f"port 127.0.0.1:{port} never came up")
+
+
+def fetch(port: int, path: str, headers: dict | None = None):
+    """Return (status, body_str, response_headers_dict)."""
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}{path}",
+        headers={"Connection": "close", **(headers or {})},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            body = r.read().decode("utf-8", "replace")
+            return r.status, body, {k.lower(): v for k, v in r.headers.items()}
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", "replace")
+        return exc.code, body, {k.lower(): v for k, v in exc.headers.items()}
+
+
+# --------------------------------------------------------------------------- #
+# Counting origin: every GET returns a unique body and bumps a hit counter.
+# --------------------------------------------------------------------------- #
+
+class Origin:
+    def __init__(self, port: int, delay: float = 0.0) -> None:
+        self.port = port
+        self.delay = delay
+        self._n = 0
+        self._lock = threading.Lock()
+        self._server: http.server.ThreadingHTTPServer | None = None
+        self._thread: threading.Thread | None = None
+
+    @property
+    def hits(self) -> int:
+        with self._lock:
+            return self._n
+
+    def start(self) -> None:
+        origin = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                if origin.delay:
+                    time.sleep(origin.delay)
+                with origin._lock:
+                    origin._n += 1
+                    n = origin._n
+                body = f"gen-{n}\n".encode()
+                self.send_response(200)
+                self.send_header("Content-Type",
+                                 "application/json; charset=utf-8")
+                self.send_header("X-Backend", "origin-42")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                try:
+                    self.wfile.write(body)
+                except BrokenPipeError:
+                    pass
+
+            def log_message(self, *a):  # silence
+                pass
+
+        self._server = http.server.ThreadingHTTPServer(
+            ("127.0.0.1", self.port), Handler)
+        self._thread = threading.Thread(target=self._server.serve_forever,
+                                        daemon=True)
+        self._thread.start()
+        wait_port(self.port)
+
+    def stop(self) -> None:
+        if self._server:
+            self._server.shutdown()
+            self._server.server_close()
+            self._server = None
+
+
+def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
+                 origin_port: int, workers: int) -> str:
+    load = f"load_module {module};\n" if module else ""
+    return f"""{load}worker_processes {workers};
+pid {root}/nginx.pid;
+error_log {root}/logs/error.log notice;
+
+events {{ worker_connections 512; }}
+
+http {{
+    access_log off;
+
+    cache_turbo_zone name=main 16m;
+    cache_turbo_zone name=tiny 8m;   # small zone for eviction test (R6)
+
+    server {{
+        listen 127.0.0.1:{port};
+
+        # standard 30s-fresh cache
+        location /c/ {{
+            cache_turbo          main;
+            cache_turbo_key      $uri;
+            cache_turbo_valid    30s;
+            cache_turbo_max_size 1m;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # short fresh TTL so the stale window is reachable in-test
+        location /swr/ {{
+            cache_turbo          main;
+            cache_turbo_key      $uri;
+            cache_turbo_valid    1s;     # stale window = 3s, expires at 4s
+            cache_turbo_beta     5000;   # aggressive: refresh likely while stale
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # max_size = 4 bytes: origin body "gen-N\\n" is >4, so never cached
+        location /big/ {{
+            cache_turbo          main;
+            cache_turbo_key      $uri;
+            cache_turbo_valid    30s;
+            cache_turbo_max_size 4;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # tiny zone to force LRU eviction (R6)
+        location /e/ {{
+            cache_turbo          tiny;
+            cache_turbo_key      $uri;
+            cache_turbo_valid    30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # uncached passthrough, lets us read the raw origin
+        location /raw/ {{
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+    }}
+}}
+"""
+
+
+class Nginx:
+    def __init__(self, binary, module, root, port, origin_port, runner,
+                 single_process) -> None:
+        self.binary = binary
+        self.module = module
+        self.root = root
+        self.port = port
+        self.origin_port = origin_port
+        self.runner = shlex.split(runner)
+        self.single_process = single_process
+        self.process: subprocess.Popen | None = None
+        self.output_path = root / "nginx-output.log"
+
+    def write_config(self) -> None:
+        workers = 1 if self.single_process else 4
+        (self.root / "conf").mkdir(parents=True, exist_ok=True)
+        (self.root / "logs").mkdir(parents=True, exist_ok=True)
+        (self.root / "conf" / "nginx.conf").write_text(
+            nginx_config(self.root, self.port, self.module,
+                         self.origin_port, workers),
+            encoding="ascii")
+
+    def command(self, test: bool = False) -> list[str]:
+        cmd = [str(self.binary), "-p", str(self.root),
+               "-c", str(self.root / "conf" / "nginx.conf")]
+        if test:
+            cmd.append("-t")
+        elif self.single_process:
+            cmd.extend(["-g", "daemon off; master_process off;"])
+        else:
+            cmd.extend(["-g", "daemon off;"])
+        return self.runner + cmd
+
+    def config_test(self) -> None:
+        r = subprocess.run(self.command(test=True), text=True,
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           timeout=20)
+        if r.returncode != 0:
+            raise RuntimeError(f"nginx -t failed:\n{r.stdout}")
+
+    def start(self) -> None:
+        self.write_config()
+        out = self.output_path.open("a", encoding="utf-8")
+        self.process = subprocess.Popen(self.command(), text=True,
+                                        stdout=out, stderr=subprocess.STDOUT)
+        out.close()
+        try:
+            wait_port(self.port)
+        except Exception:
+            self.stop()
+            raise
+
+    def stop(self) -> None:
+        if self.process is None:
+            return
+        if self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait(timeout=5)
+        rc = self.process.returncode
+        self.process = None
+        if rc not in (0, -signal.SIGTERM):
+            out = (self.output_path.read_text(encoding="utf-8", errors="replace")
+                   if self.output_path.exists() else "")
+            raise RuntimeError(f"nginx exited with {rc}:\n{out}")
+
+    def assert_clean_logs(self) -> None:
+        paths = [self.output_path, self.root / "logs" / "error.log"]
+        combined = "\n".join(
+            p.read_text(encoding="utf-8", errors="replace")
+            for p in paths if p.exists())
+        for marker in SANITIZER_MARKERS:
+            if marker == "ERROR SUMMARY:" and "ERROR SUMMARY: 0 errors" in combined:
+                continue
+            if marker in combined:
+                raise AssertionError(f"runtime checker marker found: {marker}")
+        fatal = [ln for ln in combined.splitlines()
+                 if "[alert]" in ln or "[emerg]" in ln]
+        if fatal:
+            raise AssertionError("nginx logged fatal:\n" + "\n".join(fatal))
+
+
+# --------------------------------------------------------------------------- #
+# Tests
+# --------------------------------------------------------------------------- #
+
+def test_miss_then_hit(ng: Nginx) -> None:
+    """Basic: first request MISS (origin), second HIT (cached, same body)."""
+    before = None
+    s1, b1, h1 = fetch(ng.port, "/c/hit")
+    assert s1 == 200, f"miss status {s1}"
+    assert "x-cache" not in h1, f"first req should be a miss, got {h1.get('x-cache')}"
+    s2, b2, h2 = fetch(ng.port, "/c/hit")
+    assert s2 == 200
+    assert h2.get("x-cache") == "HIT", f"second req X-Cache={h2.get('x-cache')}"
+    assert b1 == b2, f"HIT body differs: {b1!r} vs {b2!r}"
+
+
+def test_header_fidelity(ng: Nginx) -> None:
+    """R2: Content-Type + arbitrary origin header survive a HIT byte-identical."""
+    fetch(ng.port, "/c/hdr")                       # prime
+    _, _, h = fetch(ng.port, "/c/hdr")             # HIT
+    assert h.get("x-cache") == "HIT"
+    assert h.get("content-type") == "application/json; charset=utf-8", \
+        f"content-type lost: {h.get('content-type')}"
+    assert h.get("x-backend") == "origin-42", \
+        f"custom header lost: {h.get('x-backend')}"
+
+
+def test_max_size_not_cached(ng: Nginx) -> None:
+    """Responses larger than cache_turbo_max_size are never cached."""
+    fetch(ng.port, "/big/x")
+    _, _, h = fetch(ng.port, "/big/x")
+    assert "x-cache" not in h, "oversized response should not be cached"
+
+
+def test_stale_serves_stale(ng: Nginx, origin: Origin) -> None:
+    """R3: once fresh TTL passes, the cache serves the stale copy (not a miss),
+    and a refresh eventually lands (the served body advances to a new gen)."""
+    s0, b0, _ = fetch(ng.port, "/swr/serve")       # prime
+    assert s0 == 200
+    time.sleep(1.3)                                # now stale (fresh=1s)
+    # first stale read: must still be 200 and the SAME (stale) body or a fresh
+    # regenerated one — never an error, never empty.
+    s1, b1, h1 = fetch(ng.port, "/swr/serve")
+    assert s1 == 200 and b1, f"stale serve failed: {s1} {b1!r}"
+    assert h1.get("x-cache") in ("STALE", None), \
+        f"expected STALE or fresh-regen, got {h1.get('x-cache')}"
+    # within the stale window the entry refreshes to a new generation
+    deadline = time.time() + 2.0
+    advanced = False
+    while time.time() < deadline:
+        _, b, h = fetch(ng.port, "/swr/serve")
+        if b != b0 and h.get("x-cache") == "HIT":
+            advanced = True
+            break
+        time.sleep(0.1)
+    assert advanced, "stale entry never refreshed to a new generation"
+
+
+def test_single_flight(ng: Nginx, origin: Origin) -> None:
+    """R4: a burst of readers on a stale key triggers far fewer origin regens
+    than readers (single-flight), and never a per-reader stampede."""
+    fetch(ng.port, "/swr/sf")                      # prime
+    base = origin.hits
+    time.sleep(1.3)                                # stale
+    # Fire a burst; the hard lock + dice must collapse this to a handful of
+    # origin regens, not one-per-reader. Poll a moment for in-flight refreshes.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
+        results = list(pool.map(lambda _: fetch(ng.port, "/swr/sf"),
+                                range(40)))
+    assert {r[0] for r in results} == {200}, \
+        f"stale burst returned {set(r[0] for r in results)}"
+    time.sleep(0.5)
+    regens = origin.hits - base
+    # Single-flight property: nowhere near 40. A small number is fine (dice can
+    # let a few through before the lock is visible across event-loop turns).
+    assert regens <= 8, \
+        f"single-flight failed: {regens} origin regens for 40 readers"
+
+
+def test_lru_eviction(ng: Nginx) -> None:
+    """R6: with a tiny zone, old entries are evicted, not 500s."""
+    # hammer many distinct keys through the tiny zone; must all 200, no errors
+    for i in range(200):
+        s, _, _ = fetch(ng.port, f"/e/{i}")
+        assert s == 200, f"/e/{i} returned {s}"
+
+
+def test_concurrent_hits_no_deadlock(ng: Nginx) -> None:
+    """R1: many parallel HITs on one key do not serialise/deadlock."""
+    fetch(ng.port, "/c/conc")                      # prime
+    start = time.time()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=32) as pool:
+        results = list(pool.map(lambda _: fetch(ng.port, "/c/conc"),
+                                range(500)))
+    elapsed = time.time() - start
+    assert all(r[0] == 200 for r in results), "some concurrent HITs failed"
+    assert all(r[2].get("x-cache") == "HIT" for r in results), \
+        "some concurrent reads were not HITs"
+    # 500 cached HITs should be fast; serialising under a held lock would blow this.
+    assert elapsed < 10, f"concurrent HITs took {elapsed:.1f}s (possible lock stall)"
+
+
+def run_all(ng: Nginx, origin: Origin) -> None:
+    test_miss_then_hit(ng)
+    test_header_fidelity(ng)
+    test_max_size_not_cached(ng)
+    test_concurrent_hits_no_deadlock(ng)
+    test_lru_eviction(ng)
+    test_stale_serves_stale(ng, origin)
+    test_single_flight(ng, origin)
+
+
+def main() -> int:
+    args = parse_args()
+    binary = pathlib.Path(args.nginx_binary).resolve()
+    module = pathlib.Path(args.module).resolve() if args.module else None
+    if not binary.exists():
+        raise FileNotFoundError(binary)
+    if module is not None and not module.exists():
+        raise FileNotFoundError(module)
+
+    origin_port = args.port + 11
+    with tempfile.TemporaryDirectory(prefix="cache-turbo-ci-") as tmp:
+        root = pathlib.Path(tmp)
+        origin = Origin(origin_port, delay=0.05)
+        ng = Nginx(binary, module, root / "server", args.port, origin_port,
+                   args.runner, args.single_process)
+        ng.write_config()
+        ng.config_test()
+        try:
+            origin.start()
+            ng.start()
+            run_all(ng, origin)
+            time.sleep(0.2)
+            ng.stop()
+            ng.assert_clean_logs()
+        finally:
+            ng.stop()
+            origin.stop()
+
+    print("OK: miss/hit, header fidelity, max_size, concurrency (R1), "
+          "LRU eviction (R6), stale serve (R3), single-flight (R4)")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        raise

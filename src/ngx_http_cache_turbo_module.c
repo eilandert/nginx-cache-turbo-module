@@ -86,6 +86,13 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
       offsetof(ngx_http_cache_turbo_loc_conf_t, max_size),
       NULL },
 
+    { ngx_string("cache_turbo_lock_ttl"),
+      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_sec_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_cache_turbo_loc_conf_t, lock_ttl),
+      NULL },
+
       ngx_null_command
 };
 
@@ -228,17 +235,29 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
                 stale_window = 1;
             }
 
+            /* Hard single-flight: if a refresh is already claimed and its lock
+             * window hasn't expired, every reader serves stale and skips the
+             * dice entirely. Only when no lock is held (or it has expired, i.e.
+             * the previous refresh died) does anyone roll to become the single
+             * regenerator. This caps origin regens at ~one per stale cycle even
+             * with many workers and aggressive beta. */
             refresh = NGX_DECLINED;
-            if (!ctn->refreshing) {
+            if (!ctn->refreshing || now >= ctn->refresh_lock_until) {
                 refresh = ngx_http_cache_turbo_should_refresh(ctx->key_hash,
                               fresh_until, stale_window, clcf->beta);
             }
 
             if (refresh == NGX_OK) {
-                /* we win the dice: claim the refresh, serve stale, let the
-                 * request fall through to the origin so the filters restore
-                 * a fresh copy. */
+                /* we win the dice: claim the refresh under lock (atomic with
+                 * the check above), serve stale, and fall through to origin so
+                 * the filters restore a fresh copy. The lock self-heals after
+                 * lock_ttl if this refresh never completes. */
+                time_t lock_ttl = clcf->lock_ttl;
+                if (lock_ttl <= 0) {
+                    lock_ttl = 5;
+                }
                 ctn->refreshing = 1;
+                ctn->refresh_lock_until = now + lock_ttl;
                 ngx_shmtx_unlock(&z->shpool->mutex);
                 (void) ngx_atomic_fetch_add(&z->sh->stale_serves, 1);
                 (void) ngx_atomic_fetch_add(&z->sh->refreshes, 1);
@@ -301,8 +320,10 @@ ngx_http_cache_turbo_serve(ngx_http_request_t *r, u_char *copy, size_t len,
 {
     u_char                           *p, *end, *body;
     size_t                            body_len;
+    ngx_int_t                         rc;
     ngx_buf_t                        *b;
     ngx_chain_t                       out;
+    ngx_http_cache_turbo_blob_hdr_t   hdr;
     ngx_http_cache_turbo_blob_hdr_t  *bh;
     ngx_http_cache_turbo_ctx_t       *ctx;
     uint32_t                          i;
@@ -312,12 +333,15 @@ ngx_http_cache_turbo_serve(ngx_http_request_t *r, u_char *copy, size_t len,
         ctx->served = 1;           /* stop our filters re-capturing */
     }
 
-    /* Backward/safety: blob must carry our header. */
+    /* Backward/safety: blob must carry our header. The blob is byte-aligned
+     * (ngx_pnalloc), so copy the header into a properly-aligned local rather
+     * than casting the buffer to the struct (which is misaligned UB). */
     if (len < sizeof(ngx_http_cache_turbo_blob_hdr_t)) {
         return NGX_ERROR;
     }
 
-    bh = (ngx_http_cache_turbo_blob_hdr_t *) copy;
+    ngx_memcpy(&hdr, copy, sizeof(hdr));
+    bh = &hdr;
     if (bh->magic != NGX_HTTP_CACHE_TURBO_BLOB_MAGIC) {
         return NGX_ERROR;
     }
@@ -326,6 +350,13 @@ ngx_http_cache_turbo_serve(ngx_http_request_t *r, u_char *copy, size_t len,
     end = p + bh->headers_len;
     body = end;
     body_len = bh->body_len;
+
+    /* guard: header block must fit inside the blob */
+    if (bh->headers_len > len - sizeof(hdr)
+        || body_len > len - sizeof(hdr) - bh->headers_len)
+    {
+        return NGX_ERROR;
+    }
 
     r->headers_out.status = bh->status;
     r->headers_out.content_length_n = body_len;
@@ -370,7 +401,8 @@ ngx_http_cache_turbo_serve(ngx_http_request_t *r, u_char *copy, size_t len,
     }
 
     if (r->header_only || body_len == 0) {
-        return NGX_OK;
+        ngx_http_finalize_request(r, NGX_OK);
+        return NGX_DONE;
     }
 
     b = ngx_calloc_buf(r->pool);
@@ -387,7 +419,14 @@ ngx_http_cache_turbo_serve(ngx_http_request_t *r, u_char *copy, size_t len,
     out.buf = b;
     out.next = NULL;
 
-    return ngx_http_output_filter(r, &out);
+    rc = ngx_http_output_filter(r, &out);
+
+    /* Finalize and return NGX_DONE so the ACCESS phase engine stops here and
+     * does NOT fall through to the location's content handler (proxy_pass).
+     * Returning the output-filter's NGX_OK would let nginx continue to the
+     * upstream, hitting the origin on every cache HIT. */
+    ngx_http_finalize_request(r, rc);
+    return NGX_DONE;
 }
 
 
@@ -484,7 +523,6 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
     if (last && ctx->body_len > 0
         && (clcf->max_size == 0 || ctx->body_len <= clcf->max_size))
     {
-        ngx_http_cache_turbo_blob_hdr_t  *bh;
         ngx_list_part_t                  *part;
         ngx_table_elt_t                  *h;
         ngx_str_t                         ct;
@@ -528,12 +566,16 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
 
         blob = ngx_pnalloc(r->pool, blob_len);
         if (blob != NULL) {
-            bh = (ngx_http_cache_turbo_blob_hdr_t *) blob;
-            bh->magic = NGX_HTTP_CACHE_TURBO_BLOB_MAGIC;
-            bh->nheaders = nheaders;
-            bh->headers_len = (uint32_t) hdr_bytes;
-            bh->body_len = (uint32_t) ctx->body_len;
-            bh->status = (uint32_t) r->headers_out.status;
+            ngx_http_cache_turbo_blob_hdr_t  bhw;
+
+            /* blob is byte-aligned; build the header in an aligned local and
+             * memcpy it in rather than writing through a misaligned cast. */
+            bhw.magic = NGX_HTTP_CACHE_TURBO_BLOB_MAGIC;
+            bhw.nheaders = nheaders;
+            bhw.headers_len = (uint32_t) hdr_bytes;
+            bhw.body_len = (uint32_t) ctx->body_len;
+            bhw.status = (uint32_t) r->headers_out.status;
+            ngx_memcpy(blob, &bhw, sizeof(bhw));
 
             w = blob + sizeof(ngx_http_cache_turbo_blob_hdr_t);
 
@@ -721,6 +763,7 @@ ngx_http_cache_turbo_create_loc_conf(ngx_conf_t *cf)
     conf->enable = NGX_CONF_UNSET;
     conf->valid = NGX_CONF_UNSET;
     conf->beta = NGX_CONF_UNSET;
+    conf->lock_ttl = NGX_CONF_UNSET;
     conf->max_size = NGX_CONF_UNSET_SIZE;
     /* shm_zone, key default NULL via pcalloc */
 
@@ -738,6 +781,7 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_sec_value(conf->valid, prev->valid, 60);
     ngx_conf_merge_value(conf->beta, prev->beta,
                          NGX_HTTP_CACHE_TURBO_DEFAULT_BETA);
+    ngx_conf_merge_sec_value(conf->lock_ttl, prev->lock_ttl, 5);
     ngx_conf_merge_size_value(conf->max_size, prev->max_size, 1024 * 1024);
 
     if (conf->shm_zone == NULL) {

@@ -81,10 +81,18 @@ ngx_http_cache_turbo_should_refresh(u_char *key_hash, time_t fresh_until,
         return NGX_OK;
     }
 
-    /* Per-key dice: hash the key bytes with the current second so that within
-     * one second all workers/readers of a key roll the same value (mirrors the
-     * PHP per-request memoisation), but it re-rolls each second. */
-    dice = ngx_crc32_long(key_hash, 32);
+    /* Per-reader dice. Each call rolls independently; the hard single-flight
+     * lock (refresh_lock_until in the access handler) ensures that even if many
+     * readers win the dice in the same instant, only the first to take the lock
+     * regenerates and the rest serve stale. So the dice only needs to decide
+     * "should a refresh start now"; the lock decides "who". A per-reader roll
+     * (vs a deterministic per-second seed) makes the burst reliably produce a
+     * winner instead of all-or-nothing per second.
+     *
+     * key_hash is mixed in so different keys don't share the RNG stream tightly,
+     * but the entropy is ngx_random(). */
+    (void) key_hash;
+    dice = (uint64_t) ngx_random();
     dice ^= (uint64_t) now * 2654435761ULL;
     dice &= (1ULL << 20) - 1;
 

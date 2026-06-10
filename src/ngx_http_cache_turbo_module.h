@@ -46,6 +46,11 @@ typedef struct {
     time_t                   generated_at;
 
     ngx_uint_t               refreshing;    /* a single-flight regen in air */
+    time_t                   refresh_lock_until; /* hard single-flight guard:
+                                              * while now < this, ALL readers
+                                              * serve stale and skip the dice;
+                                              * only the claimer regenerates.
+                                              * Self-heals if a refresh dies. */
     ngx_uint_t               status;        /* cached HTTP status           */
 
     ngx_queue_t              lru;           /* LRU list linkage             */
@@ -79,6 +84,7 @@ typedef struct {
     ngx_http_complex_value_t *key;        /* cache key expression           */
     time_t                   valid;       /* fresh TTL (seconds)            */
     ngx_int_t                beta;        /* SWR aggressiveness, /1000       */
+    time_t                   lock_ttl;    /* hard single-flight lock window */
     size_t                   max_size;    /* max single response to cache   */
 } ngx_http_cache_turbo_loc_conf_t;
 
