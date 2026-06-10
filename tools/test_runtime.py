@@ -146,21 +146,18 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
                  redis_port: int | None = None) -> str:
     load = f"load_module {module};\n" if module else ""
 
-    # L2 (v2b): wire a Redis backend + a location that uses it. Only emitted
-    # when a RedisServer is running, so the no-redis path still config-tests.
-    redis_http = ""
+    # L2 (v2b): a location wired to a Redis backend. Scoped to /l2/ only so the
+    # L1-only tests (purge, eviction, ...) are unaffected. Emitted only when a
+    # RedisServer is running, so the no-redis path still config-tests.
     redis_loc = ""
     if redis_port is not None:
-        redis_http = (
-            f"    cache_turbo_redis 127.0.0.1:{redis_port} "
-            f"prefix=ct: timeout=250ms;\n"
-        )
         redis_loc = f"""
-        # L2 write-through: stores land in Redis as well as L1
+        # L2: write-through on store + sync fill on L1 miss
         location /l2/ {{
             cache_turbo          main;
             cache_turbo_key      $uri;
             cache_turbo_valid    30s;
+            cache_turbo_redis    127.0.0.1:{redis_port} prefix=ct: timeout=250ms;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 """
@@ -173,7 +170,7 @@ events {{ worker_connections 512; }}
 
 http {{
     access_log off;
-{redis_http}
+
     cache_turbo_zone name=main 16m;
     cache_turbo_zone name=tiny 8m;   # small zone for eviction test (R6)
 
@@ -246,6 +243,7 @@ class Nginx:
         self.root = root
         self.port = port
         self.origin_port = origin_port
+        self.runner_raw = runner
         self.runner = shlex.split(runner)
         self.single_process = single_process
         self.redis_port = redis_port
@@ -565,6 +563,49 @@ def test_l2_write_through(ng: Nginx, origin: Origin, redis: RedisServer) -> None
     assert h2.get("x-cache") == "HIT" and b2 == body, "L1 hit broken after L2 set"
 
 
+def test_l2_cross_instance_fill(ng: Nginx, origin: Origin,
+                                redis: RedisServer) -> None:
+    """P2: an L1 miss fills from L2. A second, independent nginx with a cold L1
+    but the same Redis serves the object another node cached, without hitting
+    the origin again."""
+    uri = "/l2/p2"
+    redis.cli("DEL", l2_key(uri))
+
+    # Instance A (the main server): cold -> origin -> writes L1 + L2
+    s, body_a, ha = fetch(ng.port, uri)
+    assert s == 200 and "x-cache" not in ha, "A should miss to origin first"
+    assert wait_for(lambda: redis.cli("EXISTS", l2_key(uri)) == "1"), \
+        "A never wrote the object to L2"
+    origin_after_a = origin.hits
+
+    # Instance B: separate nginx, cold L1, same Redis + same origin
+    b = Nginx(ng.binary, ng.module, ng.root.parent / "server-b",
+              ng.port + 5, ng.origin_port, ng.runner_raw,
+              ng.single_process, ng.redis_port)
+    b.write_config()
+    b.config_test()
+    b.start()
+    try:
+        s2, body_b, hb = fetch(b.port, uri)
+        assert s2 == 200, f"B status {s2}"
+        assert body_b == body_a, f"B body {body_b!r} != A body {body_a!r}"
+        assert hb.get("x-cache") == "HIT", \
+            f"B X-Cache={hb.get('x-cache')} (expected an L2-fill HIT)"
+        assert origin.hits == origin_after_a, \
+            f"origin was hit on the L2 fill ({origin.hits} vs {origin_after_a})"
+
+        # B now has it in L1 too: second read is a plain L1 HIT
+        _, body_b2, hb2 = fetch(b.port, uri)
+        assert hb2.get("x-cache") == "HIT" and body_b2 == body_a
+        assert origin.hits == origin_after_a, "origin hit on B's L1 hit"
+
+        time.sleep(0.2)
+        b.stop()
+        b.assert_clean_logs()
+    finally:
+        b.stop()
+
+
 def run_all(ng: Nginx, origin: Origin,
             redis: RedisServer | None = None) -> None:
     test_miss_then_hit(ng)
@@ -579,6 +620,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_single_flight(ng, origin)
     if redis is not None:
         test_l2_write_through(ng, origin, redis)
+        test_l2_cross_instance_fill(ng, origin, redis)
     test_admin_purge_all(ng)   # last: it empties the zone
 
 
@@ -622,7 +664,8 @@ def main() -> int:
     print("OK: miss/hit, header fidelity, max_size, concurrency (R1), "
           "LRU eviction (R6), stale serve (R3), single-flight (R4), "
           "admin stats/purge/gating"
-          + (", L2 write-through (P4)" if redis_port else ""))
+          + (", L2 write-through (P4), L2 cross-instance fill (P2)"
+             if redis_port else ""))
     return 0
 
 

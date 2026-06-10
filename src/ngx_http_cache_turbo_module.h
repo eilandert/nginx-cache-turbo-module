@@ -104,6 +104,11 @@ typedef struct {
     unsigned                 captured:1;  /* response captured for store    */
     unsigned                 served:1;    /* we served from cache           */
     unsigned                 stale_hit:1; /* served stale (for X-Cache)      */
+    unsigned                 l2_pending:1;/* L2 GET parked, awaiting reply   */
+    unsigned                 l2_done:1;   /* L2 GET finished (hit or miss)   */
+    ngx_int_t                l2_result;   /* NGX_OK = L2 hit; else miss      */
+    u_char                  *l2_blob;     /* L2-hit blob, copied to r->pool  */
+    size_t                   l2_blob_len;
     ngx_chain_t             *body;        /* buffered response chain        */
     size_t                   body_len;
     ngx_str_t                cache_key;
@@ -178,6 +183,15 @@ size_t ngx_http_cache_turbo_redis_key(ngx_str_t *prefix, u_char *key_hash,
 void ngx_http_cache_turbo_redis_set(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf, u_char *key_hash,
     u_char *blob, size_t blob_len, time_t fresh_ttl);
+
+/* Sync-on-L1-miss GET. Issues GET <key> and parks the request (count++,
+ * NGX_AGAIN) until the reply arrives; the read handler stores the result in
+ * ctx (l2_done + l2_result + l2_blob) and resumes the phase engine. Returns:
+ *   NGX_AGAIN    - parked, caller must return NGX_AGAIN to suspend the request
+ *   NGX_DECLINED - L2 disabled or could not start; caller proceeds to origin
+ * On re-entry after the reply, the caller inspects ctx->l2_result. */
+ngx_int_t ngx_http_cache_turbo_redis_get(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_ctx_t *ctx);
 
 
 #endif /* NGX_HTTP_CACHE_TURBO_MODULE_H_INCLUDED_ */
