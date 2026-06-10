@@ -29,9 +29,10 @@ get from Varnish or a CDN:
 It is the spiritual successor to `srcache` + `memc`: same "decouple the cache
 from the backend" idea, but with the modern cache semantics srcache never had.
 
-> **Status: v1 (alpha).** L1 shared-memory cache with SWR + probabilistic
-> refresh works and is smoke-tested. Redis L2 (shared/multi-node), tag-based
-> purge, a REST admin API, smart key normalisation, cache warming, and the
+> **Status: v2c (alpha).** Working and tested (debug + ASan/UBSan + valgrind):
+> L1 shared-memory cache with SWR + probabilistic refresh, full header fidelity,
+> a REST admin API, native Redis L2 (shared/multi-node, no hiredis), and
+> tag-based + L2-aware purge. Smart key normalisation, cache warming, and the
 > conservative/balanced/aggressive autotune presets are on the roadmap below.
 
 ## Quick start
@@ -73,7 +74,8 @@ is a `HIT` served from RAM in microseconds. Let it go stale and you'll see
 | `cache_turbo_lock_ttl TIME` | `server`, `location` | `5s` | Hard single-flight window: once a refresh is claimed, all readers serve stale (skip the dice) until this expires or the refresh completes. Caps origin regens to ~one per stale cycle. |
 | `cache_turbo_max_size SIZE` | `server`, `location` | `1m` | Largest single response to cache. |
 | `cache_turbo_redis HOST:PORT [prefix=STR] [timeout=TIME]` | `http`, `server`, `location` | — | Add a shared **L2 Redis** tier behind the L1 shm cache. Stores write through asynchronously; an L1 miss does one synchronous Redis `GET` (off the hot path — L1 hits never touch Redis) and fills L1 on a hit. `prefix` defaults to `ct:`, `timeout` to `250ms`. Native client, no hiredis. |
-| `cache_turbo_admin NAME` | `location` | — | Turn this location into a control endpoint for zone `NAME`. `GET` returns JSON stats; `POST ?all=1` purges the zone, `POST ?key=<string>` purges one key (L1 only for now). Gate it with `allow`/`deny`. |
+| `cache_turbo_tag EXPR` | `server`, `location` | — | Tag stored objects so they can be purged as a group. `EXPR` (any nginx variables) yields a whitespace/comma list of tags — e.g. `cache_turbo_tag $upstream_http_x_cache_tags`. Each tag set is kept in L2, so this needs `cache_turbo_redis`. Purge with `POST ?tag=<name>`. |
+| `cache_turbo_admin NAME` | `location` | — | Turn this location into a control endpoint for zone `NAME`. `GET` returns JSON stats; `POST ?all=1` purges the zone, `POST ?key=<string>` purges one key, `POST ?tag=<name>` purges every object carrying that tag. With `cache_turbo_redis` on the admin location, `?key`/`?tag` drop the entry from **both** L1 and L2. Gate it with `allow`/`deny`. |
 
 ### Admin endpoint
 
@@ -92,9 +94,16 @@ $ curl localhost/_cache
 $ curl -X POST 'localhost/_cache?key=/blog/post-42'
 {"purged":1}
 
+$ curl -X POST 'localhost/_cache?tag=blog'
+{"purged":37}
+
 $ curl -X POST 'localhost/_cache?all=1'
 {"purged":204}
 ```
+
+Add `cache_turbo_redis` to the admin location (inherited from `server`/`http`
+is fine) so `?key` and `?tag` purges clear the **L2** tier too — otherwise a
+purged entry just refills from Redis on the next miss.
 
 The **stale window** is `cache_turbo_valid × 3` (the entry lives `× 4` total),
 so a `10s` fresh TTL keeps serving stale for another `30s` while it refreshes.
@@ -116,6 +125,40 @@ only on an L1 **miss** (one synchronous `GET`, then L1 is filled) and on
 what the first node cached, without re-hitting the origin. The entry lives in
 Redis for the full stale window (`cache_turbo_valid × 4`). The client never
 blocks on Redis for a hit.
+
+### Tag-based purge
+
+Tag objects on the way in, then invalidate a whole group with one request —
+handy for "drop everything touched by this blog post / product / category"
+without enumerating URLs.
+
+```nginx
+location / {
+    cache_turbo       main;
+    cache_turbo_redis 127.0.0.1:6379;
+    cache_turbo_tag   $upstream_http_x_cache_tags;   # e.g. "blog post-42"
+    proxy_pass        http://backend;
+}
+
+location = /_cache {
+    cache_turbo_admin main;
+    cache_turbo_redis 127.0.0.1:6379;                # so purges hit L2 too
+    allow 127.0.0.1; deny all;
+}
+```
+
+On store, each tag in the expression gets the object's key added to a Redis set
+`<prefix>tag:<name>` (with a TTL bounded by the stale window). A
+`POST ?tag=<name>` reads that set, drops every member from **both** L1 and L2,
+and deletes the set:
+
+```console
+$ curl -X POST 'localhost/_cache?tag=post-42'
+{"purged":6}
+```
+
+Tags live only in Redis, so `cache_turbo_tag` requires `cache_turbo_redis`
+(without it a tag purge returns `400`).
 
 ## How it works
 
@@ -157,8 +200,8 @@ The resulting `objs/ngx_http_cache_turbo_module.so` is loaded with
 - [x] Stale-while-revalidate + probabilistic single-flight refresh
 - [x] Full header fidelity + `X-Cache` debug header
 - [x] REST admin endpoint: JSON stats + purge by key / purge all (`cache_turbo_admin`)
-- [ ] Redis L2 backend (shared/persistent, multi-node) — **native nginx client, no hiredis**
-- [ ] Tag-based purge (purge by tag, L1 + L2)
+- [x] Redis L2 backend (shared/persistent, multi-node) — **native nginx client, no hiredis**
+- [x] Tag-based purge (purge by tag, L1 + L2) + L2-aware key/expired purge
 - [ ] Smart cache-key normalisation (strip tracking params, sort args, Vary-aware)
 - [ ] Cache (re)warming — sitemap walk + TTL-extension
 - [ ] `conservative` / `balanced` / `aggressive` autotune presets
