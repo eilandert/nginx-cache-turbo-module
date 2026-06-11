@@ -263,6 +263,13 @@ typedef struct {
      * as before. The clamp band is ngx_http_cache_turbo_bands[preset]. */
     ngx_flag_t               autotune;       /* cache_turbo_autotune on|off    */
     time_t                   autotune_interval; /* recompute cadence (seconds) */
+
+    /* Honor upstream freshness (v7). When on, the fresh TTL for a stored response
+     * is taken from its own Cache-Control s-maxage / max-age (s-maxage wins), or
+     * else its Expires header, instead of the static per-status TTL. Falls back to
+     * the configured TTL when the response carries no freshness info. Off by
+     * default so existing fixed-TTL configs are unchanged. */
+    ngx_flag_t               honor_cc;
     size_t                   max_size;    /* max single response to cache   */
     ngx_flag_t               admin;       /* this location is an admin endpoint */
     ngx_shm_zone_t          *admin_zone;  /* zone the admin endpoint manages */

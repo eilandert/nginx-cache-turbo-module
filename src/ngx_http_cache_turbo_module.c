@@ -164,6 +164,13 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
       offsetof(ngx_http_cache_turbo_loc_conf_t, autotune_interval),
       NULL },
 
+    { ngx_string("cache_turbo_honor_cache_control"),
+      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_cache_turbo_loc_conf_t, honor_cc),
+      NULL },
+
     { ngx_string("cache_turbo_admin"),
       NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
       ngx_http_cache_turbo_admin,
@@ -363,6 +370,96 @@ ngx_http_cache_turbo_status_ttl(ngx_http_cache_turbo_loc_conf_t *clcf,
             if (v[i].status == status) {
                 return v[i].valid;
             }
+        }
+    }
+
+    return -1;
+}
+
+
+/* Parse the integer delta-seconds after a Cache-Control "<dir>=" token in
+ * [p,last). Returns -1 if the token is absent or has no numeric value. */
+static time_t
+ngx_http_cache_turbo_cc_delta(u_char *p, u_char *last, const char *dir,
+    size_t dirlen)
+{
+    u_char  *q, *e;
+
+    q = ngx_strlcasestrn(p, last, (u_char *) dir, dirlen - 1);
+    if (q == NULL) {
+        return -1;
+    }
+    q += dirlen;                       /* past "<dir>=" */
+    for (e = q; e < last && *e >= '0' && *e <= '9'; e++) { /* void */ }
+    if (e == q) {
+        return -1;
+    }
+    return (time_t) ngx_atoi(q, e - q);
+}
+
+
+/*
+ * Fresh TTL derived from the response's own freshness headers (v7), or -1 if it
+ * carries none. Cache-Control s-maxage wins over max-age; otherwise Expires
+ * (absolute) minus now. A past Expires / a parse miss clamps to 0 (store but
+ * immediately stale). no-store/private/max-age=0 are already refused upstream by
+ * response_cacheable, so they never reach here.
+ */
+static time_t
+ngx_http_cache_turbo_upstream_ttl(ngx_http_request_t *r)
+{
+    ngx_list_part_t  *part;
+    ngx_table_elt_t  *h;
+    ngx_uint_t        i;
+    u_char           *cc = NULL, *cc_last = NULL;
+    ngx_str_t         expires = ngx_null_string;
+    time_t            t;
+
+    part = &r->headers_out.headers.part;
+    h = part->elts;
+    for (i = 0; /* void */ ; i++) {
+        if (i >= part->nelts) {
+            if (part->next == NULL) {
+                break;
+            }
+            part = part->next;
+            h = part->elts;
+            i = 0;
+        }
+        if (h[i].hash == 0 || h[i].key.len == 0) {
+            continue;
+        }
+        if (h[i].key.len == sizeof("Cache-Control") - 1
+            && ngx_strncasecmp(h[i].key.data, (u_char *) "Cache-Control",
+                               sizeof("Cache-Control") - 1) == 0)
+        {
+            cc = h[i].value.data;
+            cc_last = cc + h[i].value.len;
+        } else if (h[i].key.len == sizeof("Expires") - 1
+                   && ngx_strncasecmp(h[i].key.data, (u_char *) "Expires",
+                                      sizeof("Expires") - 1) == 0)
+        {
+            expires = h[i].value;
+        }
+    }
+
+    if (cc != NULL) {
+        t = ngx_http_cache_turbo_cc_delta(cc, cc_last, "s-maxage=",
+                                          sizeof("s-maxage=") - 1);
+        if (t < 0) {
+            t = ngx_http_cache_turbo_cc_delta(cc, cc_last, "max-age=",
+                                              sizeof("max-age=") - 1);
+        }
+        if (t >= 0) {
+            return t;
+        }
+    }
+
+    if (expires.len) {
+        time_t  exp = ngx_parse_http_time(expires.data, expires.len);
+        if (exp != NGX_ERROR) {
+            exp -= ngx_time();
+            return (exp > 0) ? exp : 0;
         }
     }
 
@@ -972,6 +1069,15 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
         ttl = ngx_http_cache_turbo_status_ttl(clcf, r->headers_out.status);
         if (ttl < 0) {
             return ngx_http_next_body_filter(r, in);   /* not cacheable */
+        }
+
+        /* Honor upstream freshness (v7): let the response's own
+         * Cache-Control/Expires set the fresh TTL when enabled. */
+        if (clcf->honor_cc) {
+            time_t  up = ngx_http_cache_turbo_upstream_ttl(r);
+            if (up >= 0) {
+                ttl = up;
+            }
         }
 
         /* Synthesise a Content-Type entry from the typed field (it is not in
@@ -2679,6 +2785,7 @@ ngx_http_cache_turbo_create_loc_conf(ngx_conf_t *cf)
     conf->lock_ttl_raw = NGX_CONF_UNSET;
     conf->autotune = NGX_CONF_UNSET;
     conf->autotune_interval = NGX_CONF_UNSET;
+    conf->honor_cc = NGX_CONF_UNSET;
     conf->max_size = NGX_CONF_UNSET_SIZE;
     conf->redis_enable = NGX_CONF_UNSET;
     conf->redis_timeout = NGX_CONF_UNSET_MSEC;
@@ -2758,6 +2865,9 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     /* Bypass / no-store predicates (v9). */
     ngx_conf_merge_ptr_value(conf->bypass, prev->bypass, NULL);
     ngx_conf_merge_ptr_value(conf->no_store, prev->no_store, NULL);
+
+    /* Honor upstream Cache-Control/Expires (v7): off by default. */
+    ngx_conf_merge_value(conf->honor_cc, prev->honor_cc, 0);
 
     /* Live autotune (v4-3): off by default; default recompute cadence when on. */
     ngx_conf_merge_value(conf->autotune, prev->autotune, 0);

@@ -177,6 +177,9 @@ class Origin:
                     # mimic a native nginx cache (proxy_cache) sitting behind us
                     self.send_header("Age", "123")
                     self.send_header("X-Cache-Status", "HIT")
+                if "ttl1" in self.path:
+                    # upstream-declared 1s freshness (v7 honor_cache_control)
+                    self.send_header("Cache-Control", "public, max-age=1")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 try:
@@ -377,6 +380,18 @@ http {{
             cache_turbo_valid 30s;
             cache_turbo_valid 301 302 308 30s;
             cache_turbo_valid 404 410 30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # honor upstream Cache-Control (v7): origin says max-age=1, so the entry
+        # goes stale at ~1s even though cache_turbo_valid is 60s. beta 1 ~ never
+        # refresh, so a read inside the stale window is deterministically STALE.
+        location /cc7/ {{
+            cache_turbo                    main;
+            cache_turbo_key                $uri;
+            cache_turbo_valid              60s;
+            cache_turbo_beta               1;
+            cache_turbo_honor_cache_control on;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
@@ -961,6 +976,20 @@ def test_head_not_stored(ng: Nginx) -> None:
     assert "x-cache" not in h1, "GET after HEAD should still be a MISS"
     _, _, h2 = fetch_raw(ng.port, "/c/headonly", method="GET")
     assert h2.get("x-cache") == "HIT", "GET should cache normally after the HEAD"
+
+
+def test_honor_cache_control(ng: Nginx) -> None:
+    """v7: with honor_cache_control on, the origin's max-age=1 shortens the fresh
+    TTL below the configured 60s — so the entry is stale at ~2s."""
+    _, _, h0 = fetch(ng.port, "/cc7/ttl1")
+    assert "x-cache" not in h0, "first should miss"
+    _, _, h1 = fetch(ng.port, "/cc7/ttl1")
+    assert h1.get("x-cache") == "HIT", "second should be a fresh HIT (<1s)"
+    time.sleep(2.0)                               # past max-age=1, within stale
+    _, _, h2 = fetch(ng.port, "/cc7/ttl1")
+    assert h2.get("x-cache") == "STALE", \
+        ("honor_cache_control: entry should be STALE at 2s (max-age=1 < 60s), "
+         f"got {h2.get('x-cache')}")
 
 
 def test_bypass(ng: Nginx) -> None:
@@ -1948,6 +1977,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_cache_redirect(ng)
     test_cache_negative_404(ng)
     test_head_not_stored(ng)
+    test_honor_cache_control(ng)
     test_bypass(ng)
     test_no_store(ng)
     test_native_cache_headers_stripped(ng)
@@ -2071,7 +2101,8 @@ def main() -> int:
           "cacheability floor (Set-Cookie/CC-private/CC-no-store/Authorization "
           "not cached), default-key Host split, "
           "per-status caching (301/404 cached, HEAD not stored), "
-          "bypass + no_store, native-cache headers stripped, "
+          "honor upstream Cache-Control, bypass + no_store, "
+          "native-cache headers stripped, "
           "admin purge w/ body, "
           "concurrency (R1), prometheus metrics, "
           "LRU eviction (R6), stale serve (R3), single-flight (R4), "
