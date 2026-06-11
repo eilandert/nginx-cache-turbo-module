@@ -1328,6 +1328,37 @@ def test_normalize_vary_off_by_default(ng: Nginx, origin: Origin) -> None:
     assert origin.hits == base + 1, "vary off must keep one slot regardless of headers"
 
 
+def test_normalize_vary_encoding_zstd(ng: Nginx, origin: Origin) -> None:
+    """v4-3 (issues V6): the encoding bucket ranks zstd ABOVE br — we ship
+    http-zstd, which serves zstd whenever the client advertises it (winning over
+    brotli/gzip). So zstd / br / gzip are three distinct slots, two zstd requests
+    share one, and a zstd-only client never reads the identity slot. 'zstd, br'
+    collapses to the zstd class (HITs the zstd entry, not br)."""
+    base = origin.hits
+    _, bz, hz = fetch(ng.port, "/ve/z", headers={"Accept-Encoding": "zstd"})
+    assert "x-cache" not in hz, "first (zstd) request should miss to origin"
+    _, bb, hb = fetch(ng.port, "/ve/z", headers={"Accept-Encoding": "br"})
+    assert "x-cache" not in hb, \
+        f"br must be a separate slot from zstd, got X-Cache={hb.get('x-cache')}"
+    _, bg, hg = fetch(ng.port, "/ve/z", headers={"Accept-Encoding": "gzip"})
+    assert "x-cache" not in hg, \
+        f"gzip must be a separate slot, got X-Cache={hg.get('x-cache')}"
+    assert len({bz, bb, bg}) == 3, "zstd/br/gzip must be three distinct slots"
+    assert origin.hits == base + 3, "zstd/br/gzip should each reach origin once"
+
+    # identity client (no Accept-Encoding) must not read the zstd entry
+    _, bi, hi = fetch(ng.port, "/ve/z")
+    assert "x-cache" not in hi, \
+        f"zstd-only entry must not serve an identity client, got {hi.get('x-cache')}"
+    assert bi not in (bz, bb, bg), "identity slot served an encoded-class body"
+
+    # two zstd share one slot; 'zstd, br' collapses to the zstd class
+    _, bz2, hz2 = fetch(ng.port, "/ve/z", headers={"Accept-Encoding": "zstd, br"})
+    assert hz2.get("x-cache") == "HIT", \
+        f"second zstd request should HIT the zstd slot, got X-Cache={hz2.get('x-cache')}"
+    assert bz2 == bz, "two zstd requests must share one slot"
+
+
 def test_invalid_normalize_vary_token(ng: Nginx) -> None:
     """v3-4: an unknown cache_turbo_normalize_vary token is rejected at config
     time (nginx -t fails) with a clear message, not silently ignored."""
@@ -1523,6 +1554,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_normalize_vary_device(ng, origin)
     test_normalize_vary_both(ng, origin)
     test_normalize_vary_off_by_default(ng, origin)
+    test_normalize_vary_encoding_zstd(ng, origin)
     test_invalid_normalize_vary_token(ng)
     test_preset_window_differs(ng, origin)
     test_invalid_preset_name(ng)
@@ -1586,7 +1618,7 @@ def main() -> int:
           "key normalize (v3-1: order/tracking/"
           "custom-strip/strip-all/distinct), "
           "vary suffix (v3-4: encoding/device/both/off-by-default, "
-          "invalid-token rejected), "
+          "zstd>br bucket (V6), invalid-token rejected), "
           "presets (v3-2: conservative/aggressive stale-window differ, "
           "invalid-name rejected), "
           "autotune (v4-3: raises beta within band/off-by-default/"

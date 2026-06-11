@@ -1757,9 +1757,13 @@ ngx_http_cache_turbo_tok_cmp(const void *one, const void *two)
 /* ----- Vary-aware suffix (v3-4) --------------------------------------------- */
 
 /* Accept-Encoding collapsed to a small, stable enum so the cache shards by what
- * the response actually IS (br/gzip/identity), not by the per-browser raw header.
- * Priority br > gzip: this mirrors what nginx+brotli/gzip serve when the client
- * accepts both. Absent/empty header => identity. Case-insensitive substring. */
+ * the response actually IS (zstd/br/gzip/identity), not by the per-browser raw
+ * header. Priority zstd > br > gzip mirrors what our stack serves when the client
+ * accepts several: the http-zstd filter emits zstd whenever the client advertises
+ * zstd (ngx_http_zstd_ok), winning over brotli/gzip, and brotli wins over gzip.
+ * We ship http-zstd, so zstd MUST be bucketed or a zstd-only client could read an
+ * identity entry and a zstd+br client could collide a zstd body under ae=br
+ * (issues V6). Absent/empty header => identity. Case-insensitive substring. */
 static const char *
 ngx_http_cache_turbo_ae_class(ngx_http_request_t *r)
 {
@@ -1773,6 +1777,9 @@ ngx_http_cache_turbo_ae_class(ngx_http_request_t *r)
     s = ae->value.data;
     last = s + ae->value.len;
 
+    if (ngx_strlcasestrn(s, last, (u_char *) "zstd", 4 - 1) != NULL) {
+        return "zstd";
+    }
     if (ngx_strlcasestrn(s, last, (u_char *) "br", 2 - 1) != NULL) {
         return "br";
     }
