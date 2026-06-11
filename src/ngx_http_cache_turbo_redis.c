@@ -20,6 +20,10 @@
 
 #include "ngx_http_cache_turbo_module.h"
 
+#if (NGX_SSL)
+#include <ngx_event_openssl.h>
+#endif
+
 
 /* Hard ceiling on a GET reply, so a bogus/huge value can't grow the recv
  * buffer without bound. Comfortably above any sane cached page. */
@@ -34,13 +38,23 @@
 typedef struct {
     ngx_peer_connection_t        peer;
     ngx_pool_t                  *pool;
-    ngx_buf_t                   *send;     /* RESP command to write           */
+    ngx_buf_t                   *send;     /* buffer currently being written  */
     ngx_msec_t                   timeout;
 
     ngx_http_request_t          *request;  /* GET/SMEMBERS/SCAN/lock: parked req */
     ngx_http_cache_turbo_ctx_t  *ctx;      /* GET/lock: request ctx to fill   */
-    ngx_http_cache_turbo_loc_conf_t *clcf; /* SCAN: rebuild next SCAN + del_raw */
+    ngx_http_cache_turbo_loc_conf_t *clcf; /* DSN/TLS + SCAN rebuild + del_raw */
     unsigned                     is_lock:1;/* lock op (deposits ctx->lock_*)  */
+
+    /* AUTH/SELECT preamble (v5 DSN). When the backend needs auth or a non-zero
+     * db, `preamble` holds the pipelined AUTH (+SELECT) RESP; it is written
+     * first and its `preamble_replies` simple replies consumed before `command`
+     * (the real op) is written and `read_handler` installed. */
+    ngx_buf_t                   *command;     /* the real RESP op             */
+    ngx_buf_t                   *preamble;    /* AUTH/SELECT, or NULL          */
+    ngx_uint_t                   preamble_replies;
+    unsigned                     in_preamble:1;
+    void                       (*read_handler)(ngx_event_t *); /* real reader  */
 
     /* SMEMBERS / SCAN: completion callback + opaque data (purge policy) */
     ngx_http_cache_turbo_redis_members_pt  members_cb;
@@ -50,11 +64,13 @@ typedef struct {
     size_t                       rcap;
     size_t                       rlen;
 
-    u_char                       recv[128];/* SET: reply scratch (+OK / -ERR) */
+    u_char                       recv[256];/* SET/lock/preamble reply scratch */
+    size_t                       recv_len; /* bytes buffered in recv[]        */
 } ngx_http_cache_turbo_redis_op_t;
 
 
 static void ngx_http_cache_turbo_redis_write(ngx_event_t *wev);
+static void ngx_http_cache_turbo_redis_read_preamble(ngx_event_t *rev);
 static void ngx_http_cache_turbo_redis_read_drain(ngx_event_t *rev);
 static void ngx_http_cache_turbo_redis_read_get(ngx_event_t *rev);
 static void ngx_http_cache_turbo_redis_read_smembers(ngx_event_t *rev);
@@ -72,6 +88,14 @@ static void ngx_http_cache_turbo_redis_smembers_finish(
     ngx_uint_t nmembers);
 static void ngx_http_cache_turbo_redis_op_fail(
     ngx_http_cache_turbo_redis_op_t *op);
+static ngx_int_t ngx_http_cache_turbo_redis_launch(
+    ngx_http_cache_turbo_redis_op_t *op,
+    ngx_http_cache_turbo_loc_conf_t *clcf, void (*read_handler)(ngx_event_t *));
+#if (NGX_SSL)
+static void ngx_http_cache_turbo_redis_tls_handshake(ngx_event_t *ev);
+static void ngx_http_cache_turbo_redis_tls_handshake_done(
+    ngx_connection_t *c);
+#endif
 
 
 size_t
@@ -165,6 +189,30 @@ ngx_http_cache_turbo_redis_connect(ngx_http_cache_turbo_redis_op_t *op,
 
     c = op->peer.connection;
     c->data = op;
+
+#if (NGX_SSL)
+    if (op->clcf != NULL && op->clcf->redis_tls) {
+        /* A peer connection has no pool of its own; ngx_ssl_create_connection
+         * allocates c->ssl from c->pool, so lend it the op pool (which outlives
+         * the connection and is torn down in op_done). */
+        c->pool = op->pool;
+
+        /* TLS: drive the SSL handshake first; only after it completes do we run
+         * the redis write/read handlers. The handshake handler fires on the
+         * connect-complete (writable) event. */
+        c->write->handler = ngx_http_cache_turbo_redis_tls_handshake;
+        c->read->handler = ngx_http_cache_turbo_redis_tls_handshake;
+
+        if (op->timeout) {
+            ngx_add_timer(c->write, op->timeout);
+        }
+        if (rc == NGX_OK) {
+            ngx_post_event(c->write, &ngx_posted_events);
+        }
+        return NGX_OK;
+    }
+#endif
+
     c->write->handler = ngx_http_cache_turbo_redis_write;
     c->read->handler = read_handler;
 
@@ -183,6 +231,198 @@ ngx_http_cache_turbo_redis_connect(ngx_http_cache_turbo_redis_op_t *op,
 
     return NGX_OK;
 }
+
+
+/* Build the AUTH (+ optional ACL user) and SELECT <db> preamble pipeline for a
+ * DSN backend, into one buffer allocated from pool. Sets *nreplies to the number
+ * of simple replies to consume (0, 1, or 2). Returns NULL when no preamble is
+ * needed (no password and db 0) OR on allocation failure (caller treats NULL as
+ * "no preamble"; an alloc failure there merely means the op runs unauthenticated
+ * and redis rejects it — surfaced as a normal op failure, never a crash). */
+static ngx_buf_t *
+ngx_http_cache_turbo_redis_preamble(ngx_pool_t *pool,
+    ngx_http_cache_turbo_loc_conf_t *clcf, ngx_uint_t *nreplies)
+{
+    ngx_str_t   argv[3];
+    ngx_buf_t  *au = NULL, *sel = NULL, *out;
+    u_char     *dbbuf;
+    size_t      n1 = 0, n2 = 0;
+
+    *nreplies = 0;
+
+    if (clcf->redis_password.len) {
+        argv[0].data = (u_char *) "AUTH";
+        argv[0].len = sizeof("AUTH") - 1;
+        if (clcf->redis_user.len) {
+            argv[1] = clcf->redis_user;
+            argv[2] = clcf->redis_password;
+            au = ngx_http_cache_turbo_redis_encode(pool, argv, 3);
+        } else {
+            argv[1] = clcf->redis_password;
+            au = ngx_http_cache_turbo_redis_encode(pool, argv, 2);
+        }
+        if (au == NULL) {
+            return NULL;
+        }
+        (*nreplies)++;
+    }
+
+    if (clcf->redis_db > 0) {
+        dbbuf = ngx_pnalloc(pool, NGX_INT_T_LEN);
+        if (dbbuf == NULL) {
+            return NULL;
+        }
+        argv[0].data = (u_char *) "SELECT";
+        argv[0].len = sizeof("SELECT") - 1;
+        argv[1].data = dbbuf;
+        argv[1].len = (size_t) (ngx_sprintf(dbbuf, "%i", clcf->redis_db)
+                                - dbbuf);
+        sel = ngx_http_cache_turbo_redis_encode(pool, argv, 2);
+        if (sel == NULL) {
+            return NULL;
+        }
+        (*nreplies)++;
+    }
+
+    if (au == NULL && sel == NULL) {
+        return NULL;
+    }
+    if (au != NULL && sel == NULL) {
+        return au;
+    }
+    if (au == NULL) {
+        return sel;
+    }
+
+    /* pipeline AUTH + SELECT into one buffer */
+    n1 = au->last - au->pos;
+    n2 = sel->last - sel->pos;
+    out = ngx_create_temp_buf(pool, n1 + n2);
+    if (out == NULL) {
+        return NULL;
+    }
+    out->last = ngx_cpymem(out->last, au->pos, n1);
+    out->last = ngx_cpymem(out->last, sel->pos, n2);
+    return out;
+}
+
+
+/* Wire op->command (the real RESP op, already in op->send) + the AUTH/SELECT
+ * preamble, then connect. The write path sends the preamble first (if any),
+ * consumes its replies, then sends the command and installs read_handler. */
+static ngx_int_t
+ngx_http_cache_turbo_redis_launch(ngx_http_cache_turbo_redis_op_t *op,
+    ngx_http_cache_turbo_loc_conf_t *clcf, void (*read_handler)(ngx_event_t *))
+{
+    op->clcf = clcf;
+    op->command = op->send;
+    op->read_handler = read_handler;
+
+    op->preamble = ngx_http_cache_turbo_redis_preamble(op->pool, clcf,
+                       &op->preamble_replies);
+    if (op->preamble != NULL) {
+        op->send = op->preamble;
+        op->in_preamble = 1;
+    }
+
+    return ngx_http_cache_turbo_redis_connect(op, &clcf->redis_addr,
+               read_handler);
+}
+
+
+#if (NGX_SSL)
+/* Outgoing-TLS handshake driver. Fires on connect-complete, wraps the socket in
+ * the location's client SSL context, runs the handshake, and on success hands
+ * off to the redis write path. Any failure tears the op down as a miss. */
+static void
+ngx_http_cache_turbo_redis_tls_handshake(ngx_event_t *ev)
+{
+    ngx_int_t                         rc;
+    ngx_connection_t                 *c = ev->data;
+    ngx_http_cache_turbo_redis_op_t  *op = c->data;
+
+    if (c->read->timedout || c->write->timedout) {
+        ngx_log_error(NGX_LOG_INFO, c->log, NGX_ETIMEDOUT,
+                      "cache_turbo: redis TLS handshake timed out");
+        ngx_http_cache_turbo_redis_op_fail(op);
+        return;
+    }
+
+    if (c->ssl == NULL) {
+        if (ngx_ssl_create_connection(op->clcf->redis_ssl, c,
+                NGX_SSL_BUFFER|NGX_SSL_CLIENT) != NGX_OK)
+        {
+            ngx_http_cache_turbo_redis_op_fail(op);
+            return;
+        }
+
+        /* SNI: send the DSN host (or tls_name override) as the server name. */
+        {
+            ngx_str_t  sni = op->clcf->redis_tls_name.len
+                                 ? op->clcf->redis_tls_name
+                                 : op->clcf->redis_host;
+            if (sni.len) {
+                u_char *name = ngx_pnalloc(op->pool, sni.len + 1);
+                if (name != NULL) {
+                    ngx_memcpy(name, sni.data, sni.len);
+                    name[sni.len] = '\0';
+                    (void) SSL_set_tlsext_host_name(c->ssl->connection,
+                                                    (char *) name);
+                }
+            }
+        }
+    }
+
+    rc = ngx_ssl_handshake(c);
+
+    if (rc == NGX_AGAIN) {
+        c->ssl->handler = ngx_http_cache_turbo_redis_tls_handshake_done;
+        return;
+    }
+
+    ngx_http_cache_turbo_redis_tls_handshake_done(c);
+}
+
+
+static void
+ngx_http_cache_turbo_redis_tls_handshake_done(ngx_connection_t *c)
+{
+    ngx_http_cache_turbo_redis_op_t  *op = c->data;
+
+    if (!c->ssl->handshaked) {
+        ngx_http_cache_turbo_redis_op_fail(op);
+        return;
+    }
+
+    if (op->clcf->redis_tls_verify) {
+        ngx_str_t  name = op->clcf->redis_tls_name.len
+                              ? op->clcf->redis_tls_name
+                              : op->clcf->redis_host;
+
+        if (SSL_get_verify_result(c->ssl->connection) != X509_V_OK) {
+            ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                          "cache_turbo: redis TLS certificate verify failed");
+            ngx_http_cache_turbo_redis_op_fail(op);
+            return;
+        }
+        if (name.len && ngx_ssl_check_host(c, &name) != NGX_OK) {
+            ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                          "cache_turbo: redis TLS host \"%V\" mismatch", &name);
+            ngx_http_cache_turbo_redis_op_fail(op);
+            return;
+        }
+    }
+
+    /* handshake good: now run the redis write path (preamble then command) */
+    c->write->handler = ngx_http_cache_turbo_redis_write;
+    c->read->handler = op->read_handler;
+
+    if (op->timeout) {
+        ngx_add_timer(c->write, op->timeout);
+    }
+    ngx_post_event(c->write, &ngx_posted_events);
+}
+#endif
 
 
 /* Allocate an op with its own pool (so it can outlive the spawning request)
@@ -266,7 +506,7 @@ ngx_http_cache_turbo_redis_set(ngx_http_request_t *r,
         return;
     }
 
-    if (ngx_http_cache_turbo_redis_connect(op, &clcf->redis_addr,
+    if (ngx_http_cache_turbo_redis_launch(op, clcf,
             ngx_http_cache_turbo_redis_read_drain) != NGX_OK)
     {
         ngx_destroy_pool(pool);
@@ -294,7 +534,7 @@ ngx_http_cache_turbo_redis_fire_argv(ngx_http_cache_turbo_loc_conf_t *clcf,
         return;
     }
 
-    if (ngx_http_cache_turbo_redis_connect(op, &clcf->redis_addr,
+    if (ngx_http_cache_turbo_redis_launch(op, clcf,
             ngx_http_cache_turbo_redis_read_drain) != NGX_OK)
     {
         ngx_destroy_pool(op->pool);
@@ -429,7 +669,7 @@ ngx_http_cache_turbo_redis_tag_add(ngx_http_cache_turbo_loc_conf_t *clcf,
     op->send->last = ngx_cpymem(op->send->last, sadd->pos, n1);
     op->send->last = ngx_cpymem(op->send->last, expire->pos, n2);
 
-    if (ngx_http_cache_turbo_redis_connect(op, &clcf->redis_addr,
+    if (ngx_http_cache_turbo_redis_launch(op, clcf,
             ngx_http_cache_turbo_redis_read_drain) != NGX_OK)
     {
         ngx_destroy_pool(op->pool);
@@ -478,7 +718,7 @@ ngx_http_cache_turbo_redis_get(ngx_http_request_t *r,
         return NGX_DECLINED;
     }
 
-    if (ngx_http_cache_turbo_redis_connect(op, &clcf->redis_addr,
+    if (ngx_http_cache_turbo_redis_launch(op, clcf,
             ngx_http_cache_turbo_redis_read_get) != NGX_OK)
     {
         ngx_destroy_pool(pool);
@@ -554,7 +794,7 @@ ngx_http_cache_turbo_redis_lock(ngx_http_request_t *r,
         return NGX_DECLINED;
     }
 
-    if (ngx_http_cache_turbo_redis_connect(op, &clcf->redis_addr,
+    if (ngx_http_cache_turbo_redis_launch(op, clcf,
             ngx_http_cache_turbo_redis_read_lock) != NGX_OK)
     {
         ngx_destroy_pool(pool);
@@ -610,7 +850,7 @@ ngx_http_cache_turbo_redis_smembers(ngx_http_request_t *r,
         return NGX_ERROR;
     }
 
-    if (ngx_http_cache_turbo_redis_connect(op, &clcf->redis_addr,
+    if (ngx_http_cache_turbo_redis_launch(op, clcf,
             ngx_http_cache_turbo_redis_read_smembers) != NGX_OK)
     {
         ngx_destroy_pool(op->pool);
@@ -695,7 +935,7 @@ ngx_http_cache_turbo_redis_scan_del(ngx_http_request_t *r,
         return NGX_ERROR;
     }
 
-    if (ngx_http_cache_turbo_redis_connect(op, &clcf->redis_addr,
+    if (ngx_http_cache_turbo_redis_launch(op, clcf,
             ngx_http_cache_turbo_redis_read_scan) != NGX_OK)
     {
         ngx_destroy_pool(op->pool);
@@ -757,7 +997,101 @@ ngx_http_cache_turbo_redis_write(ngx_event_t *wev)
     if (op->timeout) {
         ngx_add_timer(c->read, op->timeout);
     }
+
+    /* Whichever buffer just went out decides the reader: the AUTH/SELECT
+     * preamble is followed by the preamble drainer; the real command by its
+     * own read handler. */
+    c->read->handler = op->in_preamble
+                           ? ngx_http_cache_turbo_redis_read_preamble
+                           : op->read_handler;
     c->read->handler(c->read);
+}
+
+
+/*
+ * Consume the AUTH/SELECT preamble replies (each a one-line +OK / -ERR), then
+ * send the real command. A '-' reply (auth failed, wrong db) fails the op. The
+ * replies are tiny and arrive together, so the fixed recv[] scratch suffices;
+ * we only ever need to count CRLF-terminated lines.
+ */
+static void
+ngx_http_cache_turbo_redis_read_preamble(ngx_event_t *rev)
+{
+    ssize_t                           n;
+    ngx_uint_t                        seen;
+    u_char                           *p, *last;
+    ngx_connection_t                 *c;
+    ngx_http_cache_turbo_redis_op_t  *op;
+
+    c = rev->data;
+    op = c->data;
+
+    if (rev->timedout) {
+        ngx_log_error(NGX_LOG_INFO, c->log, NGX_ETIMEDOUT,
+                      "cache_turbo: redis AUTH/SELECT timed out");
+        ngx_http_cache_turbo_redis_op_fail(op);
+        return;
+    }
+
+    for ( ;; ) {
+        if (op->recv_len >= sizeof(op->recv)) {
+            /* preamble replies should never be this large */
+            ngx_http_cache_turbo_redis_op_fail(op);
+            return;
+        }
+
+        n = c->recv(c, op->recv + op->recv_len,
+                    sizeof(op->recv) - op->recv_len);
+
+        if (n == NGX_AGAIN) {
+            if (ngx_handle_read_event(rev, 0) != NGX_OK) {
+                ngx_http_cache_turbo_redis_op_fail(op);
+            }
+            return;
+        }
+        if (n == NGX_ERROR || n == 0) {
+            ngx_http_cache_turbo_redis_op_fail(op);
+            return;
+        }
+
+        op->recv_len += (size_t) n;
+
+        /* count complete one-line replies; bail on the first error reply */
+        seen = 0;
+        p = op->recv;
+        last = op->recv + op->recv_len;
+        while (p < last && seen < op->preamble_replies) {
+            u_char *crlf = ngx_strlchr(p, last, LF);
+            if (crlf == NULL) {
+                break;                 /* partial line: read more */
+            }
+            if (*p == '-') {
+                ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                    "cache_turbo: redis AUTH/SELECT rejected: %*s",
+                    (size_t) (crlf - p > 96 ? 96 : crlf - p), p);
+                ngx_http_cache_turbo_redis_op_fail(op);
+                return;
+            }
+            seen++;
+            p = crlf + 1;
+        }
+
+        if (seen < op->preamble_replies) {
+            continue;                  /* need more reply bytes */
+        }
+
+        /* preamble done: send the real command, install its reader */
+        op->in_preamble = 0;
+        op->recv_len = 0;
+        op->send = op->command;
+
+        if (op->timeout) {
+            ngx_add_timer(c->write, op->timeout);
+        }
+        c->write->handler = ngx_http_cache_turbo_redis_write;
+        ngx_post_event(c->write, &ngx_posted_events);
+        return;
+    }
 }
 
 
@@ -1337,10 +1671,21 @@ ngx_http_cache_turbo_redis_smembers_finish(
 static void
 ngx_http_cache_turbo_redis_op_done(ngx_http_cache_turbo_redis_op_t *op)
 {
-    ngx_pool_t  *pool = op->pool;
+    ngx_pool_t        *pool = op->pool;
+    ngx_connection_t  *c = op->peer.connection;
 
-    if (op->peer.connection) {
-        ngx_close_connection(op->peer.connection);
+    if (c) {
+#if (NGX_SSL)
+        if (c->ssl) {
+            /* best-effort: don't block teardown waiting on close_notify */
+            c->ssl->no_wait_shutdown = 1;
+            (void) ngx_ssl_shutdown(c);
+        }
+        /* c->pool was borrowed from op->pool (TLS path); ngx_close_connection
+         * must not see it as its own. */
+        c->pool = NULL;
+#endif
+        ngx_close_connection(c);
     }
     ngx_destroy_pool(pool);
 }

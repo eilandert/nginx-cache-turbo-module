@@ -253,6 +253,24 @@ typedef struct {
     ngx_str_t                redis_prefix; /* key prefix, default "ct:"        */
     ngx_msec_t               redis_timeout;/* connect/read timeout             */
 
+    /* Full DSN (v5): cache_turbo_redis accepts redis://[user:pass@]host:port/db
+     * (rediss:// = TLS), with prefix=/timeout=/password=/user=/db=/tls=/
+     * tls_verify=/tls_ca=/tls_name= overrides. On each connection the driver
+     * pipelines AUTH (+ optional ACL user) and SELECT <db> before the command;
+     * rediss wraps the socket in TLS and (by default) verifies the server cert
+     * against the system CA + the host name. */
+    ngx_str_t                redis_user;    /* ACL username, "" = legacy AUTH   */
+    ngx_str_t                redis_password;/* AUTH password, "" = no AUTH      */
+    ngx_int_t                redis_db;      /* SELECT db index, 0 = no SELECT   */
+    ngx_flag_t               redis_tls;     /* rediss:// or tls=on              */
+    ngx_flag_t               redis_tls_verify; /* verify cert+host (default on) */
+    ngx_str_t                redis_tls_ca;  /* CA bundle file, "" = system CAs  */
+    ngx_str_t                redis_tls_name;/* verify/SNI name, "" = DSN host   */
+    ngx_str_t                redis_host;    /* DSN host (default SNI/verify name)*/
+#if (NGX_SSL)
+    ngx_ssl_t               *redis_ssl;     /* per-location client SSL context  */
+#endif
+
     /* Tag index (v2c). cache_turbo_tag evaluates to a whitespace/comma list of
      * tags; on store each tag set "<prefix>tag:<name>" gets the object's L2 key
      * SADD'ed (+EXPIRE), so a purge-by-tag can drop every keyed object across

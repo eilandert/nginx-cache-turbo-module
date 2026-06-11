@@ -62,6 +62,7 @@ cd "$ROOT/$DIR"
     --with-compat \
     --with-debug \
     --with-http_realip_module \
+    --with-http_ssl_module \
     --without-http_rewrite_module \
     --with-cc-opt="$CC_OPT" \
     --with-ld-opt="$LD_OPT" \

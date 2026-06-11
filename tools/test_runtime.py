@@ -155,8 +155,49 @@ class Origin:
 
 def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
                  origin_port: int, workers: int,
-                 redis_port: int | None = None) -> str:
+                 redis_port: int | None = None,
+                 redis_auth_port: int | None = None,
+                 redis_password: str | None = None,
+                 redis_tls_port: int | None = None,
+                 redis_tls_ca: str | None = None) -> str:
     load = f"load_module {module};\n" if module else ""
+
+    # DSN auth+db (v5): a backend reached via a full redis://user:pass@host/db
+    # DSN, and a plain SELECT-db (no auth) backend on the main instance.
+    dsn_loc = ""
+    if redis_auth_port is not None:
+        dsn_loc += f"""
+        # full DSN: AUTH (password) + SELECT db 2, two-reply preamble
+        location /l2auth/ {{
+            cache_turbo       main;
+            cache_turbo_key   $uri;
+            cache_turbo_valid 30s;
+            cache_turbo_redis redis://:{redis_password}@127.0.0.1:{redis_auth_port}/2;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+"""
+    if redis_port is not None:
+        dsn_loc += f"""
+        # SELECT-only preamble (db 1, no auth) on the main instance
+        location /l2db/ {{
+            cache_turbo       main;
+            cache_turbo_key   $uri;
+            cache_turbo_valid 30s;
+            cache_turbo_redis 127.0.0.1:{redis_port} db=1;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+"""
+    if redis_tls_port is not None:
+        dsn_loc += f"""
+        # rediss:// TLS, verifying the server cert against our test CA
+        location /l2tls/ {{
+            cache_turbo       main;
+            cache_turbo_key   $uri;
+            cache_turbo_valid 30s;
+            cache_turbo_redis rediss://127.0.0.1:{redis_tls_port}/0 tls_ca={redis_tls_ca} tls_name=localhost;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+"""
 
     # L2 (v2b): a location wired to a Redis backend. Scoped to /l2/ only so the
     # L1-only tests (purge, eviction, ...) are unaffected. Emitted only when a
@@ -251,6 +292,7 @@ http {{
     server {{
         listen 127.0.0.1:{port};
 {redis_loc}
+{dsn_loc}
 
         # standard 30s-fresh cache
         location /c/ {{
@@ -488,7 +530,9 @@ http {{
 
 class Nginx:
     def __init__(self, binary, module, root, port, origin_port, runner,
-                 single_process, redis_port=None) -> None:
+                 single_process, redis_port=None, redis_auth_port=None,
+                 redis_password=None, redis_tls_port=None,
+                 redis_tls_ca=None) -> None:
         self.binary = binary
         self.module = module
         self.root = root
@@ -498,6 +542,10 @@ class Nginx:
         self.runner = shlex.split(runner)
         self.single_process = single_process
         self.redis_port = redis_port
+        self.redis_auth_port = redis_auth_port
+        self.redis_password = redis_password
+        self.redis_tls_port = redis_tls_port
+        self.redis_tls_ca = redis_tls_ca
         self.process: subprocess.Popen | None = None
         self.output_path = root / "nginx-output.log"
 
@@ -507,7 +555,9 @@ class Nginx:
         (self.root / "logs").mkdir(parents=True, exist_ok=True)
         (self.root / "conf" / "nginx.conf").write_text(
             nginx_config(self.root, self.port, self.module,
-                         self.origin_port, workers, self.redis_port),
+                         self.origin_port, workers, self.redis_port,
+                         self.redis_auth_port, self.redis_password,
+                         self.redis_tls_port, self.redis_tls_ca),
             encoding="ascii")
 
     def command(self, test: bool = False) -> list[str]:
@@ -577,36 +627,84 @@ class Nginx:
 # Ephemeral Redis for the L2 (v2b) tests.
 # --------------------------------------------------------------------------- #
 
+def gen_tls_certs(dirpath: pathlib.Path) -> dict:
+    """Generate a throwaway CA + a 127.0.0.1/localhost server cert for a TLS
+    Redis. Returns {ca, cert, key} paths. Raises on any openssl failure."""
+    dirpath.mkdir(parents=True, exist_ok=True)
+    ca_key = dirpath / "ca.key"
+    ca = dirpath / "ca.crt"
+    key = dirpath / "redis.key"
+    csr = dirpath / "redis.csr"
+    crt = dirpath / "redis.crt"
+    ext = dirpath / "redis.ext"
+    ext.write_text("subjectAltName=IP:127.0.0.1,DNS:localhost\n")
+
+    def run(*a):
+        subprocess.run(a, check=True, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=30)
+
+    run("openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+        "-keyout", str(ca_key), "-out", str(ca), "-days", "1",
+        "-subj", "/CN=ct-test-ca",
+        "-addext", "basicConstraints=critical,CA:TRUE",
+        "-addext", "keyUsage=critical,keyCertSign,cRLSign")
+    run("openssl", "req", "-newkey", "rsa:2048", "-nodes",
+        "-keyout", str(key), "-out", str(csr), "-subj", "/CN=localhost")
+    run("openssl", "x509", "-req", "-in", str(csr), "-CA", str(ca),
+        "-CAkey", str(ca_key), "-CAcreateserial", "-out", str(crt),
+        "-days", "1", "-extfile", str(ext))
+    return {"ca": str(ca), "cert": str(crt), "key": str(key)}
+
+
 class RedisServer:
     def __init__(self, binary: pathlib.Path, root: pathlib.Path,
-                 port: int) -> None:
+                 port: int, password: str | None = None,
+                 tls_certs: dict | None = None) -> None:
         self.binary = binary
         self.root = root
         self.port = port
+        self.password = password
+        self.tls_certs = tls_certs
         self.process: subprocess.Popen[str] | None = None
 
     def start(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
+        args = [
+            str(self.binary),
+            "--bind", "127.0.0.1",
+            "--save", "",
+            "--appendonly", "no",
+            "--dir", str(self.root),
+        ]
+        if self.tls_certs:
+            # TLS-only listener: plaintext port off, tls-port on.
+            args += [
+                "--port", "0",
+                "--tls-port", str(self.port),
+                "--tls-cert-file", self.tls_certs["cert"],
+                "--tls-key-file", self.tls_certs["key"],
+                "--tls-ca-cert-file", self.tls_certs["ca"],
+                "--tls-auth-clients", "no",
+            ]
+        else:
+            args += ["--port", str(self.port)]
+        if self.password:
+            args += ["--requirepass", self.password]
+
         self.process = subprocess.Popen(
-            [
-                str(self.binary),
-                "--bind", "127.0.0.1",
-                "--port", str(self.port),
-                "--save", "",
-                "--appendonly", "no",
-                "--dir", str(self.root),
-            ],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-        )
+            args, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         wait_port(self.port)
         self.cli("FLUSHALL")
 
     def cli(self, *args: str) -> str:
         """Run a redis-cli command against this server; return stdout."""
+        base = ["redis-cli", "-h", "127.0.0.1", "-p", str(self.port)]
+        if self.tls_certs:
+            base += ["--tls", "--cacert", self.tls_certs["ca"]]
+        if self.password:
+            base += ["-a", self.password, "--no-auth-warning"]
         r = subprocess.run(
-            ["redis-cli", "-h", "127.0.0.1", "-p", str(self.port), *args],
+            [*base, *args],
             text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             timeout=10)
         return r.stdout.strip()
@@ -1032,6 +1130,42 @@ def make_ctb1_blob(body: bytes, status: int = 200,
     head = struct.pack("<IIIII", magic, nheaders, len(hdr_block),
                        len(body), status)
     return head + hdr_block + body
+
+
+def test_l2_dsn_auth_db(ng: Nginx, origin: Origin,
+                        redis_auth: RedisServer) -> None:
+    """v5 DSN: redis://:pass@host/2 drives an AUTH + SELECT preamble, then the
+    write-through SET lands in the AUTHED instance's db 2."""
+    fetch(ng.port, "/l2auth/k1")                   # miss -> store via preamble
+    key = l2_key("/l2auth/k1")
+    assert wait_for(lambda: redis_auth.cli("-n", "2", "EXISTS", key) == "1",
+                    timeout=4.0), \
+        "object not in authed redis db 2 (AUTH/SELECT preamble failed?)"
+    _, _, h = fetch(ng.port, "/l2auth/k1")
+    assert h.get("x-cache") == "HIT", "second read should be an L1 hit"
+
+
+def test_l2_db_select(ng: Nginx, origin: Origin,
+                      redis: RedisServer) -> None:
+    """SELECT-only preamble (db=1, no auth): the object lands in db 1, not 0."""
+    fetch(ng.port, "/l2db/k1")
+    key = l2_key("/l2db/k1")
+    assert wait_for(lambda: redis.cli("-n", "1", "EXISTS", key) == "1",
+                    timeout=4.0), "object not written to db 1 (SELECT preamble?)"
+    assert redis.cli("-n", "0", "EXISTS", key) == "0", \
+        "object leaked into db 0 — SELECT did not take effect"
+
+
+def test_l2_tls(ng: Nginx, origin: Origin,
+                redis_tls: RedisServer) -> None:
+    """rediss:// with server-cert verification against the test CA: the
+    write-through SET reaches the TLS redis over an encrypted connection."""
+    fetch(ng.port, "/l2tls/k1")
+    key = l2_key("/l2tls/k1")
+    assert wait_for(lambda: redis_tls.cli("EXISTS", key) == "1", timeout=4.0), \
+        "object not in TLS redis (handshake/verify failed?)"
+    _, _, h = fetch(ng.port, "/l2tls/k1")
+    assert h.get("x-cache") == "HIT", "second read should be an L1 hit"
 
 
 def test_l2_purge_key_drops_l2(ng: Nginx, origin: Origin,
@@ -1649,7 +1783,9 @@ def test_autotune_churn_disqualifies(ng: Nginx, origin: Origin) -> None:
 
 
 def run_all(ng: Nginx, origin: Origin,
-            redis: RedisServer | None = None) -> None:
+            redis: RedisServer | None = None,
+            redis_auth: RedisServer | None = None,
+            redis_tls: RedisServer | None = None) -> None:
     test_miss_then_hit(ng)
     test_header_fidelity(ng)
     test_max_size_not_cached(ng)
@@ -1696,7 +1832,12 @@ def run_all(ng: Nginx, origin: Origin,
         test_l2_tag_purge(ng, origin, redis)
         test_multinode_lock(ng, origin, redis)
         test_lock_self_heal(ng, origin, redis)
+        test_l2_db_select(ng, origin, redis)         # SELECT-only preamble
         test_purge_all_clears_l2(ng, origin, redis)  # last L2: empties L2
+    if redis_auth is not None:
+        test_l2_dsn_auth_db(ng, origin, redis_auth)  # AUTH+SELECT preamble
+    if redis_tls is not None:
+        test_l2_tls(ng, origin, redis_tls)           # rediss:// + verify
     test_admin_purge_all(ng)   # last: it empties the zone
 
 
@@ -1711,23 +1852,51 @@ def main() -> int:
 
     origin_port = args.port + 11
     redis_port = args.port + 21 if args.redis_server else None
+    redis_auth_port = args.port + 22 if args.redis_server else None
+    redis_tls_port = args.port + 23 if args.redis_server else None
+    redis_password = "ctsecret"
     with tempfile.TemporaryDirectory(prefix="cache-turbo-ci-") as tmp:
         root = pathlib.Path(tmp)
         origin = Origin(origin_port, delay=0.05)
-        redis = None
+        redis = redis_auth = redis_tls = None
+        tls_certs = None
         if args.redis_server:
-            redis = RedisServer(pathlib.Path(args.redis_server),
-                                root / "redis", redis_port)
+            rbin = pathlib.Path(args.redis_server)
+            redis = RedisServer(rbin, root / "redis", redis_port)
+            redis_auth = RedisServer(rbin, root / "redis-auth", redis_auth_port,
+                                     password=redis_password)
+            # TLS is best-effort: needs a TLS-capable redis + openssl. If either
+            # is missing, skip the rediss:// test rather than failing the suite.
+            try:
+                tls_certs = gen_tls_certs(root / "redis-tls-certs")
+                redis_tls = RedisServer(rbin, root / "redis-tls", redis_tls_port,
+                                        tls_certs=tls_certs)
+            except (OSError, subprocess.SubprocessError):
+                redis_tls = None
+                tls_certs = None
+
         ng = Nginx(binary, module, root / "server", args.port, origin_port,
-                   args.runner, args.single_process, redis_port)
-        ng.write_config()
-        ng.config_test()
+                   args.runner, args.single_process, redis_port,
+                   redis_auth_port=redis_auth_port if redis_auth else None,
+                   redis_password=redis_password,
+                   redis_tls_port=redis_tls_port if redis_tls else None,
+                   redis_tls_ca=(tls_certs or {}).get("ca"))
+
         try:
             origin.start()
             if redis is not None:
                 redis.start()
+            if redis_auth is not None:
+                redis_auth.start()
+            if redis_tls is not None:
+                try:
+                    redis_tls.start()
+                except Exception:
+                    redis_tls = None        # TLS redis refused to start: skip
+            ng.write_config()
+            ng.config_test()
             ng.start()
-            run_all(ng, origin, redis)
+            run_all(ng, origin, redis, redis_auth, redis_tls)
             time.sleep(0.2)
             ng.stop()
             ng.assert_clean_logs()
@@ -1735,6 +1904,10 @@ def main() -> int:
             ng.stop()
             if redis is not None:
                 redis.stop()
+            if redis_auth is not None:
+                redis_auth.stop()
+            if redis_tls is not None:
+                redis_tls.stop()
             origin.stop()
 
     print("OK: miss/hit, header fidelity, max_size, "
@@ -1755,8 +1928,11 @@ def main() -> int:
              "L2-aware key purge (P6), expired-L1 consults L2 (P6), "
              "tag index add (v2c), tag purge both tiers (P4), "
              "multi-node dogpile lock (v4-2 SET NX PX), lock self-heal (v4-2), "
-             "?all=1 clears L2 (v4-2 SCAN+DEL)"
-             if redis_port else ""))
+             "?all=1 clears L2 (v4-2 SCAN+DEL), "
+             "DSN SELECT-db preamble (v5)"
+             if redis_port else "")
+          + (", DSN AUTH+SELECT preamble (v5)" if redis_auth else "")
+          + (", rediss:// TLS + verify (v5)" if redis_tls else ""))
     return 0
 
 

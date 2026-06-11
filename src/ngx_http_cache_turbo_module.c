@@ -19,6 +19,10 @@
 
 #include "ngx_http_cache_turbo_module.h"
 
+#if (NGX_SSL)
+#include <ngx_event_openssl.h>
+#endif
+
 
 static ngx_int_t ngx_http_cache_turbo_access_handler(ngx_http_request_t *r);
 static ngx_int_t ngx_http_cache_turbo_header_filter(ngx_http_request_t *r);
@@ -166,7 +170,7 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
       NULL },
 
     { ngx_string("cache_turbo_redis"),
-      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE123,
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_1MORE,
       ngx_http_cache_turbo_redis_conf,
       NGX_HTTP_LOC_CONF_OFFSET,
       0,
@@ -1263,23 +1267,142 @@ ngx_http_cache_turbo_admin(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 }
 
 
-/* "cache_turbo_redis <host:port> [prefix=<str>] [timeout=<time>];" wires the
- * L2 backend. The address is resolved at config time. Settable at http/server/
- * location level and merged down, so a whole http{} block can share one L2. */
+#if (NGX_SSL)
+/* Build the per-location client SSL context for a rediss:// (TLS) backend.
+ * Verification is on unless tls_verify=off: trust the system CA store, or the
+ * file named by tls_ca=. The cert+hostname are checked post-handshake in the
+ * driver (ngx_ssl_check_host + SSL_get_verify_result). */
+static char *
+ngx_http_cache_turbo_redis_build_ssl(ngx_conf_t *cf,
+    ngx_http_cache_turbo_loc_conf_t *clcf)
+{
+    ngx_ssl_t           *ssl;
+    ngx_pool_cleanup_t  *cln;
+
+    ssl = ngx_pcalloc(cf->pool, sizeof(ngx_ssl_t));
+    if (ssl == NULL) {
+        return NGX_CONF_ERROR;
+    }
+    ssl->log = cf->log;
+
+    if (ngx_ssl_create(ssl, NGX_SSL_TLSv1_2|NGX_SSL_TLSv1_3, NULL) != NGX_OK) {
+        return NGX_CONF_ERROR;
+    }
+
+    cln = ngx_pool_cleanup_add(cf->pool, 0);
+    if (cln == NULL) {
+        ngx_ssl_cleanup_ctx(ssl);
+        return NGX_CONF_ERROR;
+    }
+    cln->handler = ngx_ssl_cleanup_ctx;
+    cln->data = ssl;
+
+    /* redis_tls_verify is still NGX_CONF_UNSET (-1) here unless tls_verify=off
+     * set it to 0; -1 and 1 both mean "verify on" (merge resolves -1 -> 1). */
+    if (clcf->redis_tls_verify != 0) {
+        if (clcf->redis_tls_ca.len) {
+            if (ngx_ssl_trusted_certificate(cf, ssl, &clcf->redis_tls_ca, 2)
+                != NGX_OK)
+            {
+                return NGX_CONF_ERROR;
+            }
+        } else if (SSL_CTX_set_default_verify_paths(ssl->ctx) != 1) {
+            ngx_ssl_error(NGX_LOG_EMERG, cf->log, 0,
+                          "cache_turbo_redis: "
+                          "SSL_CTX_set_default_verify_paths() failed");
+            return NGX_CONF_ERROR;
+        }
+    }
+
+    clcf->redis_ssl = ssl;
+    return NGX_CONF_OK;
+}
+#endif
+
+
+/*
+ * "cache_turbo_redis <dsn|host:port> [prefix=] [timeout=] [password=] [user=]
+ *  [db=] [tls=on|off] [tls_verify=on|off] [tls_ca=<file>] [tls_name=<host>];"
+ *
+ * The DSN is redis://[user:pass@]host:port/db ; rediss:// selects TLS. Bare
+ * host:port still works (legacy). Trailing params override whatever the DSN
+ * carried. The address is resolved at config time; settable at http/server/
+ * location level and merged down, so a whole http{} block can share one L2.
+ */
 static char *
 ngx_http_cache_turbo_redis_conf(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
     ngx_http_cache_turbo_loc_conf_t  *clcf = conf;
 
-    ngx_str_t   *value, s;
+    ngx_str_t   *value, s, hostport, arg1;
     ngx_url_t    u;
     ngx_uint_t   i;
     ngx_int_t    t;
+    u_char      *rest, *last, *at, *slash, *colon;
 
     value = cf->args->elts;
+    arg1 = value[1];
 
+    /* --- 1. split the DSN (scheme / userinfo / host:port / db) ------------- */
+    hostport = arg1;
+
+    if (arg1.len > sizeof("rediss://") - 1
+        && ngx_strncasecmp(arg1.data, (u_char *) "rediss://",
+                           sizeof("rediss://") - 1) == 0)
+    {
+        clcf->redis_tls = 1;
+        rest = arg1.data + sizeof("rediss://") - 1;
+
+    } else if (arg1.len > sizeof("redis://") - 1
+               && ngx_strncasecmp(arg1.data, (u_char *) "redis://",
+                                  sizeof("redis://") - 1) == 0)
+    {
+        rest = arg1.data + sizeof("redis://") - 1;
+
+    } else {
+        rest = NULL;        /* bare host:port */
+    }
+
+    if (rest != NULL) {
+        last = arg1.data + arg1.len;
+
+        at = ngx_strlchr(rest, last, '@');
+        if (at != NULL) {
+            colon = ngx_strlchr(rest, at, ':');
+            if (colon != NULL) {
+                clcf->redis_user.data = rest;
+                clcf->redis_user.len = colon - rest;
+                clcf->redis_password.data = colon + 1;
+                clcf->redis_password.len = at - (colon + 1);
+            } else {
+                clcf->redis_user.data = rest;
+                clcf->redis_user.len = at - rest;
+            }
+            rest = at + 1;
+        }
+
+        slash = ngx_strlchr(rest, last, '/');
+        if (slash != NULL) {
+            if (last - (slash + 1) > 0) {
+                clcf->redis_db = ngx_atoi(slash + 1,
+                                          last - (slash + 1));
+                if (clcf->redis_db == NGX_ERROR || clcf->redis_db < 0) {
+                    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                        "cache_turbo_redis: bad db in DSN \"%V\"", &arg1);
+                    return NGX_CONF_ERROR;
+                }
+            }
+            hostport.data = rest;
+            hostport.len = slash - rest;
+        } else {
+            hostport.data = rest;
+            hostport.len = last - rest;
+        }
+    }
+
+    /* --- 2. resolve the host:port ----------------------------------------- */
     ngx_memzero(&u, sizeof(ngx_url_t));
-    u.url = value[1];
+    u.url = hostport;
     u.default_port = 6379;
 
     if (ngx_parse_url(cf->pool, &u) != NGX_OK) {
@@ -1289,7 +1412,6 @@ ngx_http_cache_turbo_redis_conf(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         }
         return NGX_CONF_ERROR;
     }
-
     if (u.naddrs == 0) {
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                            "cache_turbo_redis: no addresses for \"%V\"", &u.url);
@@ -1297,16 +1419,16 @@ ngx_http_cache_turbo_redis_conf(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     }
 
     clcf->redis_addr = u.addrs[0];
+    clcf->redis_host = u.host;        /* default SNI / verify name */
 
+    /* --- 3. trailing params override the DSN ------------------------------ */
     for (i = 2; i < cf->args->nelts; i++) {
 
         if (ngx_strncmp(value[i].data, "prefix=", 7) == 0) {
             clcf->redis_prefix.data = value[i].data + 7;
             clcf->redis_prefix.len = value[i].len - 7;
-            continue;
-        }
 
-        if (ngx_strncmp(value[i].data, "timeout=", 8) == 0) {
+        } else if (ngx_strncmp(value[i].data, "timeout=", 8) == 0) {
             s.data = value[i].data + 8;
             s.len = value[i].len - 8;
             t = ngx_parse_time(&s, 0);   /* milliseconds */
@@ -1316,13 +1438,77 @@ ngx_http_cache_turbo_redis_conf(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
                 return NGX_CONF_ERROR;
             }
             clcf->redis_timeout = (ngx_msec_t) t;
-            continue;
-        }
 
+        } else if (ngx_strncmp(value[i].data, "password=", 9) == 0) {
+            clcf->redis_password.data = value[i].data + 9;
+            clcf->redis_password.len = value[i].len - 9;
+
+        } else if (ngx_strncmp(value[i].data, "user=", 5) == 0) {
+            clcf->redis_user.data = value[i].data + 5;
+            clcf->redis_user.len = value[i].len - 5;
+
+        } else if (ngx_strncmp(value[i].data, "db=", 3) == 0) {
+            clcf->redis_db = ngx_atoi(value[i].data + 3, value[i].len - 3);
+            if (clcf->redis_db == NGX_ERROR || clcf->redis_db < 0) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "cache_turbo_redis: bad db \"%V\"", &value[i]);
+                return NGX_CONF_ERROR;
+            }
+
+        } else if (ngx_strncmp(value[i].data, "tls=", 4) == 0) {
+            s.data = value[i].data + 4;
+            s.len = value[i].len - 4;
+            if (s.len == 2 && ngx_strncmp(s.data, "on", 2) == 0) {
+                clcf->redis_tls = 1;
+            } else if (s.len == 3 && ngx_strncmp(s.data, "off", 3) == 0) {
+                clcf->redis_tls = 0;
+            } else {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "cache_turbo_redis: tls must be on|off");
+                return NGX_CONF_ERROR;
+            }
+
+        } else if (ngx_strncmp(value[i].data, "tls_verify=", 11) == 0) {
+            s.data = value[i].data + 11;
+            s.len = value[i].len - 11;
+            if (s.len == 2 && ngx_strncmp(s.data, "on", 2) == 0) {
+                clcf->redis_tls_verify = 1;
+            } else if (s.len == 3 && ngx_strncmp(s.data, "off", 3) == 0) {
+                clcf->redis_tls_verify = 0;
+            } else {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "cache_turbo_redis: tls_verify must be on|off");
+                return NGX_CONF_ERROR;
+            }
+
+        } else if (ngx_strncmp(value[i].data, "tls_ca=", 7) == 0) {
+            clcf->redis_tls_ca.data = value[i].data + 7;
+            clcf->redis_tls_ca.len = value[i].len - 7;
+
+        } else if (ngx_strncmp(value[i].data, "tls_name=", 9) == 0) {
+            clcf->redis_tls_name.data = value[i].data + 9;
+            clcf->redis_tls_name.len = value[i].len - 9;
+
+        } else {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "cache_turbo_redis: invalid parameter \"%V\"",
+                               &value[i]);
+            return NGX_CONF_ERROR;
+        }
+    }
+
+    /* --- 4. build the SSL context if this is a TLS backend ---------------- */
+    if (clcf->redis_tls == 1) {
+#if (NGX_SSL)
+        if (ngx_http_cache_turbo_redis_build_ssl(cf, clcf) != NGX_CONF_OK) {
+            return NGX_CONF_ERROR;
+        }
+#else
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                           "cache_turbo_redis: invalid parameter \"%V\"",
-                           &value[i]);
+            "cache_turbo_redis: TLS (rediss:// / tls=on) requires nginx built "
+            "with --with-http_ssl_module");
         return NGX_CONF_ERROR;
+#endif
     }
 
     clcf->redis_enable = 1;
@@ -2351,6 +2537,9 @@ ngx_http_cache_turbo_create_loc_conf(ngx_conf_t *cf)
     conf->max_size = NGX_CONF_UNSET_SIZE;
     conf->redis_enable = NGX_CONF_UNSET;
     conf->redis_timeout = NGX_CONF_UNSET_MSEC;
+    conf->redis_db = NGX_CONF_UNSET;
+    conf->redis_tls = NGX_CONF_UNSET;
+    conf->redis_tls_verify = NGX_CONF_UNSET;
     conf->normalize_strip_all = NGX_CONF_UNSET;
     conf->normalize_strip = NGX_CONF_UNSET_PTR;
     conf->normalize_vary = NGX_CONF_UNSET;
@@ -2444,6 +2633,21 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
                         NGX_HTTP_CACHE_TURBO_REDIS_PREFIX);
         }
     }
+
+    /* L2 auth/db/tls (v5 DSN). Inherit alongside the address. */
+    ngx_conf_merge_str_value(conf->redis_user, prev->redis_user, "");
+    ngx_conf_merge_str_value(conf->redis_password, prev->redis_password, "");
+    ngx_conf_merge_value(conf->redis_db, prev->redis_db, 0);
+    ngx_conf_merge_value(conf->redis_tls, prev->redis_tls, 0);
+    ngx_conf_merge_value(conf->redis_tls_verify, prev->redis_tls_verify, 1);
+    ngx_conf_merge_str_value(conf->redis_tls_ca, prev->redis_tls_ca, "");
+    ngx_conf_merge_str_value(conf->redis_tls_name, prev->redis_tls_name, "");
+    ngx_conf_merge_str_value(conf->redis_host, prev->redis_host, "");
+#if (NGX_SSL)
+    if (conf->redis_ssl == NULL) {
+        conf->redis_ssl = prev->redis_ssl;
+    }
+#endif
 
     /* Resolve the backend vtables (v4-1). l1 is a stateless dispatch table, so
      * it is always wired (the zone is an argument, not driver state). backend is

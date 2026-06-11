@@ -197,7 +197,7 @@ $ curl -X POST 'localhost/_cache?url=/,/blog/,/about' # pre-warm cold pages
 | `cache_turbo_max_size SIZE` | `server`, `location` | `1m` | Don't cache responses bigger than this. |
 | `cache_turbo_autotune on` | `server`, `location` | `off` | Auto-pick `beta` from the measured backend latency, clamped to the preset's band. |
 | `cache_turbo_autotune_interval TIME` | `server`, `location` | `30s` | How often autotune recomputes. |
-| `cache_turbo_redis HOST:PORT [prefix=STR] [timeout=TIME]` | `http`, `server`, `location` | — | Add a shared **L2 Redis** tier. Write-through on store; one sync `GET` on an L1 miss (never on an L1 hit). `prefix` default `ct:`, `timeout` default `250ms`. Native client, no hiredis. |
+| `cache_turbo_redis DSN [opts...]` | `http`, `server`, `location` | — | Add a shared **L2 Redis** tier. `DSN` is `redis://[user:pass@]host:port/db` (or bare `host:port`); `rediss://` = TLS. Write-through on store; one sync `GET` on an L1 miss (never on an L1 hit). Opts: `prefix=` (`ct:`), `timeout=` (`250ms`), `password=`, `user=`, `db=`, `tls=on\|off`, `tls_verify=on\|off` (default on), `tls_ca=<file>`, `tls_name=<host>`. Native client, no hiredis. |
 | `cache_turbo_tag EXPR` | `server`, `location` | — | Tag stored pages (whitespace/comma list) so they can be purged as a group. Needs `cache_turbo_redis`. |
 | `cache_turbo_admin NAME` | `location` | — | Make this location a control endpoint for zone `NAME` (stats/purge/warm). Gate with `allow`/`deny`. |
 | `cache_turbo_normalize_strip NAME...` | `server`, `location` | — | Extra query args to drop from `$cache_turbo_normalized_args` (trailing `*` = prefix), on top of the built-ins. |
@@ -272,6 +272,46 @@ rate(cache_turbo_misses_total[5m]))`, **backend regen rate**
 |---|---|
 | `$cache_turbo_normalized_args` | The query string with tracking junk dropped, args sorted, plus any `normalize_vary` buckets — drop it in your `cache_turbo_key`. |
 | `$cache_turbo_beta` | The `beta` this request would actually use right now (handy to `add_header X-CT-Beta $cache_turbo_beta;` and watch autotune work). |
+
+## Redis L2 (shared cache)
+
+By default the cache lives in each box's RAM (L1). Add Redis as a shared **L2**
+so a whole fleet of nginx boxes share one cache: write-through on store, and one
+`GET` on an L1 miss (L1 hits never touch Redis). Point it with a DSN:
+
+```nginx
+# plain
+cache_turbo_redis redis://10.0.0.5:6379/0;
+
+# with ACL user + password + db 2
+cache_turbo_redis redis://cache:s3cret@10.0.0.5:6379/2;
+
+# TLS (rediss://) — verifies the server cert against the system CA by default
+cache_turbo_redis rediss://redis.internal:6380/0;
+
+# TLS with a private CA, and override the verified name
+cache_turbo_redis rediss://10.0.0.5:6380/0 tls_ca=/etc/ssl/redis-ca.pem tls_name=redis.internal;
+```
+
+The driver pipelines `AUTH` (+ ACL user) and `SELECT <db>` before each command;
+`rediss://` wraps the socket in TLS. Any DSN field can also be given as a
+trailing option, which **overrides** the DSN:
+
+| Option | Default | Meaning |
+|---|---|---|
+| `password=` | — | `AUTH` password (or put it in the DSN userinfo). |
+| `user=` | — | ACL username (Redis 6+). |
+| `db=` | `0` | `SELECT` this db number. |
+| `tls=on\|off` | from scheme | Force TLS on/off regardless of `redis://`/`rediss://`. |
+| `tls_verify=on\|off` | `on` | Verify the server cert + hostname. **Leave on** unless you know why. |
+| `tls_ca=<file>` | system CAs | CA bundle to trust (for a private CA). |
+| `tls_name=<host>` | DSN host | Name used for SNI + cert verification. |
+| `prefix=` | `ct:` | Key prefix in Redis. |
+| `timeout=` | `250ms` | Connect/read timeout. |
+
+> TLS needs nginx built with `--with-http_ssl_module` (the stock `nginx`
+> package is). Without it, a `rediss://` / `tls=on` config is rejected at start.
+> Passwords sit in your nginx config — keep it `chmod 600` / out of git.
 
 ## Cache-key normalization
 
