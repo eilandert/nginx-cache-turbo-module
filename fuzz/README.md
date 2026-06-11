@@ -1,6 +1,25 @@
-# RESP reply parser fuzzing
+# Fuzzing
 
-Coverage-guided (libFuzzer) fuzzing of the three Redis (RESP) reply parsers in
+Coverage-guided (libFuzzer) fuzzing of the module's attacker-controlled
+parsers. Two targets, each built from the SHIPPED source by its own
+`extract_*.sh` slicer (no hand-maintained copy):
+
+- **`fuzz_resp_parser`** → the three Redis (RESP) reply parsers (below).
+- **`fuzz_norm_args`** → `ngx_http_cache_turbo_normalized_args_variable()`,
+  which builds `$cache_turbo_normalized_args` from the **fully attacker-
+  controlled** request query string: it splits on `&`/`=` with pointer
+  arithmetic, drops denied params, stable-sorts the rest, then sizes and
+  writes a `?`-prefixed buffer. Bug classes: an OOB-read in the splitter
+  and an OOB-write if the size computation ever under-counts the build
+  loop. The harness feeds non-NUL-terminated args (exact-sized alloc) so
+  ASAN catches both. `vary_suffix` / `var_set` / `name_denied` are stubbed
+  (see `ngx_shim_args.h`): the write bound is computed from the same
+  kept-token set it writes, so it is invariant to which tokens are dropped
+  or whether a Vary suffix is appended.
+
+## RESP reply parsers
+
+The `fuzz_resp_parser` target covers the three Redis (RESP) reply parsers in
 `../src/ngx_http_cache_turbo_redis.c`:
 
 | function | reply shape |
