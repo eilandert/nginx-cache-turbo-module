@@ -185,6 +185,23 @@ class Origin:
                     except BrokenPipeError:
                         pass
                     return
+                if "bigbody" in self.path:
+                    # ~200 KB body so nginx streams it to our body filter in
+                    # several buffers/calls -> exercises the Q2 mid-stream
+                    # oversize early-abort, not just a single-buffer case. The
+                    # leading gen-N keeps each response distinct so a cached
+                    # serve would be detectable.
+                    body = (f"gen-{n}\n".encode()
+                            + b"x" * 200000)
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/octet-stream")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    try:
+                        self.wfile.write(body)
+                    except BrokenPipeError:
+                        pass
+                    return
                 body = f"gen-{n}\n".encode()
                 self.send_response(200)
                 self.send_header("Content-Type",
@@ -672,6 +689,39 @@ http {{
             cache_turbo_backend woocommerce;
             cache_turbo_key     $uri;
             cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # two backends stacked: both WP and Woo dynamic surfaces skip
+        location /multi/ {{
+            cache_turbo         main;
+            cache_turbo_backend wordpress woocommerce;
+            cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # joomla URI-prefix rule: r->uri starts with /administrator/ -> skip
+        location /administrator/ {{
+            cache_turbo       main auto;
+            cache_turbo_key   $uri;
+            cache_turbo_valid 30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # Q2 multi-buffer oversize: ~200 KB body, 1k cap -> mid-stream abort
+        location /qbig/ {{
+            cache_turbo          main;
+            cache_turbo_key      $uri;
+            cache_turbo_valid    30s;
+            cache_turbo_max_size 1k;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # Q1: a location WITHOUT cache_turbo -> $cache_turbo_active must be "0"
+        # (no ctx / disabled), proving the variable's defensive default.
+        location /plain/ {{
+            add_header X-CT-Active $cache_turbo_active always;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
@@ -1297,6 +1347,107 @@ def test_auto_backend_composition(ng: Nginx, origin: Origin) -> None:
     assert hp2.get("x-cache") == "HIT", \
         f"woo backend should ignore a WP cookie and cache, got {hp2.get('x-cache')}"
     drain_origin(origin)
+
+
+def test_auto_classify_more(ng: Nginx, origin: Origin) -> None:
+    """Auto-classify breadth: the search query arg (?s=), the comment_author_
+    cookie, the joomla /administrator/ URI prefix, and a two-backend stack
+    (wordpress woocommerce) where BOTH cookie families skip."""
+    # ?s= search -> skip (generic /auto/)
+    _, s1, hs1 = fetch(ng.port, "/auto/results?s=widgets")
+    _, s2, hs2 = fetch(ng.port, "/auto/results?s=widgets")
+    assert "x-cache" not in hs1 and "x-cache" not in hs2, "search arg must skip"
+    assert s1 != s2, "search requests must each reach origin"
+
+    # comment_author_ cookie -> skip
+    cc = {"Cookie": "comment_author_email_x=foo%40bar"}
+    _, _, hc1 = fetch(ng.port, "/auto/comment", headers=cc)
+    _, _, hc2 = fetch(ng.port, "/auto/comment", headers=cc)
+    assert "x-cache" not in hc1 and "x-cache" not in hc2, \
+        "comment_author_ cookie must skip"
+
+    # joomla /administrator/ URI prefix -> skip
+    _, _, ha1 = fetch(ng.port, "/administrator/index.php")
+    _, _, ha2 = fetch(ng.port, "/administrator/index.php")
+    assert "x-cache" not in ha1 and "x-cache" not in ha2, \
+        "/administrator/ must skip"
+
+    # two backends stacked: a WP cookie AND a Woo cookie both skip on /multi/
+    _, _, hm1 = fetch(ng.port, "/multi/a",
+                      headers={"Cookie": "wordpress_logged_in_z=1"})
+    assert "x-cache" not in hm1, "stacked WP cookie must skip on /multi/"
+    _, _, hm2 = fetch(ng.port, "/multi/b",
+                      headers={"Cookie": "woocommerce_cart_hash=z"})
+    assert "x-cache" not in hm2, "stacked Woo cookie must skip on /multi/"
+    # a plain anon page on the stacked location still caches
+    fetch(ng.port, "/multi/plain")
+    _, _, hm3 = fetch(ng.port, "/multi/plain")
+    assert hm3.get("x-cache") == "HIT", \
+        f"anon page on /multi/ should cache, got {hm3.get('x-cache')}"
+    drain_origin(origin)
+
+
+def test_q2_multibuffer_oversize(ng: Nginx, origin: Origin) -> None:
+    """Q2: a ~200 KB response (streamed in several buffers) over a 1k max_size
+    must early-abort capture mid-stream — never cached, body intact, no error,
+    across repeats (the abort path runs each time)."""
+    first = None
+    for _ in range(3):
+        s, b, h = fetch(ng.port, "/qbig/bigbody-media")
+        assert s == 200, f"oversize multibuffer served {s}, expected 200"
+        assert len(b) > 100000, f"body truncated: {len(b)} bytes"
+        assert "x-cache" not in h, "multibuffer oversize must not be cached"
+        if first is not None:
+            assert b != first, "served a cached copy of an oversize body"
+        first = b
+    drain_origin(origin)
+
+
+def test_suppress_native_inert_on_plain_location(ng: Nginx) -> None:
+    """Q1: $cache_turbo_active is "0" on a location with no cache_turbo (no ctx
+    / disabled) — the variable's defensive default, so wiring it into an
+    unrelated location can never accidentally read 1."""
+    _, _, h = fetch(ng.port, "/plain/x")
+    assert h.get("x-ct-active") == "0", \
+        f"plain location: expected X-CT-Active=0, got {h.get('x-ct-active')}"
+
+
+def test_invalid_backend_name(ng: Nginx) -> None:
+    """An unknown cache_turbo_backend value is rejected at config time."""
+    bad = ng.root.parent / "bad-backend"
+    (bad / "conf").mkdir(parents=True, exist_ok=True)
+    (bad / "logs").mkdir(parents=True, exist_ok=True)
+    cfg = nginx_config(bad, ng.port, ng.module, ng.origin_port, 1)
+    cfg = cfg.replace("cache_turbo_backend woocommerce;",
+                      "cache_turbo_backend bogus;")
+    (bad / "conf" / "nginx.conf").write_text(cfg, encoding="ascii")
+    cmd = ng.runner + [str(ng.binary), "-p", str(bad),
+                       "-c", str(bad / "conf" / "nginx.conf"), "-t"]
+    r = subprocess.run(cmd, text=True, stdout=subprocess.PIPE,
+                       stderr=subprocess.STDOUT, timeout=20)
+    assert r.returncode != 0, \
+        f"invalid backend 'bogus' was accepted by nginx -t:\n{r.stdout}"
+    assert "unknown cache_turbo_backend" in r.stdout, \
+        f"missing/odd diagnostic for bad backend:\n{r.stdout}"
+
+
+def test_invalid_auto_mode(ng: Nginx) -> None:
+    """cache_turbo <zone> <mode> rejects any 2nd token other than 'auto'."""
+    bad = ng.root.parent / "bad-mode"
+    (bad / "conf").mkdir(parents=True, exist_ok=True)
+    (bad / "logs").mkdir(parents=True, exist_ok=True)
+    cfg = nginx_config(bad, ng.port, ng.module, ng.origin_port, 1)
+    cfg = cfg.replace("cache_turbo       main auto;",
+                      "cache_turbo       main bogusmode;")
+    (bad / "conf" / "nginx.conf").write_text(cfg, encoding="ascii")
+    cmd = ng.runner + [str(ng.binary), "-p", str(bad),
+                       "-c", str(bad / "conf" / "nginx.conf"), "-t"]
+    r = subprocess.run(cmd, text=True, stdout=subprocess.PIPE,
+                       stderr=subprocess.STDOUT, timeout=20)
+    assert r.returncode != 0, \
+        f"invalid cache_turbo mode was accepted by nginx -t:\n{r.stdout}"
+    assert "invalid cache_turbo mode" in r.stdout, \
+        f"missing/odd diagnostic for bad mode:\n{r.stdout}"
 
 
 def test_max_size_not_cached(ng: Nginx) -> None:
@@ -3067,6 +3218,11 @@ def run_all(ng: Nginx, origin: Origin,
     test_suppress_native_variable(ng)
     test_auto_classify(ng, origin)
     test_auto_backend_composition(ng, origin)
+    test_auto_classify_more(ng, origin)
+    test_q2_multibuffer_oversize(ng, origin)
+    test_suppress_native_inert_on_plain_location(ng)
+    test_invalid_backend_name(ng)
+    test_invalid_auto_mode(ng)
     test_no_cache_set_cookie(ng)
     test_no_cache_cc_private(ng)
     test_no_cache_cc_nostore(ng)
