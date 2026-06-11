@@ -111,17 +111,24 @@ static void ngx_http_cache_turbo_redis_tls_handshake_done(
  * (empty slots). An idle pooled connection carries a close-on-readable handler
  * (peer hung up / sent unsolicited data -> drop) plus an idle timer.
  *
- * Plain TCP only. A TLS connection's c->ssl is allocated from the op pool
- * (which op_done destroys), so a pooled TLS conn would dangle — TLS ops are
- * never pooled (guarded in save/get). A reused dead connection (redis closed it
- * between park and reuse) just fails the op, which degrades to an L2 miss /
- * lost fire-and-forget write / serve-stale — all safe, since L2 is advisory.
+ * TLS pooling (v15-2): a TLS connection's c->ssl is allocated from a dedicated
+ * connection-owned pool (created in redis_connect, parented at worker lifetime),
+ * NOT the op pool — so the conn (and its live, already-handshaked, already-AUTH'd
+ * TLS session) outlives the op that opened it and can be reused with neither a
+ * handshake nor a preamble. The same TLS channel persists across reuse, so no
+ * re-handshake or cert re-verification is needed; only liveness is re-checked
+ * (boundary peek on save + close-on-readable handler while idle). Pool entries
+ * carry a `tls` bit so a TLS op never reuses a plaintext conn or vice versa.
+ * A reused dead connection (redis closed it between park and reuse) just fails
+ * the op, which degrades to an L2 miss / lost fire-and-forget write / serve-
+ * stale — all safe, since L2 is advisory.
  * ------------------------------------------------------------------------- */
 
 typedef struct {
     ngx_queue_t        queue;
     ngx_connection_t  *connection;
     socklen_t          socklen;
+    unsigned           tls:1;          /* pooled conn is TLS (match on reuse) */
     ngx_sockaddr_t     sockaddr;       /* copy of peer addr, for match */
 } ngx_http_cache_turbo_redis_ka_item_t;
 
@@ -197,7 +204,21 @@ ngx_http_cache_turbo_redis_ka_drop(ngx_http_cache_turbo_redis_ka_item_t *item)
 
     item->connection = NULL;
     if (c) {
+#if (NGX_SSL)
+        ngx_pool_t  *cpool = c->pool;  /* conn-owned pool (TLS) or NULL (plain) */
+
+        if (c->ssl) {
+            c->ssl->no_wait_shutdown = 1;
+            (void) ngx_ssl_shutdown(c); /* best-effort close_notify */
+        }
+        c->pool = NULL;
+        ngx_close_connection(c);
+        if (cpool) {
+            ngx_destroy_pool(cpool);
+        }
+#else
         ngx_close_connection(c);       /* plain conn: c->pool is NULL */
+#endif
     }
 }
 
@@ -213,8 +234,9 @@ ngx_http_cache_turbo_redis_ka_get(ngx_http_cache_turbo_loc_conf_t *clcf,
     ngx_connection_t                       *c;
     ngx_http_cache_turbo_redis_ka_item_t   *item;
     ngx_http_cache_turbo_redis_ka_t        *ka = &ngx_http_cache_turbo_redis_ka;
+    ngx_uint_t                              want_tls = clcf->redis_tls ? 1 : 0;
 
-    if (clcf->redis_tls || !ngx_http_cache_turbo_redis_ka_init(clcf)) {
+    if (!ngx_http_cache_turbo_redis_ka_init(clcf)) {
         return NULL;
     }
 
@@ -224,7 +246,8 @@ ngx_http_cache_turbo_redis_ka_get(ngx_http_cache_turbo_loc_conf_t *clcf,
     {
         item = ngx_queue_data(q, ngx_http_cache_turbo_redis_ka_item_t, queue);
 
-        if (item->socklen == addr->socklen
+        if (item->tls == want_tls
+            && item->socklen == addr->socklen
             && ngx_memcmp(&item->sockaddr, addr->sockaddr, addr->socklen) == 0)
         {
             c = item->connection;
@@ -267,9 +290,6 @@ ngx_http_cache_turbo_redis_ka_save(ngx_http_cache_turbo_redis_op_t *op)
     if (!op->clean || c == NULL || op->clcf == NULL) {
         return 0;
     }
-    if (op->clcf->redis_tls || c->ssl) {
-        return 0;                          /* TLS conns are never pooled */
-    }
     if (c->read->error || c->write->error || c->read->eof
         || c->read->timedout || c->write->timedout || c->error)
     {
@@ -298,6 +318,7 @@ ngx_http_cache_turbo_redis_ka_save(ngx_http_cache_turbo_redis_op_t *op)
 
     item->connection = c;
     item->socklen = op->peer.socklen;
+    item->tls = c->ssl ? 1 : 0;
     ngx_memcpy(&item->sockaddr, op->peer.sockaddr, op->peer.socklen);
 
     if (c->write->timer_set) {
@@ -447,9 +468,17 @@ ngx_http_cache_turbo_redis_connect(ngx_http_cache_turbo_redis_op_t *op,
 #if (NGX_SSL)
     if (op->clcf != NULL && op->clcf->redis_tls) {
         /* A peer connection has no pool of its own; ngx_ssl_create_connection
-         * allocates c->ssl from c->pool, so lend it the op pool (which outlives
-         * the connection and is torn down in op_done). */
-        c->pool = op->pool;
+         * allocates c->ssl from c->pool. Give the connection a DEDICATED pool
+         * (parented at worker lifetime via ngx_create_pool, not borrowed from
+         * op->pool) so c->ssl outlives the spawning op and the connection can be
+         * parked on the keepalive pool (v15-2). It is destroyed only when the
+         * connection is finally closed (op_done non-park / ka_drop). */
+        c->pool = ngx_create_pool(ngx_pagesize, ngx_cycle->log);
+        if (c->pool == NULL) {
+            ngx_close_connection(c);
+            op->peer.connection = NULL;
+            return NGX_ERROR;
+        }
 
         /* TLS: drive the SSL handshake first; only after it completes do we run
          * the redis write/read handlers. The handshake handler fires on the
@@ -575,9 +604,10 @@ ngx_http_cache_turbo_redis_launch(ngx_http_cache_turbo_redis_op_t *op,
     op->read_handler = read_handler;
 
     /* Keepalive (v15): reuse a pooled idle connection if one is live. A pooled
-     * connection is already AUTH'd + SELECT'd, so it skips the preamble and
-     * sends the command straight away. */
-    if (clcf->redis_keepalive > 0 && !clcf->redis_tls) {
+     * connection is already AUTH'd + SELECT'd (and, for TLS (v15-2), already
+     * handshaked), so it skips both the preamble and the handshake and sends the
+     * command straight away over the persistent (TLS) channel. */
+    if (clcf->redis_keepalive > 0) {
         c = ngx_http_cache_turbo_redis_ka_get(clcf, &clcf->redis_addr);
         if (c != NULL) {
             op->reused = 1;
@@ -1990,6 +2020,9 @@ ngx_http_cache_turbo_redis_op_done(ngx_http_cache_turbo_redis_op_t *op)
     }
 
     if (c) {
+#if (NGX_SSL)
+        ngx_pool_t  *cpool = c->pool;  /* conn-owned pool (TLS) or NULL (plain) */
+#endif
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0,
                        "cache_turbo: redis conn close fd:%d", c->fd);
 #if (NGX_SSL)
@@ -1998,11 +2031,16 @@ ngx_http_cache_turbo_redis_op_done(ngx_http_cache_turbo_redis_op_t *op)
             c->ssl->no_wait_shutdown = 1;
             (void) ngx_ssl_shutdown(c);
         }
-        /* c->pool was borrowed from op->pool (TLS path); ngx_close_connection
-         * must not see it as its own. */
+        /* c->pool is the dedicated conn pool (TLS path); ngx_close_connection
+         * must not treat it as its own — we destroy it after the close. */
         c->pool = NULL;
-#endif
         ngx_close_connection(c);
+        if (cpool) {
+            ngx_destroy_pool(cpool);
+        }
+#else
+        ngx_close_connection(c);
+#endif
     }
     ngx_destroy_pool(pool);
 }

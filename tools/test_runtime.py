@@ -286,6 +286,16 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             cache_turbo_redis rediss://127.0.0.1:{redis_tls_port}/0 tls_ca={redis_tls_ca} tls_name=localhost;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
+
+        # v15-2: TLS keepalive pool -- idle TLS conns cached + reused across ops
+        # (handshake + AUTH/SELECT skipped on reuse over the persistent channel).
+        location /l2tlska/ {{
+            cache_turbo       main;
+            cache_turbo_key   $uri;
+            cache_turbo_valid 30s;
+            cache_turbo_redis rediss://127.0.0.1:{redis_tls_port}/0 tls_ca={redis_tls_ca} tls_name=localhost keepalive=4 keepalive_timeout=30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
 """
 
     # L2 (v2b): a location wired to a Redis backend. Scoped to /l2/ only so the
@@ -303,13 +313,18 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
-        # L2 keepalive pool (v15): up to 4 idle Redis connections cached per
-        # worker and reused across ops, instead of connect()+close per op.
+        # L2 keepalive pool (v15): idle Redis connections cached per worker and
+        # reused across ops, instead of connect()+close per op. The pool is
+        # process-global with a single cap set by the first keepalive location to
+        # init; keep it at 8 so the plain working set (<=4) AND the TLS keepalive
+        # test's working set (<=4, v15-2 /l2tlska/) both fit -- otherwise the
+        # leftover idle plain conns saturate the cap and shut TLS out (see
+        # test_l2_tls_keepalive_reuse + lessons.md).
         location /l2ka/ {{
             cache_turbo          main;
             cache_turbo_key      $uri;
             cache_turbo_valid    30s;
-            cache_turbo_redis    127.0.0.1:{redis_port} prefix=ct: timeout=250ms keepalive=4 keepalive_timeout=30s;
+            cache_turbo_redis    127.0.0.1:{redis_port} prefix=ct: timeout=250ms keepalive=8 keepalive_timeout=30s;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
@@ -1730,7 +1745,7 @@ def test_l2_keepalive_reuse(ng: Nginx, origin: Origin,
     def burst(prefix: str) -> int:
         before = _redis_conns_received(redis)
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
-            # 4 concurrent (== pool size) so reuse can dominate; unique keys so
+            # 4 concurrent (<= pool cap) so reuse can dominate; unique keys so
             # every request is an L1+L2 miss (GET then write-through SET).
             list(ex.map(lambda i: fetch(ng.port, f"{prefix}ka-{stamp}-{i}"),
                         range(n)))
@@ -1851,6 +1866,39 @@ def test_l2_tls(ng: Nginx, origin: Origin,
         "object not in TLS redis (handshake/verify failed?)"
     _, _, h = fetch(ng.port, "/l2tls/k1")
     assert h.get("x-cache") == "HIT", "second read should be an L1 hit"
+
+
+def test_l2_tls_keepalive_reuse(ng: Nginx, origin: Origin,
+                                redis_tls: RedisServer) -> None:
+    """v15-2: the keepalive pool reuses TLS Redis connections across L2 ops, so
+    a TLS handshake + AUTH/SELECT is paid once per pooled conn, not per op. A
+    distinct-URI burst opens one L2 GET + one L2 SET each; under /l2tlska/
+    (keepalive=4) Redis accepts far fewer new TLS connections than the same burst
+    under /l2tls/ (no keepalive), where every op dials + handshakes a fresh
+    socket. A passing TLS HIT after the burst proves the pooled (already-
+    handshaked) channel still serves correctly."""
+    n = 60
+    stamp = time.time()
+
+    def burst(prefix: str) -> int:
+        before = _redis_conns_received(redis_tls)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
+            list(ex.map(lambda i: fetch(ng.port, f"{prefix}tka-{stamp}-{i}"),
+                        range(n)))
+        # let the fire-and-forget SETs complete + pooled conns settle
+        time.sleep(0.6)
+        return _redis_conns_received(redis_tls) - before
+
+    off = burst("/l2tls/")     # no keepalive: ~2N fresh TLS connections
+    on = burst("/l2tlska/")    # keepalive=4: a small bounded number, then reuse
+
+    assert off > n, f"no-keepalive TLS baseline too low ({off}); expected > {n}"
+    assert on * 2 < off, \
+        f"TLS keepalive did not cut Redis connection churn (on={on}, off={off})"
+
+    # the pool keeps the TLS channel live: a subsequent op still hits + serves
+    _, _, h = fetch(ng.port, f"/l2tlska/tka-{stamp}-0")   # now an L1 HIT
+    assert h.get("x-cache") == "HIT", "TLS keepalive location broke the hot path"
 
 
 def test_l2_purge_key_drops_l2(ng: Nginx, origin: Origin,
@@ -2725,6 +2773,7 @@ def run_all(ng: Nginx, origin: Origin,
         test_l2_dsn_auth_db(ng, origin, redis_auth)  # AUTH+SELECT preamble
     if redis_tls is not None:
         test_l2_tls(ng, origin, redis_tls)           # rediss:// + verify
+        test_l2_tls_keepalive_reuse(ng, origin, redis_tls)  # v15-2 TLS pool
     test_admin_purge_all(ng)   # last: it empties the zone
 
 
@@ -2834,7 +2883,8 @@ def main() -> int:
              "DSN SELECT-db preamble (v5)"
              if redis_port else "")
           + (", DSN AUTH+SELECT preamble (v5)" if redis_auth else "")
-          + (", rediss:// TLS + verify (v5)" if redis_tls else ""))
+          + (", rediss:// TLS + verify (v5), TLS keepalive reuse (v15-2)"
+             if redis_tls else ""))
     return 0
 
 
