@@ -87,6 +87,8 @@ ngx_http_cache_turbo_shm_init_zone(ngx_shm_zone_t *shm_zone, void *data)
     ctx->sh->stale_serves = 0;
     ctx->sh->refreshes = 0;
     ctx->sh->evictions = 0;
+    ctx->sh->l2_hits = 0;
+    ctx->sh->l2_misses = 0;
 
     /* Autotune state (v4-3): everything zeroed. autotune_next = 0 makes the first
      * recompute fire immediately; the snapshots being 0 means the first window is
@@ -326,6 +328,8 @@ ngx_http_cache_turbo_shm_stats(ngx_http_cache_turbo_zone_t *z,
     out->stale_serves = z->sh->stale_serves;
     out->refreshes    = z->sh->refreshes;
     out->evictions    = z->sh->evictions;
+    out->l2_hits      = z->sh->l2_hits;
+    out->l2_misses    = z->sh->l2_misses;
 
     /* Autotune introspection (v4-3): average origin-regen cost and the live beta
      * verdict, so the admin GET can render the tuning without an internal probe. */

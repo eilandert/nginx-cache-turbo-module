@@ -945,6 +945,17 @@ def test_admin_purge_post_with_body(ng: Nginx) -> None:
     assert "x-cache" not in h2, "entry should be gone after purge (a MISS)"
 
 
+def test_default_key_normalizes(ng: Nginx) -> None:
+    """The default key (no cache_turbo_key) is $host$uri$cache_turbo_normalized_args,
+    so tracking params and the built-in sid/sessionid are stripped: a junk-laden
+    URL shares the clean slot."""
+    _, b1, h1 = fetch(ng.port, "/dk/norm?utm_source=x&sid=42&sessionid=abc")
+    assert "x-cache" not in h1, "first should miss"
+    _, b2, h2 = fetch(ng.port, "/dk/norm")
+    assert h2.get("x-cache") == "HIT" and b2 == b1, \
+        "default key should strip tracking + sid/sessionid to one slot"
+
+
 def test_cache_redirect(ng: Nginx) -> None:
     """v6: a 301 (empty body) is cached and replayed with its Location intact."""
     s1, _, h1 = fetch_raw(ng.port, "/st/redir")
@@ -1128,6 +1139,8 @@ def test_admin_prometheus(ng: Nginx) -> None:
     assert "text/plain" in ct and "0.0.4" in ct, f"bad content-type: {ct}"
     for line in ("# TYPE cache_turbo_hits_total counter",
                  "# TYPE cache_turbo_misses_total counter",
+                 "# TYPE cache_turbo_l2_hits_total counter",
+                 "# TYPE cache_turbo_l2_misses_total counter",
                  "# TYPE cache_turbo_regen_cost_ms gauge",
                  "# TYPE cache_turbo_autotuned_beta gauge"):
         assert line in b, f"metrics missing line: {line!r}"
@@ -1974,6 +1987,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_no_cache_cc_nostore(ng)
     test_no_cache_authorization(ng)
     test_default_key_varies_by_host(ng)
+    test_default_key_normalizes(ng)
     test_cache_redirect(ng)
     test_cache_negative_404(ng)
     test_head_not_stored(ng)
@@ -2104,7 +2118,8 @@ def main() -> int:
           "honor upstream Cache-Control, bypass + no_store, "
           "native-cache headers stripped, "
           "admin purge w/ body, "
-          "concurrency (R1), prometheus metrics, "
+          "concurrency (R1), prometheus metrics (incl L2 hit/miss), "
+          "default-key normalization, "
           "LRU eviction (R6), stale serve (R3), single-flight (R4), "
           "admin stats/purge/gating, warm (v3-3: populates/multi/no-url), "
           "key normalize (v3-1: order/tracking/"

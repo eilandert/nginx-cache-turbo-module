@@ -147,6 +147,12 @@ typedef struct {
     ngx_atomic_t             refreshes;
     ngx_atomic_t             evictions;
 
+    /* L2 (Redis) outcome counters (v12): incremented on an L1 miss that
+     * consulted L2 — l2_hits when L2 held the object (filled L1), l2_misses when
+     * it did not (went to origin). Zero when no L2 is configured. */
+    ngx_atomic_t             l2_hits;
+    ngx_atomic_t             l2_misses;
+
     /*
      * Live autotune state (v4-3). cost_sum_ms / cost_count accumulate the
      * wall-clock cost of every origin regeneration (request_time at the
@@ -185,6 +191,8 @@ typedef struct {
     ngx_atomic_uint_t   stale_serves;
     ngx_atomic_uint_t   refreshes;
     ngx_atomic_uint_t   evictions;
+    ngx_atomic_uint_t   l2_hits;
+    ngx_atomic_uint_t   l2_misses;
     /* Autotune introspection (v4-3): cost_ms = the measured average origin-regen
      * cost (cost_sum_ms / cost_count, 0 when nothing measured); autotuned_beta =
      * the live verdict ×1000 (0 = none). Rendered by the admin GET so a test (or

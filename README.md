@@ -137,7 +137,22 @@ http {
 }
 ```
 
-That's it. Curl it twice and look at the `X-Cache` header:
+That's the whole config. With just `cache_turbo ct;` the default key is already
+`$host$uri$cache_turbo_normalized_args`, so vhosts don't collide and tracking
+params (`utm_*`, `fbclid`, …, plus `sid`, `sessionid`, `tmp_*`) are stripped and
+args are order-insensitive out of the box — no extra directives needed. Want it
+spelled out, or to tweak it?
+
+```nginx
+location / {
+    cache_turbo                 ct;
+    cache_turbo_key             $host$uri$cache_turbo_normalized_args;  # = the default
+    cache_turbo_normalize_strip sid sessionid "tmp_*";                  # already built in
+    proxy_pass http://127.0.0.1:8080;
+}
+```
+
+Curl it twice and look at the `X-Cache` header:
 
 ```console
 $ curl -sI localhost/ | grep -i x-cache      # 1st time: nothing (it was a miss)
@@ -266,7 +281,7 @@ http {
 ```console
 # stats (JSON)
 $ curl localhost/_cache
-{"hits":1240,"misses":83,"stale_serves":12,"refreshes":11,"evictions":0,"cost_ms":34,"autotuned_beta":1700}
+{"hits":1240,"misses":83,"stale_serves":12,"refreshes":11,"evictions":0,"l2_hits":61,"l2_misses":22,"cost_ms":34,"autotuned_beta":1700}
 
 $ curl -X POST 'localhost/_cache?key=/blog/post-42'   # drop one page
 {"purged":1}
@@ -290,7 +305,7 @@ $ curl -X POST 'localhost/_cache?url=/,/blog/,/about' # pre-warm cold pages
 |---|---|---|---|
 | `cache_turbo_zone name=NAME SIZE` | `http` | — | Declare a shared-memory cache zone (min 8 pages). |
 | `cache_turbo NAME` / `off` | `server`, `location` | `off` | Turn caching on (bind a zone) or off. |
-| `cache_turbo_key STRING` | `server`, `location` | `$host$request_uri` | What makes two requests "the same page". |
+| `cache_turbo_key STRING` | `server`, `location` | `$host$uri$cache_turbo_normalized_args` | What makes two requests "the same page". The default already includes the Host and the **normalized args** (tracking params stripped, args sorted). |
 | `cache_turbo_preset NAME` | `server`, `location` | `balanced` | `conservative` / `balanced` / `aggressive` — sets the four knobs below at once. |
 | `cache_turbo_valid [CODE...] TIME` | `server`, `location` | preset (`60s`) | How long a copy stays *fresh* (then *stale*, still served). Bare `TIME` = the default/200 TTL. With leading status codes (`cache_turbo_valid 301 404 1m;`) it makes those statuses cacheable too — redirects + negative caching. Repeatable. |
 | `cache_turbo_beta N` | `server`, `location` | preset (`1000`) | Refresh eagerness, ×1000 (1000 = 1.0). Higher = refresh sooner/more often. |
@@ -333,6 +348,8 @@ cache_turbo_misses_total{zone="ct"} 83
 cache_turbo_stale_serves_total{zone="ct"} 12
 cache_turbo_refreshes_total{zone="ct"} 11
 cache_turbo_evictions_total{zone="ct"} 0
+cache_turbo_l2_hits_total{zone="ct"} 61
+cache_turbo_l2_misses_total{zone="ct"} 22
 cache_turbo_regen_cost_ms{zone="ct"} 34
 cache_turbo_autotuned_beta{zone="ct"} 1700
 ```
@@ -346,6 +363,8 @@ Every sample is labelled by `zone`, so one job can scrape many zones. Metrics:
 | `cache_turbo_stale_serves_total` | counter | Old copies served during a refresh. |
 | `cache_turbo_refreshes_total` | counter | Background refreshes started. |
 | `cache_turbo_evictions_total` | counter | Entries dropped under memory pressure (LRU). |
+| `cache_turbo_l2_hits_total` | counter | L1 misses the L2 (Redis) tier satisfied. |
+| `cache_turbo_l2_misses_total` | counter | L1 misses L2 couldn't satisfy (went to origin). |
 | `cache_turbo_regen_cost_ms` | gauge | Average backend regeneration time (ms). |
 | `cache_turbo_autotuned_beta` | gauge | Live autotuned `beta` ×1000 (0 = none). |
 
@@ -364,7 +383,12 @@ scrape_configs:
 > Same `allow`/`deny` gate applies — let your Prometheus box reach it, keep the
 > public out.
 
-Useful Grafana/PromQL: **hit ratio**
+A ready-made **Grafana dashboard** is in
+[`tools/grafana-dashboard.json`](tools/grafana-dashboard.json) — import it and
+pick your Prometheus datasource (hit ratios, L1/L2 request rates, regen cost,
+autotuned beta, per-`zone` template variable).
+
+Useful PromQL: **hit ratio**
 `rate(cache_turbo_hits_total[5m]) / (rate(cache_turbo_hits_total[5m]) +
 rate(cache_turbo_misses_total[5m]))`, **backend regen rate**
 `rate(cache_turbo_refreshes_total[5m])`, plus `cache_turbo_regen_cost_ms` and
@@ -422,7 +446,8 @@ trailing option, which **overrides** the DSN:
 `$cache_turbo_normalized_args` rebuilds the query string so equivalent requests
 share one slot: it sorts args (`?b=2&a=1` == `?a=1&b=2`) and drops tracking
 params (built-in denylist: `utm_*`, `fbclid`, `gclid`, `msclkid`, `mc_eid`,
-`_ga`, `ref`). Add more with `cache_turbo_normalize_strip`, or nuke them all
+`_ga`, `ref`, `sid`, `sessionid`, `tmp_*`). Add more with
+`cache_turbo_normalize_strip`, or nuke them all
 with `cache_turbo_normalize_strip_all on`.
 
 ```nginx

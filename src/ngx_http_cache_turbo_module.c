@@ -673,11 +673,17 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
                            ctx->l2_blob, ctx->l2_blob_len, bh.status,
                            clcf->valid, clcf->stale_mult);
                 (void) ngx_atomic_fetch_add(&z->sh->hits, 1);
+                (void) ngx_atomic_fetch_add(&z->sh->l2_hits, 1);
                 return ngx_http_cache_turbo_serve(r, ctx->l2_blob,
                            ctx->l2_blob_len, 0);
             }
         }
         /* corrupt/short blob: treat as a miss, fall through to origin */
+    }
+
+    /* L2 was consulted but did not satisfy the request (v12 metric). */
+    if (clcf->backend && ctx->l2_done) {
+        (void) ngx_atomic_fetch_add(&z->sh->l2_misses, 1);
     }
 
     /* true miss: mark for capture, let the request run to the origin */
@@ -2132,9 +2138,9 @@ ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
         {
             ngx_str_t  zname = clcf->admin_zone->shm.name;
 
-            /* Five counters (*_total) + two gauges, each labelled by zone so one
+            /* Seven counters (*_total) + two gauges, each labelled by zone so one
              * Prometheus job can scrape many zones. Exposition format 0.0.4. */
-            len = 2048 + 7 * zname.len + 7 * NGX_ATOMIC_T_LEN;
+            len = 2600 + 9 * zname.len + 9 * NGX_ATOMIC_T_LEN;
             p = ngx_pnalloc(r->pool, len);
             if (p == NULL) {
                 return NGX_HTTP_INTERNAL_SERVER_ERROR;
@@ -2156,6 +2162,12 @@ ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
                 "# HELP cache_turbo_evictions_total Entries evicted under memory pressure (LRU).\n"
                 "# TYPE cache_turbo_evictions_total counter\n"
                 "cache_turbo_evictions_total{zone=\"%V\"} %uA\n"
+                "# HELP cache_turbo_l2_hits_total L1 misses satisfied by the L2 (Redis) tier.\n"
+                "# TYPE cache_turbo_l2_hits_total counter\n"
+                "cache_turbo_l2_hits_total{zone=\"%V\"} %uA\n"
+                "# HELP cache_turbo_l2_misses_total L1 misses that L2 could not satisfy (went to origin).\n"
+                "# TYPE cache_turbo_l2_misses_total counter\n"
+                "cache_turbo_l2_misses_total{zone=\"%V\"} %uA\n"
                 "# HELP cache_turbo_regen_cost_ms Average origin regeneration cost in milliseconds.\n"
                 "# TYPE cache_turbo_regen_cost_ms gauge\n"
                 "cache_turbo_regen_cost_ms{zone=\"%V\"} %uA\n"
@@ -2164,6 +2176,7 @@ ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
                 "cache_turbo_autotuned_beta{zone=\"%V\"} %uA\n",
                 &zname, st.hits, &zname, st.misses, &zname, st.stale_serves,
                 &zname, st.refreshes, &zname, st.evictions,
+                &zname, st.l2_hits, &zname, st.l2_misses,
                 &zname, st.cost_ms, &zname, st.autotuned_beta) - p;
 
             return ngx_http_cache_turbo_send_body(r, NGX_HTTP_OK, &body,
@@ -2172,8 +2185,9 @@ ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
         }
 
         len = sizeof("{\"hits\":,\"misses\":,\"stale_serves\":,\"refreshes\":,"
-                     "\"evictions\":,\"cost_ms\":,\"autotuned_beta\":}\n")
-              + 7 * NGX_ATOMIC_T_LEN;
+                     "\"evictions\":,\"l2_hits\":,\"l2_misses\":,\"cost_ms\":,"
+                     "\"autotuned_beta\":}\n")
+              + 9 * NGX_ATOMIC_T_LEN;
         p = ngx_pnalloc(r->pool, len);
         if (p == NULL) {
             return NGX_HTTP_INTERNAL_SERVER_ERROR;
@@ -2181,10 +2195,11 @@ ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
         body.data = p;
         body.len = ngx_sprintf(p,
             "{\"hits\":%uA,\"misses\":%uA,\"stale_serves\":%uA,"
-            "\"refreshes\":%uA,\"evictions\":%uA,\"cost_ms\":%uA,"
-            "\"autotuned_beta\":%uA}\n",
+            "\"refreshes\":%uA,\"evictions\":%uA,\"l2_hits\":%uA,"
+            "\"l2_misses\":%uA,\"cost_ms\":%uA,\"autotuned_beta\":%uA}\n",
             st.hits, st.misses, st.stale_serves,
-            st.refreshes, st.evictions, st.cost_ms, st.autotuned_beta) - p;
+            st.refreshes, st.evictions, st.l2_hits, st.l2_misses,
+            st.cost_ms, st.autotuned_beta) - p;
     }
     return ngx_http_cache_turbo_send_json(r, NGX_HTTP_OK, &body);
 }
@@ -2328,6 +2343,9 @@ static ngx_str_t  ngx_http_cache_turbo_default_strip[] = {
     ngx_string("mc_eid"),
     ngx_string("_ga"),
     ngx_string("ref"),
+    ngx_string("sid"),
+    ngx_string("sessionid"),
+    ngx_string("tmp_*"),
 };
 
 
@@ -2880,6 +2898,30 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     if (conf->key == NULL) {
         conf->key = prev->key;
     }
+
+    /* Default cache key (no explicit cache_turbo_key) for an enabled location:
+     * $host$uri$cache_turbo_normalized_args — host so vhosts don't collide, $uri
+     * for the path, and the normalized args so tracking params are stripped and
+     * args are order-insensitive out of the box. Compiled lazily here; the
+     * variable was registered in preconfiguration. */
+    if (conf->key == NULL && conf->enable) {
+        ngx_str_t                         defkey =
+            ngx_string("$host$uri$cache_turbo_normalized_args");
+        ngx_http_compile_complex_value_t  ccv;
+
+        conf->key = ngx_palloc(cf->pool, sizeof(ngx_http_complex_value_t));
+        if (conf->key == NULL) {
+            return NGX_CONF_ERROR;
+        }
+        ngx_memzero(&ccv, sizeof(ngx_http_compile_complex_value_t));
+        ccv.cf = cf;
+        ccv.value = &defkey;
+        ccv.complex_value = conf->key;
+        if (ngx_http_compile_complex_value(&ccv) != NGX_OK) {
+            return NGX_CONF_ERROR;
+        }
+    }
+
     if (conf->tag == NULL) {
         conf->tag = prev->tag;
     }

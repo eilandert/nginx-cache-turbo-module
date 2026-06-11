@@ -1,0 +1,106 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "description": "Prometheus datasource scraping /_cache?format=prometheus",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus"
+    }
+  ],
+  "annotations": { "list": [] },
+  "editable": true,
+  "graphTooltip": 1,
+  "schemaVersion": 39,
+  "tags": ["nginx", "cache-turbo"],
+  "templating": {
+    "list": [
+      {
+        "name": "zone",
+        "label": "Zone",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+        "query": "label_values(cache_turbo_hits_total, zone)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true
+      }
+    ]
+  },
+  "time": { "from": "now-6h", "to": "now" },
+  "title": "nginx cache-turbo",
+  "uid": "cache-turbo",
+  "panels": [
+    {
+      "title": "L1 hit ratio",
+      "type": "stat",
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1 } },
+      "targets": [
+        {
+          "expr": "sum(rate(cache_turbo_hits_total{zone=~\"$zone\"}[5m])) / clamp_min(sum(rate(cache_turbo_hits_total{zone=~\"$zone\"}[5m])) + sum(rate(cache_turbo_misses_total{zone=~\"$zone\"}[5m])), 1)",
+          "legendFormat": "hit ratio"
+        }
+      ]
+    },
+    {
+      "title": "L2 hit ratio",
+      "type": "stat",
+      "gridPos": { "h": 6, "w": 6, "x": 6, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1 } },
+      "targets": [
+        {
+          "expr": "sum(rate(cache_turbo_l2_hits_total{zone=~\"$zone\"}[5m])) / clamp_min(sum(rate(cache_turbo_l2_hits_total{zone=~\"$zone\"}[5m])) + sum(rate(cache_turbo_l2_misses_total{zone=~\"$zone\"}[5m])), 1)",
+          "legendFormat": "L2 hit ratio"
+        }
+      ]
+    },
+    {
+      "title": "Avg origin regen cost",
+      "type": "stat",
+      "gridPos": { "h": 6, "w": 6, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "ms" } },
+      "targets": [
+        { "expr": "max(cache_turbo_regen_cost_ms{zone=~\"$zone\"})", "legendFormat": "regen ms" }
+      ]
+    },
+    {
+      "title": "Autotuned beta (x1000)",
+      "type": "stat",
+      "gridPos": { "h": 6, "w": 6, "x": 18, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        { "expr": "max(cache_turbo_autotuned_beta{zone=~\"$zone\"})", "legendFormat": "beta" }
+      ]
+    },
+    {
+      "title": "L1 requests/s (hit / miss / stale)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "reqps" } },
+      "targets": [
+        { "expr": "sum(rate(cache_turbo_hits_total{zone=~\"$zone\"}[5m]))", "legendFormat": "hit" },
+        { "expr": "sum(rate(cache_turbo_misses_total{zone=~\"$zone\"}[5m]))", "legendFormat": "miss" },
+        { "expr": "sum(rate(cache_turbo_stale_serves_total{zone=~\"$zone\"}[5m]))", "legendFormat": "stale" }
+      ]
+    },
+    {
+      "title": "L2 + origin (l2 hit / l2 miss / refresh)/s",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 6 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "reqps" } },
+      "targets": [
+        { "expr": "sum(rate(cache_turbo_l2_hits_total{zone=~\"$zone\"}[5m]))", "legendFormat": "l2 hit" },
+        { "expr": "sum(rate(cache_turbo_l2_misses_total{zone=~\"$zone\"}[5m]))", "legendFormat": "l2 miss" },
+        { "expr": "sum(rate(cache_turbo_refreshes_total{zone=~\"$zone\"}[5m]))", "legendFormat": "refresh" },
+        { "expr": "sum(rate(cache_turbo_evictions_total{zone=~\"$zone\"}[5m]))", "legendFormat": "eviction" }
+      ]
+    }
+  ]
+}
