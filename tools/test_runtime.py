@@ -380,6 +380,24 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # bypass (v9): ?nocache=1 skips the cache lookup but still refreshes it
+        location /bp/ {{
+            cache_turbo        main;
+            cache_turbo_key    $uri;
+            cache_turbo_valid  30s;
+            cache_turbo_bypass $arg_nocache;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # no_store (v9): ?private=1 means the response is never stored
+        location /nost/ {{
+            cache_turbo          main;
+            cache_turbo_key      $uri;
+            cache_turbo_valid    30s;
+            cache_turbo_no_store $arg_private;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # short fresh TTL so the stale window is reachable in-test
         location /swr/ {{
             cache_turbo          main;
@@ -943,6 +961,36 @@ def test_head_not_stored(ng: Nginx) -> None:
     assert "x-cache" not in h1, "GET after HEAD should still be a MISS"
     _, _, h2 = fetch_raw(ng.port, "/c/headonly", method="GET")
     assert h2.get("x-cache") == "HIT", "GET should cache normally after the HEAD"
+
+
+def test_bypass(ng: Nginx) -> None:
+    """v9: cache_turbo_bypass skips the lookup (forces origin) but still stores,
+    so a bypassing request refreshes the entry."""
+    _, b0, h0 = fetch(ng.port, "/bp/x")
+    assert "x-cache" not in h0, "first should miss"
+    _, b1, h1 = fetch(ng.port, "/bp/x")
+    assert h1.get("x-cache") == "HIT" and b1 == b0, "second should HIT"
+    # bypass: must go to origin (new body), not served from cache
+    _, b2, h2 = fetch(ng.port, "/bp/x?nocache=1")
+    assert "x-cache" not in h2, "bypass should not be served from cache"
+    assert b2 != b1, "bypass should hit the origin (fresh body)"
+    # the bypass refreshed the entry: a plain read now returns the bypass body
+    _, b3, h3 = fetch(ng.port, "/bp/x")
+    assert h3.get("x-cache") == "HIT" and b3 == b2, \
+        "bypass should have refreshed the cached entry"
+
+
+def test_no_store(ng: Nginx) -> None:
+    """v9: cache_turbo_no_store keeps a flagged response out of the cache."""
+    _, _, h1 = fetch(ng.port, "/nost/y?private=1")
+    assert "x-cache" not in h1, "first should miss"
+    _, _, h2 = fetch(ng.port, "/nost/y?private=1")
+    assert "x-cache" not in h2, "no_store response must not be cached"
+    # without the flag it caches normally (same $uri key)
+    _, _, h3 = fetch(ng.port, "/nost/y")
+    assert "x-cache" not in h3, "first un-flagged read is still a miss"
+    _, _, h4 = fetch(ng.port, "/nost/y")
+    assert h4.get("x-cache") == "HIT", "un-flagged response should cache"
 
 
 def test_native_cache_headers_stripped(ng: Nginx) -> None:
@@ -1900,6 +1948,8 @@ def run_all(ng: Nginx, origin: Origin,
     test_cache_redirect(ng)
     test_cache_negative_404(ng)
     test_head_not_stored(ng)
+    test_bypass(ng)
+    test_no_store(ng)
     test_native_cache_headers_stripped(ng)
     test_admin_purge_post_with_body(ng)
     test_concurrent_hits_no_deadlock(ng)
@@ -2021,7 +2071,7 @@ def main() -> int:
           "cacheability floor (Set-Cookie/CC-private/CC-no-store/Authorization "
           "not cached), default-key Host split, "
           "per-status caching (301/404 cached, HEAD not stored), "
-          "native-cache headers stripped, "
+          "bypass + no_store, native-cache headers stripped, "
           "admin purge w/ body, "
           "concurrency (R1), prometheus metrics, "
           "LRU eviction (R6), stale serve (R3), single-flight (R4), "

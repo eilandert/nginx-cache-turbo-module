@@ -248,6 +248,14 @@ typedef struct {
      * clcf->valid). 200's TTL stays the bare `cache_turbo_valid TIME` value. */
     ngx_array_t             *valid_status;
 
+    /* Bypass / no-store predicates (v9), like proxy_cache_bypass / proxy_no_cache.
+     * Each is an array of complex values; a request "trips" the predicate when any
+     * evaluates to a non-empty string other than "0". bypass => don't serve from
+     * cache (still store the fresh response); no_store => don't store. Both NULL
+     * by default. */
+    ngx_array_t             *bypass;
+    ngx_array_t             *no_store;
+
     /* Live autotune (v4-3). When on, the request path uses the zone's live
      * autotuned beta (clamped to this location's preset band) in place of the
      * static effective beta above; autotune_interval throttles the per-zone

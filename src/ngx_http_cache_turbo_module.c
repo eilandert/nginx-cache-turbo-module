@@ -185,6 +185,20 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
       0,
       NULL },
 
+    { ngx_string("cache_turbo_bypass"),
+      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_1MORE,
+      ngx_http_set_predicate_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_cache_turbo_loc_conf_t, bypass),
+      NULL },
+
+    { ngx_string("cache_turbo_no_store"),
+      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_1MORE,
+      ngx_http_set_predicate_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_cache_turbo_loc_conf_t, no_store),
+      NULL },
+
     { ngx_string("cache_turbo_normalize_strip"),
       NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_1MORE,
       ngx_http_cache_turbo_normalize_strip,
@@ -402,6 +416,18 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
 
     z = clcf->shm_zone->data;
     hash = ngx_crc32_short(ctx->key_hash, 32);
+
+    /* Bypass (v9): when a cache_turbo_bypass predicate trips, skip the cache
+     * lookup entirely and go to the origin — but still let the filters store the
+     * fresh response (so a bypassing request refreshes the entry). The key was
+     * built above so the body filter stores under the right slot. */
+    if (clcf->bypass != NULL
+        && !ctx->l2_done && !ctx->lock_done
+        && ngx_http_test_predicates(r, clcf->bypass) != NGX_OK)
+    {
+        (void) ngx_atomic_fetch_add(&z->sh->misses, 1);
+        return NGX_DECLINED;
+    }
 
     /* Live autotune (v4-3): throttled per-zone recompute of the beta verdict from
      * the window's stats. Cheap to call every request (one time compare on the
@@ -840,7 +866,9 @@ ngx_http_cache_turbo_header_filter(ngx_http_request_t *r)
     if (clcf->enable && (r == r->main || ctx->warm)
         && !(r->method & NGX_HTTP_HEAD)
         && ngx_http_cache_turbo_status_ttl(clcf, r->headers_out.status) >= 0
-        && ngx_http_cache_turbo_response_cacheable(r))
+        && ngx_http_cache_turbo_response_cacheable(r)
+        && (clcf->no_store == NULL
+            || ngx_http_test_predicates(r, clcf->no_store) == NGX_OK))
     {
         /* A warm subrequest never ran the access phase (nginx skips it for
          * subrequests), so its key was never built. Build it here from the
@@ -2660,6 +2688,8 @@ ngx_http_cache_turbo_create_loc_conf(ngx_conf_t *cf)
     conf->normalize_strip_all = NGX_CONF_UNSET;
     conf->normalize_strip = NGX_CONF_UNSET_PTR;
     conf->normalize_vary = NGX_CONF_UNSET;
+    conf->bypass = NGX_CONF_UNSET_PTR;
+    conf->no_store = NGX_CONF_UNSET_PTR;
     /* shm_zone, key, redis_addr, redis_prefix default NULL via pcalloc */
 
     return conf;
@@ -2724,6 +2754,10 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     if (conf->valid_status == NULL) {
         conf->valid_status = prev->valid_status;
     }
+
+    /* Bypass / no-store predicates (v9). */
+    ngx_conf_merge_ptr_value(conf->bypass, prev->bypass, NULL);
+    ngx_conf_merge_ptr_value(conf->no_store, prev->no_store, NULL);
 
     /* Live autotune (v4-3): off by default; default recompute cadence when on. */
     ngx_conf_merge_value(conf->autotune, prev->autotune, 0);
