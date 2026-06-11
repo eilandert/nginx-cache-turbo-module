@@ -1457,6 +1457,12 @@ def test_suppress_native_e2e_proxy_cache(ng: Nginx) -> None:
     variable gates native caching for real, not just as a header value."""
     import os
 
+    # proxy_cache writes go through nginx's cache-manager process, which is not
+    # spawned under `master_process off`; the multi-process Runtime job covers
+    # this end-to-end. Skip in single-process mode (the ASan run uses it).
+    if ng.single_process:
+        return
+
     def file_count(d: pathlib.Path) -> int:
         return sum(len(files) for _, _, files in os.walk(d))
 
