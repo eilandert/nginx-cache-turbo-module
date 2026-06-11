@@ -395,6 +395,15 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # PURGE method (v14): `PURGE /pg/x` drops that entry from L1 (+L2)
+        location /pg/ {{
+            cache_turbo       main;
+            cache_turbo_key   $uri;
+            cache_turbo_valid 30s;
+            cache_turbo_purge on;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # bypass (v9): ?nocache=1 skips the cache lookup but still refreshes it
         location /bp/ {{
             cache_turbo        main;
@@ -1001,6 +1010,19 @@ def test_honor_cache_control(ng: Nginx) -> None:
     assert h2.get("x-cache") == "STALE", \
         ("honor_cache_control: entry should be STALE at 2s (max-age=1 < 60s), "
          f"got {h2.get('x-cache')}")
+
+
+def test_purge_method(ng: Nginx) -> None:
+    """v14: a PURGE request drops that URI's entry; the next GET is a MISS."""
+    import json
+    fetch(ng.port, "/pg/x")                          # miss -> cached
+    _, _, h = fetch(ng.port, "/pg/x")
+    assert h.get("x-cache") == "HIT", "should be cached before PURGE"
+    s, b, _ = fetch_raw(ng.port, "/pg/x", method="PURGE")
+    assert s == 200, f"PURGE status {s}"
+    assert json.loads(b)["purged"] == 1, f"purge count: {b}"
+    _, _, h2 = fetch(ng.port, "/pg/x")
+    assert "x-cache" not in h2, "entry should be gone after PURGE (a MISS)"
 
 
 def test_bypass(ng: Nginx) -> None:
@@ -1992,6 +2014,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_cache_negative_404(ng)
     test_head_not_stored(ng)
     test_honor_cache_control(ng)
+    test_purge_method(ng)
     test_bypass(ng)
     test_no_store(ng)
     test_native_cache_headers_stripped(ng)
@@ -2115,7 +2138,7 @@ def main() -> int:
           "cacheability floor (Set-Cookie/CC-private/CC-no-store/Authorization "
           "not cached), default-key Host split, "
           "per-status caching (301/404 cached, HEAD not stored), "
-          "honor upstream Cache-Control, bypass + no_store, "
+          "honor upstream Cache-Control, PURGE method, bypass + no_store, "
           "native-cache headers stripped, "
           "admin purge w/ body, "
           "concurrency (R1), prometheus metrics (incl L2 hit/miss), "

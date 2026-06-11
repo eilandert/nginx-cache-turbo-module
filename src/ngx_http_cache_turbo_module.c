@@ -31,6 +31,8 @@ static ngx_int_t ngx_http_cache_turbo_body_filter(ngx_http_request_t *r,
 
 static ngx_int_t ngx_http_cache_turbo_serve(ngx_http_request_t *r,
     u_char *copy, size_t len, ngx_uint_t stale);
+static ngx_int_t ngx_http_cache_turbo_send_json(ngx_http_request_t *r,
+    ngx_uint_t status, ngx_str_t *body);
 
 static void *ngx_http_cache_turbo_create_loc_conf(ngx_conf_t *cf);
 static char *ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf,
@@ -169,6 +171,13 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
       ngx_conf_set_flag_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_cache_turbo_loc_conf_t, honor_cc),
+      NULL },
+
+    { ngx_string("cache_turbo_purge"),
+      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_cache_turbo_loc_conf_t, purge),
       NULL },
 
     { ngx_string("cache_turbo_admin"),
@@ -467,6 +476,61 @@ ngx_http_cache_turbo_upstream_ttl(ngx_http_request_t *r)
 }
 
 
+/* PURGE <uri> (v14): drop this URI's entry from L1 (+ L2) and answer
+ * {"purged":N}. Reuses the request's own key (built via the configured
+ * cache_turbo_key), so the purged slot matches what a GET would look up. The
+ * location must be gated with allow/deny. */
+static ngx_int_t
+ngx_http_cache_turbo_purge_request(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf)
+{
+    uint32_t                      hash;
+    ngx_int_t                     drc;
+    ngx_uint_t                    purged;
+    ngx_str_t                     body;
+    u_char                       *p;
+    ngx_http_cache_turbo_ctx_t   *ctx;
+    ngx_http_cache_turbo_zone_t  *z;
+
+    drc = ngx_http_discard_request_body(r);
+    if (drc != NGX_OK) {
+        return drc;
+    }
+
+    ctx = ngx_pcalloc(r->pool, sizeof(ngx_http_cache_turbo_ctx_t));
+    if (ctx == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+    if (ngx_http_cache_turbo_build_key(r, clcf, ctx) != NGX_OK) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    z = clcf->shm_zone->data;
+    hash = ngx_crc32_short(ctx->key_hash, 32);
+
+    purged = (ngx_uint_t) clcf->l1->purge_key(z, ctx->key_hash, hash);
+
+    /* Drop from L2 too, so a purge can't be silently refilled from Redis. */
+    if (clcf->backend) {
+        clcf->backend->del(clcf, ctx->key_hash);
+    }
+
+    p = ngx_pnalloc(r->pool, sizeof("{\"purged\":4294967295}\n"));
+    if (p == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+    body.data = p;
+    body.len = ngx_sprintf(p, "{\"purged\":%ui}\n", purged) - p;
+
+    /* We are in the ACCESS phase: send the reply, finalize, and return NGX_DONE
+     * so the phase engine stops here instead of falling through to proxy_pass
+     * (same pattern as serve()). */
+    drc = ngx_http_cache_turbo_send_json(r, NGX_HTTP_OK, &body);
+    ngx_http_finalize_request(r, drc);
+    return NGX_DONE;
+}
+
+
 static ngx_int_t
 ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
 {
@@ -480,6 +544,15 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
 
     if (!clcf->enable || clcf->shm_zone == NULL) {
         return NGX_DECLINED;
+    }
+
+    /* PURGE method (v14): purge this URI's entry, then answer directly. Checked
+     * before the GET/HEAD gate since PURGE is a non-standard method. */
+    if (clcf->purge && r == r->main
+        && r->method_name.len == sizeof("PURGE") - 1
+        && ngx_strncmp(r->method_name.data, "PURGE", sizeof("PURGE") - 1) == 0)
+    {
+        return ngx_http_cache_turbo_purge_request(r, clcf);
     }
 
     /* Only cache safe idempotent reads for v1. */
@@ -2804,6 +2877,7 @@ ngx_http_cache_turbo_create_loc_conf(ngx_conf_t *cf)
     conf->autotune = NGX_CONF_UNSET;
     conf->autotune_interval = NGX_CONF_UNSET;
     conf->honor_cc = NGX_CONF_UNSET;
+    conf->purge = NGX_CONF_UNSET;
     conf->max_size = NGX_CONF_UNSET_SIZE;
     conf->redis_enable = NGX_CONF_UNSET;
     conf->redis_timeout = NGX_CONF_UNSET_MSEC;
@@ -2886,6 +2960,9 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 
     /* Honor upstream Cache-Control/Expires (v7): off by default. */
     ngx_conf_merge_value(conf->honor_cc, prev->honor_cc, 0);
+
+    /* PURGE method (v14): off by default. */
+    ngx_conf_merge_value(conf->purge, prev->purge, 0);
 
     /* Live autotune (v4-3): off by default; default recompute cadence when on. */
     ngx_conf_merge_value(conf->autotune, prev->autotune, 0);

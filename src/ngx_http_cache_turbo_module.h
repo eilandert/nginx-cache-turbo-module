@@ -282,6 +282,11 @@ typedef struct {
     ngx_flag_t               admin;       /* this location is an admin endpoint */
     ngx_shm_zone_t          *admin_zone;  /* zone the admin endpoint manages */
 
+    /* PURGE method (v14). When on, a `PURGE <uri>` request to this caching
+     * location drops that URI's entry from L1 (+ L2). Gate the location with
+     * allow/deny. Off by default. */
+    ngx_flag_t               purge;
+
     /* L2 Redis (v2b). Native async client, no hiredis. The L2 store is touched
      * only on an L1 miss (sync GET) and on store (async write-through); it is
      * never on the L1-hit hot path. */
