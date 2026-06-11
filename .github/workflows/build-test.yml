@@ -37,8 +37,12 @@ jobs:
       - name: Validate scripts and source
         run: |
           bash -n tools/ci-build.sh
-          shellcheck tools/ci-build.sh
+          bash -n tools/lint-shm-lock.sh
+          shellcheck tools/ci-build.sh tools/lint-shm-lock.sh
           python3 -m py_compile tools/test_runtime.py
+
+      - name: shm-mutex hold invariant (R7)
+        run: bash tools/lint-shm-lock.sh
           cppcheck \
             --enable=warning,performance,portability \
             --error-exitcode=1 \
