@@ -36,13 +36,13 @@ jobs:
 
       - name: Validate scripts and source
         run: |
-          bash -n tools/ci-build.sh
-          bash -n tools/lint-shm-lock.sh
-          shellcheck tools/ci-build.sh tools/lint-shm-lock.sh
+          bash -n tools/*.sh fuzz/*.sh
+          shellcheck tools/*.sh fuzz/*.sh
           python3 -m py_compile tools/test_runtime.py
 
-      - name: shm-mutex hold invariant (R7)
-        run: bash tools/lint-shm-lock.sh
+      - name: Static analysis (R7 shm-lock invariant + cppcheck + whitespace)
+        run: |
+          bash tools/lint-shm-lock.sh
           cppcheck \
             --enable=warning,performance,portability \
             --error-exitcode=1 \
@@ -52,7 +52,8 @@ jobs:
             src/ngx_http_cache_turbo_module.c \
             src/ngx_http_cache_turbo_shm.c \
             src/ngx_http_cache_turbo_swr.c \
-            src/ngx_http_cache_turbo_redis.c
+            src/ngx_http_cache_turbo_redis.c \
+            src/ngx_http_cache_turbo_memcached.c
           git diff --check
 
       - name: Lint workflows

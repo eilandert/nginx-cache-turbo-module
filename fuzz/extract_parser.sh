@@ -33,10 +33,10 @@ fi
 # different control flow than production. Fail the build if they diverge.
 check_define() {
     name="$1"
-    got=$(grep -E "^#define[[:space:]]+$name[[:space:]]" "$SRC" \
-          | head -n1 | sed -E "s/^#define[[:space:]]+$name[[:space:]]+//; s/[[:space:]]*$//")
-    shim=$(grep -E "^#define[[:space:]]+$name[[:space:]]" "$SHIM" \
-          | head -n1 | sed -E "s/^#define[[:space:]]+$name[[:space:]]+//; s/[[:space:]]*$//")
+    got=$(grep -E "^#define[[:space:]]+${name}[[:space:]]" "$SRC" \
+          | head -n1 | sed -E "s/^#define[[:space:]]+${name}[[:space:]]+//; s/[[:space:]]*$//")
+    shim=$(grep -E "^#define[[:space:]]+${name}[[:space:]]" "$SHIM" \
+          | head -n1 | sed -E "s/^#define[[:space:]]+${name}[[:space:]]+//; s/[[:space:]]*$//")
     if [ -z "$got" ]; then
         echo "✗ $name not found in $SRC (renamed? update extract_parser.sh)" >&2
         exit 1

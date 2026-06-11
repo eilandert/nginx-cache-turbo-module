@@ -184,10 +184,13 @@ cache_turbo_valid 404 410 1m;       # negative caching
 And it **refuses** to cache anything that looks per-user, so you don't
 accidentally serve Alice's logged-in page to Bob:
 
-- request had an `Authorization` header → not cached
+- request had an `Authorization` header → not cached **and not served from cache**
+  (an anonymously-primed copy is never handed to a credentialed request)
 - response sets a cookie (`Set-Cookie`) → not cached
 - response says `Cache-Control: private | no-store | no-cache | max-age=0 |
   s-maxage=0` → not cached
+- `206 Partial Content` → never cached (the cache key has no `Range`, so a stored
+  partial could be served for a different/whole range)
 
 Hop-by-hop / framing headers (`Connection`, `Transfer-Encoding`,
 `Content-Length`, `Set-Cookie`, `Date`, `Server`, …) are stripped before
@@ -212,8 +215,10 @@ Turn on `cache_turbo_auto_vary on` and the module reads the response's own
 `Accept-Encoding` (bucketed br/gzip/identity/zstd), `User-Agent` (mobile/desktop
 class), `Accept-Language` and `Origin` (raw value). A response with `Vary: *`, or
 one that varies on `Cookie` or `Authorization`, is treated as **uncacheable**
-(those vary per-user — caching them would poison or leak across users); any other
-named header is ignored (still cached, just not split on it).
+(those vary per-user — caching them would poison or leak across users). **Any
+other named header is also treated as uncacheable** — the module can't key on it,
+and caching a single representation for every value of that header would serve the
+wrong one (RFC 9110 §12.5.5).
 
 Keying is two-level and node-local: the first time a URL's response is seen to
 vary, the module records a tiny *vary marker* in L1 and stores the body under a
@@ -339,7 +344,9 @@ $ curl -X POST 'localhost/_cache?url=/,/blog/,/about' # pre-warm cold pages
 | Directive | Context | Default | What it does |
 |---|---|---|---|
 | `cache_turbo_zone name=NAME SIZE` | `http` | — | Declare a shared-memory cache zone (min 8 pages). |
-| `cache_turbo NAME` / `off` | `server`, `location` | `off` | Turn caching on (bind a zone) or off. |
+| `cache_turbo NAME [auto]` / `off` | `server`, `location` | `off` | Turn caching on (bind a zone) or off. The optional `auto` is shorthand for `cache_turbo_backend generic` (auto-classify dynamic CMS surfaces — see below). |
+| `cache_turbo_backend NAME...` | `server`, `location` | — | Auto-classify dynamic (uncacheable) request surfaces for one or more CMS presets: `generic` (a.k.a. `auto`, the union), `wordpress`, `woocommerce`, `joomla`. A matching request (login/session cookie, admin URI, dynamic arg) skips the cache and goes straight to origin. Implies `cache_turbo_honor_cache_control on`. |
+| `cache_turbo_suppress_native on` | `server`, `location` | `off` | Make `$cache_turbo_active` read `1` while cache-turbo owns a request, so a stacked native `proxy_cache` can defer via `proxy_no_cache $cache_turbo_active; proxy_cache_bypass $cache_turbo_active;`. Off (default) keeps the variable always `0` (the wiring stays inert). |
 | `cache_turbo_key STRING` | `server`, `location` | `$host$uri$cache_turbo_normalized_args` | What makes two requests "the same page". The default already includes the Host and the **normalized args** (tracking params stripped, args sorted). |
 | `cache_turbo_preset NAME` | `server`, `location` | `balanced` | `conservative` / `balanced` / `aggressive` — sets the four knobs below at once. |
 | `cache_turbo_valid [CODE...] TIME` | `server`, `location` | preset (`60s`) | How long a copy stays *fresh* (then *stale*, still served). Bare `TIME` = the default/200 TTL. With leading status codes (`cache_turbo_valid 301 404 1m;`) it makes those statuses cacheable too — redirects + negative caching. Repeatable. |
@@ -356,14 +363,22 @@ $ curl -X POST 'localhost/_cache?url=/,/blog/,/about' # pre-warm cold pages
 | `cache_turbo_background_update on` / `off` | `server`, `location` | `on` | The stale-while-revalidate behaviour. **On** (default): a stale page is served *immediately* while one request quietly refreshes it in the background — **nobody waits on the backend**, and if that refresh hits a 5xx/timeout the old copy is left untouched and keeps being served (**stale-if-error**). **Off**: the chosen refresher regenerates inline (it waits for the backend and serves the fresh body), the pre-SWR behaviour. |
 | `cache_turbo_autotune on` | `server`, `location` | `off` | Auto-pick `beta` from the measured backend latency, clamped to the preset's band. |
 | `cache_turbo_autotune_interval TIME` | `server`, `location` | `30s` | How often autotune recomputes. |
-| `cache_turbo_redis DSN [opts...]` | `http`, `server`, `location` | — | Add a shared **L2 Redis** tier. `DSN` is `redis://[user:pass@]host:port/db` (or bare `host:port`); `rediss://` = TLS. Write-through on store; one sync `GET` on an L1 miss (never on an L1 hit). Opts: `prefix=` (`ct:`), `timeout=` (`250ms`), `password=`, `user=`, `db=`, `tls=on\|off`, `tls_verify=on\|off` (default on), `tls_ca=<file>`, `tls_name=<host>`. Native client, no hiredis. |
+| `cache_turbo_redis DSN [opts...]` | `http`, `server`, `location` | — | Add a shared **L2 Redis** tier. `DSN` is `redis://[user:pass@]host:port/db` (or bare `host:port`); `rediss://` = TLS. Write-through on store; one sync `GET` on an L1 miss (never on an L1 hit). Opts: `prefix=` (`ct:`, must be non-empty), `timeout=` (`250ms`), `password=`, `user=`, `db=`, `tls=on\|off`, `tls_verify=on\|off` (default on), `tls_ca=<file>`, `tls_name=<host>`, `keepalive=N` (idle conns to pool per worker, `0`=off), `keepalive_timeout=` (`60s`). Pooled conns are reused only within the same db/credentials/TLS context. Native client, no hiredis. |
 | `cache_turbo_memcached HOST:PORT [opts...]` | `http`, `server`, `location` | — | Add a shared **L2 memcached** tier (alternative to `cache_turbo_redis`, mutually exclusive with it). Write-through on store; one sync `get` on an L1 miss. Opts: `prefix=` (`ct:`), `timeout=` (`250ms`). No tags / `?all` / cross-node lock (memcached lacks sorted sets, `SCAN`, atomic `SET-NX`); 1 MiB value cap. Native client, no libmemcached. |
 | `cache_turbo_tag EXPR` | `server`, `location` | — | Tag stored pages (whitespace/comma list) so they can be purged as a group. Needs `cache_turbo_redis`. |
 | `cache_turbo_admin NAME` | `location` | — | Make this location a control endpoint for zone `NAME` (stats/purge/warm). Gate with `allow`/`deny`. |
 | `cache_turbo_normalize_strip NAME...` | `server`, `location` | — | Extra query args to drop from `$cache_turbo_normalized_args` (trailing `*` = prefix), on top of the built-ins. |
 | `cache_turbo_normalize_strip_all on` | `server`, `location` | `off` | Drop **every** query arg from `$cache_turbo_normalized_args`. |
 | `cache_turbo_normalize_vary TOKEN...` | `server`, `location` | off | Append a variant bucket to `$cache_turbo_normalized_args`: `encoding` (br/gzip/identity) and/or `device` (mobile/desktop). |
-| `cache_turbo_auto_vary on` | `server`, `location` | `off` | Read the response's own `Vary` header and split the cache by the named request header automatically. Safe whitelist: `Accept-Encoding`, `User-Agent` (device class), `Accept-Language`, `Origin`. `Vary: *`/`Cookie`/`Authorization` ⇒ uncacheable; other names ignored. Two-level, node-local keying. See [Auto-Vary](#auto-vary-read-the-response-vary). |
+| `cache_turbo_auto_vary on` | `server`, `location` | `off` | Read the response's own `Vary` header and split the cache by the named request header automatically. Safe whitelist: `Accept-Encoding`, `User-Agent` (device class), `Accept-Language`, `Origin`. `Vary: *`/`Cookie`/`Authorization` — **or any other header not on the whitelist** — ⇒ uncacheable (so an un-split Vary axis can never serve the wrong representation). Two-level, node-local keying. See [Auto-Vary](#auto-vary-read-the-response-vary). |
+
+### Variables
+
+| Variable | Value |
+|---|---|
+| `$cache_turbo_normalized_args` | The request's query string with tracking params stripped and the rest sorted, plus the optional Vary bucket (`cache_turbo_normalize_vary`). The default cache key's args component. |
+| `$cache_turbo_active` | `1` when cache-turbo is engaged for this request (enabled, cacheable method, main request) **and** `cache_turbo_suppress_native on`; else `0`. Wire it into a stacked `proxy_cache` via `proxy_no_cache`/`proxy_cache_bypass` so the native cache defers. |
+| `$cache_turbo_beta` | The effective refresh `beta` ×1000 in force for this request (preset/explicit/autotuned). Handy for debugging/logging. |
 
 ### Admin endpoint verbs
 
@@ -372,7 +387,7 @@ $ curl -X POST 'localhost/_cache?url=/,/blog/,/about' # pre-warm cold pages
 | `GET /_cache` | JSON stats (`?autotune=1` also forces an autotune recompute first). |
 | `GET /_cache?format=prometheus` | Same stats in Prometheus text format — scrape this. |
 | `POST /_cache?all=1` | Purge the whole zone (and the L2 keyspace, if Redis is on). |
-| `POST /_cache?key=<string>` | Purge one entry (hashed like the cache key). Drops L1 + L2. |
+| `POST /_cache?key=<string>` | Purge one entry. `<string>` is hashed **verbatim**, so it must equal the entry's full cache-key value — for the default key that is `<host><uri><normalized-args>` (e.g. `example.com/blog/post-42`), **not** just the path. Use a `PURGE` request to that URL (above) if you don't want to reconstruct the key. Drops L1 + L2. |
 | `POST /_cache?tag=<name>` | Purge every page tagged `<name>` across L1 + L2. |
 | `POST /_cache?url=<path[,path,...]>` | Warm those paths (background prefetch). |
 
@@ -407,6 +422,8 @@ Every sample is labelled by `zone`, so one job can scrape many zones. Metrics:
 | `cache_turbo_evictions_total` | counter | Entries dropped under memory pressure (LRU). |
 | `cache_turbo_l2_hits_total` | counter | L1 misses the L2 (Redis) tier satisfied. |
 | `cache_turbo_l2_misses_total` | counter | L1 misses L2 couldn't satisfy (went to origin). |
+| `cache_turbo_lock_waits_total` | counter | Cold-miss requests that waited on a single-flight winner's fill. |
+| `cache_turbo_min_uses_skips_total` | counter | Requests sent to origin (not stored) for being below `cache_turbo_min_uses`. |
 | `cache_turbo_regen_cost_ms` | gauge | Average backend regeneration time (ms). |
 | `cache_turbo_autotuned_beta` | gauge | Live autotuned `beta` ×1000 (0 = none). |
 

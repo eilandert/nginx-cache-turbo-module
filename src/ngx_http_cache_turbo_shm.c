@@ -231,14 +231,16 @@ ngx_http_cache_turbo_shm_purge_all(ngx_http_cache_turbo_zone_t *z)
 ngx_int_t
 ngx_http_cache_turbo_shm_store(ngx_http_cache_turbo_zone_t *z,
     u_char *key_hash, uint32_t hash, u_char *data, size_t len,
-    ngx_uint_t status, time_t fresh_ttl, ngx_int_t stale_mult)
+    ngx_uint_t status, time_t fresh_ttl, time_t stale_ttl)
 {
     u_char                       *body;
-    time_t                        now, stale_ttl;
+    time_t                        now;
     ngx_http_cache_turbo_node_t  *ctn;
 
+    /* fresh_ttl may be <= 0 (object already stale on an L2 fill) — fresh_until
+     * then lands in the past and the node is served via the stale path. stale_ttl
+     * is the absolute serveable window from now (0 = no stale serving). */
     now = ngx_time();
-    stale_ttl = ngx_http_cache_turbo_stale_ttl(fresh_ttl, stale_mult);
 
     ngx_shmtx_lock(&z->shpool->mutex);
 
@@ -246,12 +248,22 @@ ngx_http_cache_turbo_shm_store(ngx_http_cache_turbo_zone_t *z,
     ctn = ngx_http_cache_turbo_shm_lookup(z, key_hash, hash);
 
     if (ctn) {
+        /* Detach ctn from the LRU *before* any eviction. shm_evict_one() frees
+         * the LRU tail, and on a stale refresh ctn may itself be that tail;
+         * evicting it here would free the very node we go on to write to
+         * (use-after-free + double-free of ctn->data). Detaching guarantees the
+         * retry-evict frees some OTHER node (or none, if ctn was the only one).
+         * Re-inserted at the LRU head on success, restored on alloc fail. */
+        ngx_queue_remove(&ctn->lru);
+
         body = ngx_slab_alloc_locked(z->shpool, len);
         if (body == NULL) {
             ngx_http_cache_turbo_shm_evict_one(z);
             body = ngx_slab_alloc_locked(z->shpool, len);
         }
         if (body == NULL) {
+            /* Refresh failed: keep the existing (stale) entry reachable. */
+            ngx_queue_insert_head(&z->sh->lru, &ctn->lru);
             ngx_shmtx_unlock(&z->shpool->mutex);
             return NGX_ERROR;
         }
@@ -268,7 +280,6 @@ ngx_http_cache_turbo_shm_store(ngx_http_cache_turbo_zone_t *z,
         ctn->refreshing = 0;
         ctn->refresh_lock_until = 0;
 
-        ngx_queue_remove(&ctn->lru);
         ngx_queue_insert_head(&z->sh->lru, &ctn->lru);
 
         ngx_shmtx_unlock(&z->shpool->mutex);

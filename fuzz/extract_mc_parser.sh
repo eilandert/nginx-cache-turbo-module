@@ -26,10 +26,10 @@ fi
 # shim. A drift would make the fuzzer exercise a different control flow than
 # production. Fail the build if they diverge.
 name=NGX_HTTP_CACHE_TURBO_MC_MAX_VALUE
-got=$(grep -E "^#define[[:space:]]+$name[[:space:]]" "$SRC" \
-      | head -n1 | sed -E "s/^#define[[:space:]]+$name[[:space:]]+//; s/[[:space:]]*$//")
-shim=$(grep -E "^#define[[:space:]]+$name[[:space:]]" "$SHIM" \
-      | head -n1 | sed -E "s/^#define[[:space:]]+$name[[:space:]]+//; s/[[:space:]]*$//")
+got=$(grep -E "^#define[[:space:]]+${name}[[:space:]]" "$SRC" \
+      | head -n1 | sed -E "s/^#define[[:space:]]+${name}[[:space:]]+//; s/[[:space:]]*$//")
+shim=$(grep -E "^#define[[:space:]]+${name}[[:space:]]" "$SHIM" \
+      | head -n1 | sed -E "s/^#define[[:space:]]+${name}[[:space:]]+//; s/[[:space:]]*$//")
 if [ -z "$got" ]; then
     echo "✗ $name not found in $SRC (renamed? update extract_mc_parser.sh)" >&2
     exit 1

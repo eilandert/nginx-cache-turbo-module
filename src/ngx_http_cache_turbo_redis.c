@@ -129,8 +129,44 @@ typedef struct {
     ngx_connection_t  *connection;
     socklen_t          socklen;
     unsigned           tls:1;          /* pooled conn is TLS (match on reuse) */
+    uint32_t           ctx_fp;         /* security-context fingerprint (match) */
     ngx_sockaddr_t     sockaddr;       /* copy of peer addr, for match */
 } ngx_http_cache_turbo_redis_ka_item_t;
+
+
+/* Fingerprint the security context a pooled connection was opened under. Reuse
+ * skips the AUTH/SELECT preamble (and, for TLS, cert verification), so a pooled
+ * conn may ONLY be handed to a location with the IDENTICAL db, credentials and
+ * TLS trust — otherwise ops would run on the wrong db or under the wrong
+ * identity. The peer address and `tls` bit are matched separately; everything
+ * else that changes the connection's authenticated state folds in here. */
+static uint32_t
+ngx_http_cache_turbo_redis_ka_fp(ngx_http_cache_turbo_loc_conf_t *clcf)
+{
+    uint32_t  crc;
+    u_char    flags[2];
+
+    ngx_crc32_init(crc);
+
+    flags[0] = (u_char) (clcf->redis_tls_verify ? 1 : 0);
+    flags[1] = 0;
+    ngx_crc32_update(&crc, flags, sizeof(flags));
+    ngx_crc32_update(&crc, (u_char *) &clcf->redis_db, sizeof(clcf->redis_db));
+
+    /* NUL-separated so field boundaries can't alias (""+"ab" vs "a"+"b"). */
+    ngx_crc32_update(&crc, clcf->redis_user.data, clcf->redis_user.len);
+    ngx_crc32_update(&crc, (u_char *) "", 1);
+    ngx_crc32_update(&crc, clcf->redis_password.data, clcf->redis_password.len);
+    ngx_crc32_update(&crc, (u_char *) "", 1);
+    ngx_crc32_update(&crc, clcf->redis_tls_ca.data, clcf->redis_tls_ca.len);
+    ngx_crc32_update(&crc, (u_char *) "", 1);
+    ngx_crc32_update(&crc, clcf->redis_tls_name.data, clcf->redis_tls_name.len);
+    ngx_crc32_update(&crc, (u_char *) "", 1);
+    ngx_crc32_update(&crc, clcf->redis_host.data, clcf->redis_host.len);
+
+    ngx_crc32_final(crc);
+    return crc;
+}
 
 typedef struct {
     ngx_uint_t   inited;
@@ -235,6 +271,7 @@ ngx_http_cache_turbo_redis_ka_get(ngx_http_cache_turbo_loc_conf_t *clcf,
     ngx_http_cache_turbo_redis_ka_item_t   *item;
     ngx_http_cache_turbo_redis_ka_t        *ka = &ngx_http_cache_turbo_redis_ka;
     ngx_uint_t                              want_tls = clcf->redis_tls ? 1 : 0;
+    uint32_t                                want_fp = ngx_http_cache_turbo_redis_ka_fp(clcf);
 
     if (!ngx_http_cache_turbo_redis_ka_init(clcf)) {
         return NULL;
@@ -247,6 +284,7 @@ ngx_http_cache_turbo_redis_ka_get(ngx_http_cache_turbo_loc_conf_t *clcf,
         item = ngx_queue_data(q, ngx_http_cache_turbo_redis_ka_item_t, queue);
 
         if (item->tls == want_tls
+            && item->ctx_fp == want_fp
             && item->socklen == addr->socklen
             && ngx_memcmp(&item->sockaddr, addr->sockaddr, addr->socklen) == 0)
         {
@@ -319,6 +357,7 @@ ngx_http_cache_turbo_redis_ka_save(ngx_http_cache_turbo_redis_op_t *op)
     item->connection = c;
     item->socklen = op->peer.socklen;
     item->tls = c->ssl ? 1 : 0;
+    item->ctx_fp = ngx_http_cache_turbo_redis_ka_fp(op->clcf);
     ngx_memcpy(&item->sockaddr, op->peer.sockaddr, op->peer.socklen);
 
     if (c->write->timer_set) {
@@ -1199,20 +1238,32 @@ ngx_http_cache_turbo_redis_smembers(ngx_http_request_t *r,
 #define NGX_HTTP_CACHE_TURBO_REDIS_SCAN_COUNT  "256"
 
 
-/* Encode one SCAN <cursor> MATCH <prefix>* COUNT <n> command into pool. */
+/* Encode one SCAN <cursor> MATCH <prefix>* COUNT <n> command into pool. The
+ * prefix is escaped: SCAN MATCH treats *, ?, [, ], \ as glob metacharacters, so
+ * a prefix that happens to contain one (or a deliberately crafted one) must not
+ * widen the pattern. Only the single trailing '*' we append is a wildcard. */
 static ngx_buf_t *
 ngx_http_cache_turbo_redis_scan_cmd(ngx_pool_t *pool,
     ngx_http_cache_turbo_loc_conf_t *clcf, ngx_str_t *cursor)
 {
-    ngx_str_t  argv[6];
-    u_char    *match;
+    ngx_str_t   argv[6];
+    u_char     *match, *p, *s, *end;
 
-    match = ngx_pnalloc(pool, clcf->redis_prefix.len + 1);
+    /* Worst case every byte is a metachar needing a backslash, plus trailing '*'. */
+    match = ngx_pnalloc(pool, clcf->redis_prefix.len * 2 + 1);
     if (match == NULL) {
         return NULL;
     }
-    ngx_memcpy(match, clcf->redis_prefix.data, clcf->redis_prefix.len);
-    match[clcf->redis_prefix.len] = '*';
+    p = match;
+    s = clcf->redis_prefix.data;
+    end = s + clcf->redis_prefix.len;
+    for (; s < end; s++) {
+        if (*s == '*' || *s == '?' || *s == '[' || *s == ']' || *s == '\\') {
+            *p++ = '\\';
+        }
+        *p++ = *s;
+    }
+    *p++ = '*';
 
     argv[0].data = (u_char *) "SCAN";
     argv[0].len = sizeof("SCAN") - 1;
@@ -1220,7 +1271,7 @@ ngx_http_cache_turbo_redis_scan_cmd(ngx_pool_t *pool,
     argv[2].data = (u_char *) "MATCH";
     argv[2].len = sizeof("MATCH") - 1;
     argv[3].data = match;
-    argv[3].len = clcf->redis_prefix.len + 1;
+    argv[3].len = p - match;
     argv[4].data = (u_char *) "COUNT";
     argv[4].len = sizeof("COUNT") - 1;
     argv[5].data = (u_char *) NGX_HTTP_CACHE_TURBO_REDIS_SCAN_COUNT;
@@ -1239,6 +1290,16 @@ ngx_http_cache_turbo_redis_scan_del(ngx_http_request_t *r,
     ngx_http_cache_turbo_redis_op_t  *op;
 
     if (!clcf->redis_enable) {
+        return NGX_ERROR;
+    }
+
+    /* Refuse to scan-delete with an empty prefix: that would be SCAN MATCH *,
+     * i.e. the entire (possibly shared) Redis keyspace. An empty prefix is also
+     * rejected at config time; this is the last-line guard. */
+    if (clcf->redis_prefix.len == 0) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "cache_turbo: refusing L2 all-purge with empty key prefix "
+                      "(would SCAN MATCH * the whole keyspace)");
         return NGX_ERROR;
     }
 

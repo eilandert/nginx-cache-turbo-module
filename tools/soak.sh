@@ -102,7 +102,6 @@ END=$(( $(date +%s) + DURATION ))
 saw_hit="$WORK/logs/saw_hit"
 
 worker() {
-    local wid="$1"
     local paths=(/tiny /medium /large)
     local i=0
     while [ "$(date +%s)" -lt "$END" ]; do

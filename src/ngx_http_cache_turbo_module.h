@@ -547,16 +547,28 @@ typedef struct {
  *
  * The header block lets us restore Content-Type and any other response
  * headers on a cache hit, so cached responses are byte-identical to origin.
+ *
+ * created/fresh_ttl/stale_ttl carry the object's ORIGINAL freshness so an L2
+ * hit can rebuild L1 with the remaining lifetime instead of resetting it to the
+ * location default — without these, every L2 hit would re-promote a stale object
+ * as fresh and it could live forever (and per-status/upstream TTLs would be lost
+ * across the L2 round-trip). All offsets are derived from sizeof(header), so the
+ * body/header-block parse is unaffected by these fields.
  */
 typedef struct {
-    uint32_t                 magic;       /* 0x43544231 = "CTB1"            */
+    uint32_t                 magic;       /* 0x43544232 = "CTB2"            */
     uint32_t                 nheaders;
     uint32_t                 headers_len; /* bytes of the header block      */
     uint32_t                 body_len;
     uint32_t                 status;
+    int64_t                  created;     /* unix time (s) the blob was made */
+    uint32_t                 fresh_ttl;   /* freshness seconds from created  */
+    uint32_t                 stale_ttl;   /* total serveable window (>=fresh) */
 } ngx_http_cache_turbo_blob_hdr_t;
 
-#define NGX_HTTP_CACHE_TURBO_BLOB_MAGIC  0x43544231
+/* CTB2 added created/fresh_ttl/stale_ttl. Old CTB1 blobs in L2 fail the magic
+ * check and are treated as a miss (cache self-heals), so no migration needed. */
+#define NGX_HTTP_CACHE_TURBO_BLOB_MAGIC  0x43544232
 
 
 extern ngx_module_t  ngx_http_cache_turbo_module;
@@ -571,7 +583,7 @@ ngx_http_cache_turbo_node_t *
 
 ngx_int_t ngx_http_cache_turbo_shm_store(ngx_http_cache_turbo_zone_t *z,
     u_char *key_hash, uint32_t hash, u_char *data, size_t len,
-    ngx_uint_t status, time_t fresh_ttl, ngx_int_t stale_mult);
+    ngx_uint_t status, time_t fresh_ttl, time_t stale_ttl);
 
 /* Purge a single entry by key hash. Returns 1 if an entry was removed, 0 if
  * not present. */
@@ -744,7 +756,7 @@ struct ngx_cache_turbo_l1_backend_s {
         u_char *key_hash, uint32_t hash);
     ngx_int_t  (*store)(ngx_http_cache_turbo_zone_t *z, u_char *key_hash,
         uint32_t hash, u_char *data, size_t len, ngx_uint_t status,
-        time_t fresh_ttl, ngx_int_t stale_mult);
+        time_t fresh_ttl, time_t stale_ttl);
     ngx_int_t  (*purge_key)(ngx_http_cache_turbo_zone_t *z, u_char *key_hash,
         uint32_t hash);
     ngx_uint_t (*purge_all)(ngx_http_cache_turbo_zone_t *z);

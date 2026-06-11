@@ -25,6 +25,7 @@
 
 
 static ngx_int_t ngx_http_cache_turbo_access_handler(ngx_http_request_t *r);
+static ngx_int_t ngx_http_cache_turbo_precontent_handler(ngx_http_request_t *r);
 static ngx_int_t ngx_http_cache_turbo_header_filter(ngx_http_request_t *r);
 static ngx_int_t ngx_http_cache_turbo_body_filter(ngx_http_request_t *r,
     ngx_chain_t *in);
@@ -450,6 +451,13 @@ ngx_http_cache_turbo_status_ttl(ngx_http_cache_turbo_loc_conf_t *clcf,
     ngx_http_cache_turbo_valid_t  *v;
     ngx_uint_t                     i;
 
+    /* Never cache 206 Partial Content: the cache key does not include the Range,
+     * so a stored partial would be served for a different (or full) range. Refuse
+     * even if an operator listed 206 in cache_turbo_valid. */
+    if (status == NGX_HTTP_PARTIAL_CONTENT) {
+        return -1;
+    }
+
     if (status == NGX_HTTP_OK) {
         return clcf->valid;
     }
@@ -607,9 +615,9 @@ ngx_http_cache_turbo_purge_request(ngx_http_request_t *r,
     body.data = p;
     body.len = ngx_sprintf(p, "{\"purged\":%ui}\n", purged) - p;
 
-    /* We are in the ACCESS phase: send the reply, finalize, and return NGX_DONE
-     * so the phase engine stops here instead of falling through to proxy_pass
-     * (same pattern as serve()). */
+    /* PRECONTENT phase (after ACCESS/allow-deny): send the reply, finalize, and
+     * return NGX_DONE so the phase engine stops here instead of falling through
+     * to the content handler / proxy_pass (same pattern as serve()). */
     drc = ngx_http_cache_turbo_send_json(r, NGX_HTTP_OK, &body);
     ngx_http_finalize_request(r, drc);
     return NGX_DONE;
@@ -751,6 +759,34 @@ ngx_http_cache_turbo_auto_skip(ngx_http_request_t *r,
 /* >>> FUZZ-EXTRACT auto-classify END <<< */
 
 
+/* PURGE (v14) runs in the PRECONTENT phase, NOT the ACCESS phase. The ACCESS
+ * phase (allow/deny, auth_basic, …) must complete first: handling PURGE in
+ * ACCESS and returning NGX_DONE would short-circuit the phase engine and let an
+ * unauthorized client purge the cache despite the documented allow/deny gate.
+ * Precontent runs after access, so a 403 from allow/deny fires before we get
+ * here. */
+static ngx_int_t
+ngx_http_cache_turbo_precontent_handler(ngx_http_request_t *r)
+{
+    ngx_http_cache_turbo_loc_conf_t  *clcf;
+
+    clcf = ngx_http_get_module_loc_conf(r, ngx_http_cache_turbo_module);
+
+    if (!clcf->enable || clcf->shm_zone == NULL || !clcf->purge) {
+        return NGX_DECLINED;
+    }
+
+    if (r != r->main
+        || r->method_name.len != sizeof("PURGE") - 1
+        || ngx_strncmp(r->method_name.data, "PURGE", sizeof("PURGE") - 1) != 0)
+    {
+        return NGX_DECLINED;
+    }
+
+    return ngx_http_cache_turbo_purge_request(r, clcf);
+}
+
+
 static ngx_int_t
 ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
 {
@@ -766,14 +802,8 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
         return NGX_DECLINED;
     }
 
-    /* PURGE method (v14): purge this URI's entry, then answer directly. Checked
-     * before the GET/HEAD gate since PURGE is a non-standard method. */
-    if (clcf->purge && r == r->main
-        && r->method_name.len == sizeof("PURGE") - 1
-        && ngx_strncmp(r->method_name.data, "PURGE", sizeof("PURGE") - 1) == 0)
-    {
-        return ngx_http_cache_turbo_purge_request(r, clcf);
-    }
+    /* PURGE is handled by the preceding PRECONTENT handler. Both handlers run
+     * after ACCESS so cache hits cannot bypass allow/deny or auth modules. */
 
     /* Only cache safe idempotent reads for v1. */
     if (!(r->method & (NGX_HTTP_GET|NGX_HTTP_HEAD))) {
@@ -782,12 +812,15 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
 
     if (r != r->main) {
         /* subrequest (e.g. our own background refresh) — never serve from
-         * cache, let it hit the origin and repopulate. NB: nginx's access-phase
-         * checker skips subrequests entirely (ngx_http_core_access_phase:
-         * r != r->main -> phase_handler = next), so in practice this handler
-         * only ever runs for the main request. A warm subrequest (v3-3) builds
-         * its key + captures in the header/body filters, which DO run for
-         * subrequests. */
+         * cache, let it hit the origin and repopulate. A warm subrequest (v3-3)
+         * builds its key + captures in the header/body filters. */
+        return NGX_DECLINED;
+    }
+
+    /* RFC 9111 shared-cache safety: do not reuse a public representation for a
+     * request carrying credentials. response_cacheable() already prevents the
+     * resulting response from being stored; this is the matching lookup gate. */
+    if (r->headers_in.authorization != NULL) {
         return NGX_DECLINED;
     }
 
@@ -1069,20 +1102,41 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
         if (ctx->l2_blob_len >= sizeof(bh)) {
             ngx_memcpy(&bh, ctx->l2_blob, sizeof(bh));
             if (bh.magic == NGX_HTTP_CACHE_TURBO_BLOB_MAGIC) {
-                (void) clcf->l1->store(z, ctx->key_hash, hash,
-                           ctx->l2_blob, ctx->l2_blob_len, bh.status,
-                           clcf->valid, clcf->stale_mult);
-                (void) ngx_atomic_fetch_add(&z->sh->hits, 1);
-                (void) ngx_atomic_fetch_add(&z->sh->l2_hits, 1);
-                ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                               "cache_turbo: L2 HIT \"%V\" key=%ui len=%uz "
-                               "(filled L1)", &r->uri, (ngx_uint_t) hash,
-                               ctx->l2_blob_len);
-                return ngx_http_cache_turbo_serve(r, ctx->l2_blob,
-                           ctx->l2_blob_len, 0);
+                time_t  age, rem_fresh, rem_stale;
+
+                /* Restore the object's REMAINING lifetime, not the location
+                 * default — otherwise every L2 hit re-promotes a stale object as
+                 * fresh and it never expires (and per-status/upstream TTLs are
+                 * lost across the L2 round-trip). */
+                age = ngx_time() - (time_t) bh.created;
+                if (age < 0) {                 /* clock skew between writers */
+                    age = 0;
+                }
+                rem_fresh = (time_t) bh.fresh_ttl - age;   /* <=0 => stale */
+                rem_stale = (time_t) bh.stale_ttl - age;   /* total window left */
+
+                if (rem_stale <= 0) {
+                    /* Object outlived its serveable window in L2 (Redis TTL
+                     * slack): treat as a miss and go to origin. */
+                    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                                   "cache_turbo: L2 blob expired \"%V\" key=%ui "
+                                   "-> origin", &r->uri, (ngx_uint_t) hash);
+                } else {
+                    (void) clcf->l1->store(z, ctx->key_hash, hash,
+                               ctx->l2_blob, ctx->l2_blob_len, bh.status,
+                               rem_fresh, rem_stale);
+                    (void) ngx_atomic_fetch_add(&z->sh->hits, 1);
+                    (void) ngx_atomic_fetch_add(&z->sh->l2_hits, 1);
+                    ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                                   "cache_turbo: L2 HIT \"%V\" key=%ui len=%uz "
+                                   "(filled L1)", &r->uri, (ngx_uint_t) hash,
+                                   ctx->l2_blob_len);
+                    return ngx_http_cache_turbo_serve(r, ctx->l2_blob,
+                               ctx->l2_blob_len, rem_fresh <= 0 ? 1 : 0);
+                }
             }
         }
-        /* corrupt/short blob: treat as a miss, fall through to origin */
+        /* corrupt/short/expired blob: treat as a miss, fall through to origin */
     }
 
     /* L2 was consulted but did not satisfy the request (v12 metric). Count it
@@ -1773,10 +1827,10 @@ ngx_http_cache_turbo_header_filter(ngx_http_request_t *r)
         && (clcf->no_store == NULL
             || ngx_http_test_predicates(r, clcf->no_store) == NGX_OK))
     {
-        /* A warm subrequest never ran the access phase (nginx skips it for
-         * subrequests), so its key was never built. Build it here from the
-         * subrequest URI before flagging capture, so the body filter stores
-         * under the same key a later real request will look up. */
+        /* A warm subrequest is deliberately excluded from lookup, so its key
+         * was never built. Build it here from the subrequest URI before flagging
+         * capture, so the body filter stores under the same key a later real
+         * request will look up. */
         if (ctx->warm
             && ngx_http_cache_turbo_build_key(r, clcf, ctx) != NGX_OK)
         {
@@ -1834,9 +1888,44 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
         ngx_chain_t  *ncl;
 
         b = cl->buf;
-        n = ngx_buf_size(b);
+
+        /* Only in-memory bytes are capturable. A file-backed buffer (sendfile
+         * path) carries no valid b->pos for its declared ngx_buf_size(), so
+         * copying from b->pos would read out of bounds. Abort capture and
+         * delegate the whole response downstream rather than store garbage. */
+        if (b->in_file && !ngx_buf_in_memory(b)
+            && b->file_last > b->file_pos)
+        {
+            ctx->captured = 0;
+            ctx->body = NULL;
+            ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                           "cache_turbo: file-backed body \"%V\" -> delegate to "
+                           "native (cannot capture from memory)", &r->uri);
+            return ngx_http_next_body_filter(r, in);
+        }
+
+        n = ngx_buf_in_memory(b) ? (size_t) (b->last - b->pos) : 0;
 
         if (n > 0) {
+            /* Q2: oversize early-abort, BEFORE the alloc+memcpy. Once the body
+             * would cross max_size we will never store this response (the store
+             * gate below refuses it), so a single huge buffer must not be fully
+             * copied into the request pool just to be discarded at last_buf.
+             * Drop the partial capture, mark the request non-capturing, and
+             * forward downstream untouched. A stacked native proxy_cache (README
+             * pattern B) keeps the object on disk; cache-turbo delegates oversize
+             * media with ~zero shm/pool overhead. Any cold-miss stub is cleared
+             * by the pool-cleanup backstop at request end. */
+            if (clcf->max_size > 0 && ctx->body_len + n > clcf->max_size) {
+                ctx->captured = 0;
+                ctx->body = NULL;
+                ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                               "cache_turbo: oversize capture aborted \"%V\" "
+                               "body>%uz -> delegate to native",
+                               &r->uri, clcf->max_size);
+                return ngx_http_next_body_filter(r, in);
+            }
+
             p = ngx_pnalloc(r->pool, n);
             if (p == NULL) {
                 return NGX_ERROR;
@@ -1862,27 +1951,6 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
             ll = &ncl->next;
 
             ctx->body_len += n;
-
-            /* Q2: oversize early-abort. Once the captured body crosses
-             * max_size we know we will never store this response (the store
-             * gate below refuses it), so stop copying the rest of the blob
-             * into the request pool just to discard it at last_buf. Drop the
-             * partial capture, mark the request non-capturing for the rest of
-             * the body, and forward downstream untouched. A stacked native
-             * proxy_cache (README pattern B) keeps the object on disk;
-             * cache-turbo delegates oversize media with ~zero shm/pool
-             * overhead instead of a full memcpy-then-discard every request.
-             * Any cold-miss stub is cleared by the pool-cleanup backstop at
-             * request end (same as the non-cacheable path). */
-            if (clcf->max_size > 0 && ctx->body_len > clcf->max_size) {
-                ctx->captured = 0;
-                ctx->body = NULL;
-                ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                               "cache_turbo: oversize capture aborted \"%V\" "
-                               "body>%uz -> delegate to native",
-                               &r->uri, clcf->max_size);
-                return ngx_http_next_body_filter(r, in);
-            }
         }
 
         if (b->last_buf || b->last_in_chain) {
@@ -1903,7 +1971,7 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
         uint32_t                          nheaders = 0;
         u_char                           *blob, *w;
         ngx_uint_t                        i;
-        time_t                            ttl;
+        time_t                            ttl, stale_window;
 
         ttl = ngx_http_cache_turbo_status_ttl(clcf, r->headers_out.status);
         if (ttl < 0) {
@@ -1921,6 +1989,10 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
                 ttl = up;
             }
         }
+
+        /* Absolute serveable window (fresh + stale) from now, reused by the blob
+         * metadata, the L1 store, and the L2 EXPIRE so all three agree. */
+        stale_window = ngx_http_cache_turbo_stale_ttl(ttl, clcf->stale_mult);
 
         /* Synthesise a Content-Type entry from the typed field (it is not in
          * the headers list). Everything else comes from headers_out.headers. */
@@ -1970,6 +2042,12 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
             bhw.headers_len = (uint32_t) hdr_bytes;
             bhw.body_len = (uint32_t) ctx->body_len;
             bhw.status = (uint32_t) r->headers_out.status;
+            /* Freshness metadata so an L2 hit restores the remaining lifetime
+             * (not the location default). stale_ttl is the absolute serveable
+             * window from creation (fresh + stale), matching shm_store. */
+            bhw.created = (int64_t) ngx_time();
+            bhw.fresh_ttl = (uint32_t) (ttl > 0 ? ttl : 0);
+            bhw.stale_ttl = (uint32_t) stale_window;
             ngx_memcpy(blob, &bhw, sizeof(bhw));
 
             w = blob + sizeof(ngx_http_cache_turbo_blob_hdr_t);
@@ -2047,7 +2125,7 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
 
             (void) clcf->l1->store(z, store_key, hash,
                        blob, blob_len, r->headers_out.status, ttl,
-                       clcf->stale_mult);
+                       stale_window);
 
             /* v10: store overwrote any cold-miss stub into a real entry (or we
              * cleared the relocated base stub above), so the cleanup must not
@@ -2083,7 +2161,11 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
             }
 
             /* L2 write-through (async, fire-and-forget). Copies the blob into
-             * its own pool, so it is safe even though `blob` lives in r->pool. */
+             * its own pool, so it is safe even though `blob` lives in r->pool.
+             * set() takes the FRESH ttl and derives its own EXPIRE spanning the
+             * full serveable window (fresh + stale), so the object can still be
+             * stale-served from L2 after its fresh deadline; the blob's own
+             * freshness metadata then bounds how it is restored into L1. */
             if (clcf->backend) {
                 clcf->backend->set(r, clcf, store_key,
                                    blob, blob_len, ttl);
@@ -2623,6 +2705,12 @@ ngx_http_cache_turbo_redis_conf(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         if (ngx_strncmp(value[i].data, "prefix=", 7) == 0) {
             clcf->redis_prefix.data = value[i].data + 7;
             clcf->redis_prefix.len = value[i].len - 7;
+            if (clcf->redis_prefix.len == 0) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                    "cache_turbo: empty prefix= is not allowed "
+                    "(an all-purge would match the whole L2 keyspace)");
+                return NGX_CONF_ERROR;
+            }
 
         } else if (ngx_strncmp(value[i].data, "timeout=", 8) == 0) {
             s.data = value[i].data + 8;
@@ -2730,6 +2818,10 @@ ngx_http_cache_turbo_redis_conf(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     }
 
     clcf->redis_enable = 1;
+    /* Pin the backend choice for this block to Redis. Without this the flag
+     * stays UNSET and merge_loc_conf would inherit a parent's memcached=1,
+     * selecting the memcached driver for this block's redis:// address. */
+    clcf->memcached = 0;
 
     return NGX_CONF_OK;
 }
@@ -2788,6 +2880,12 @@ ngx_http_cache_turbo_memcached_conf(ngx_conf_t *cf, ngx_command_t *cmd,
         if (ngx_strncmp(value[i].data, "prefix=", 7) == 0) {
             clcf->redis_prefix.data = value[i].data + 7;
             clcf->redis_prefix.len = value[i].len - 7;
+            if (clcf->redis_prefix.len == 0) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                    "cache_turbo: empty prefix= is not allowed "
+                    "(an all-purge would match the whole L2 keyspace)");
+                return NGX_CONF_ERROR;
+            }
 
         } else if (ngx_strncmp(value[i].data, "timeout=", 8) == 0) {
             s.data = value[i].data + 8;
@@ -3720,18 +3818,21 @@ ngx_http_cache_turbo_marker_store(ngx_http_cache_turbo_loc_conf_t *clcf,
                                           + 1];
     ngx_http_cache_turbo_blob_hdr_t  bh;
 
+    ngx_memzero(&bh, sizeof(bh));
     bh.magic = NGX_HTTP_CACHE_TURBO_BLOB_MAGIC;
-    bh.nheaders = 0;
-    bh.headers_len = 0;
     bh.body_len = 1;
-    bh.status = 0;
+    bh.created = (int64_t) ngx_time();
+    bh.fresh_ttl = (uint32_t) (ttl > 0 ? ttl : 0);
+    bh.stale_ttl = (uint32_t) ngx_http_cache_turbo_stale_ttl(ttl,
+                       clcf->stale_mult);
     ngx_memcpy(blob, &bh, sizeof(bh));
     blob[sizeof(bh)] = (u_char) (bits & 0xFF);
 
     ngx_http_cache_turbo_marker_hash(base, mk);
 
     (void) clcf->l1->store(z, mk, ngx_crc32_short(mk, 32),
-               blob, sizeof(blob), 0, ttl, clcf->stale_mult);
+               blob, sizeof(blob), 0, ttl,
+               ngx_http_cache_turbo_stale_ttl(ttl, clcf->stale_mult));
 }
 
 
@@ -3776,11 +3877,11 @@ ngx_http_cache_turbo_vary_resolve(ngx_http_request_t *r,
 
 /* Classify the response Vary header into a safe-axis bitmask (what we may key
  * on) and a nocache veto. Only the whitelist (Accept-Encoding, User-Agent,
- * Accept-Language, Origin) contributes to the key; Vary: * or a Vary naming
- * Cookie / Authorization forces the response uncacheable (cross-user
- * poisoning/leak guard); any other named header is ignored (the response is
- * still cached, just not split on that header). Walks every Vary header instance
- * and tokenises on comma/whitespace. */
+ * Accept-Language, Origin) contributes to the key. Anything else — Vary: *,
+ * Cookie, Authorization, OR any header we cannot key on — forces the response
+ * uncacheable, because serving one stored representation for every value of an
+ * un-split Vary axis would return the wrong representation (RFC 9110 12.5.5).
+ * Walks every Vary header instance and tokenises on comma/whitespace. */
 static void
 ngx_http_cache_turbo_classify_vary(ngx_http_request_t *r,
     ngx_int_t *bits_out, ngx_uint_t *nocache_out)
@@ -3848,8 +3949,13 @@ ngx_http_cache_turbo_classify_vary(ngx_http_request_t *r,
             } else if (tl == sizeof("Origin") - 1
                 && ngx_strncasecmp(tok, (u_char *) "Origin", tl) == 0) {
                 bits |= NGX_HTTP_CACHE_TURBO_VARY_ORIGIN;
+            } else {
+                /* A Vary axis we cannot key on. Caching anyway would serve one
+                 * stored representation for every value of this header — i.e.
+                 * the wrong representation (RFC 9110 12.5.5 / RFC 9111 4.1).
+                 * Refuse to cache, same as Cookie/Authorization/"*". */
+                nocache = 1;
             }
-            /* any other token: ignored (still cacheable, not split on it) */
         }
     }
 
@@ -4414,11 +4520,20 @@ ngx_http_cache_turbo_init(ngx_conf_t *cf)
 
     cmcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_core_module);
 
-    h = ngx_array_push(&cmcf->phases[NGX_HTTP_ACCESS_PHASE].handlers);
+    /* Cache lookup/serve runs after ACCESS. Serving a HIT from ACCESS and
+     * returning NGX_DONE would short-circuit allow/deny and auth handlers. */
+    h = ngx_array_push(&cmcf->phases[NGX_HTTP_PRECONTENT_PHASE].handlers);
     if (h == NULL) {
         return NGX_ERROR;
     }
     *h = ngx_http_cache_turbo_access_handler;
+
+    /* PURGE runs here, after the ACCESS phase, so allow/deny gates it. */
+    h = ngx_array_push(&cmcf->phases[NGX_HTTP_PRECONTENT_PHASE].handlers);
+    if (h == NULL) {
+        return NGX_ERROR;
+    }
+    *h = ngx_http_cache_turbo_precontent_handler;
 
     ngx_http_next_header_filter = ngx_http_top_header_filter;
     ngx_http_top_header_filter = ngx_http_cache_turbo_header_filter;

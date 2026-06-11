@@ -185,6 +185,13 @@ ngx_http_cache_turbo_memcached_set(ngx_http_request_t *r,
     if (stale_ttl <= 0) {
         return;
     }
+    /* memcached interprets an exptime > 30 days as an ABSOLUTE Unix timestamp,
+     * not a relative duration. A large relative window would otherwise be read
+     * as a timestamp near the epoch and expire instantly — convert it to a real
+     * absolute deadline so long-lived objects persist as intended. */
+    if (stale_ttl > 60 * 60 * 24 * 30) {
+        stale_ttl = ngx_time() + stale_ttl;
+    }
 
     op = ngx_http_cache_turbo_mc_op_create(clcf);
     if (op == NULL) {

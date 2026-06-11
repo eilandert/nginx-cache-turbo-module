@@ -360,6 +360,24 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # Keepalive security-context isolation: these locations share one Redis
+        # address and pool but select different DBs. Separate L1 zones and the
+        # same key shape ensure only Redis connection state distinguishes them.
+        location /l2ka0/ {{
+            cache_turbo          ka0;
+            cache_turbo_key      $arg_k;
+            cache_turbo_valid    30s;
+            cache_turbo_redis    127.0.0.1:{redis_port} db=0 prefix=kais: timeout=250ms keepalive=8 keepalive_timeout=30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+        location /l2ka1/ {{
+            cache_turbo          ka1;
+            cache_turbo_key      $arg_k;
+            cache_turbo_valid    30s;
+            cache_turbo_redis    127.0.0.1:{redis_port} db=1 prefix=kais: timeout=250ms keepalive=8 keepalive_timeout=30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # L2 with a short fresh TTL so the L1 copy expires in-test (stale window
         # = valid*4 = 4s), exercising the expired-L1 -> consult-L2 path (P6).
         location /l2e/ {{
@@ -437,6 +455,15 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             allow 127.0.0.1;
             deny all;
         }}
+
+        # Literal Redis glob metacharacters in a prefix must stay literal during
+        # SCAN-based all-purge; only the module-appended final '*' is a wildcard.
+        location = /_cache_l2glob {{
+            cache_turbo_admin    main;
+            cache_turbo_redis    127.0.0.1:{redis_port} prefix=ct*: timeout=250ms;
+            allow 127.0.0.1;
+            deny all;
+        }}
 """
 
     # L2 memcached (v13): a location wired to the memcached backend instead of
@@ -479,6 +506,8 @@ http {{
     cache_turbo_zone name=at 16m;    # autotune raise/clamp/off (v4-3)
     cache_turbo_zone name=ati 16m;   # autotune insufficient-data (v4-3)
     cache_turbo_zone name=atch 16m;  # autotune churn-disqualify (v4-3)
+    cache_turbo_zone name=ka0 8m;    # Redis keepalive DB-isolation test
+    cache_turbo_zone name=ka1 8m;    # Redis keepalive DB-isolation test
 
     # Q1 end-to-end: stacked native proxy_cache, one zone per suppress mode, so
     # a test can prove cache_turbo_suppress_native actually keeps the native
@@ -592,6 +621,24 @@ http {{
             cache_turbo_key   $uri;
             cache_turbo_valid 30s;
             cache_turbo_purge on;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # Access-phase regression: both locations use the same cache key, but
+        # the denied location must reject a cached GET and PURGE before cache
+        # lookup/side effects run.
+        location /acl-seed/ {{
+            cache_turbo       main;
+            cache_turbo_key   $arg_k;
+            cache_turbo_valid 30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+        location /acl-denied/ {{
+            cache_turbo       main;
+            cache_turbo_key   $arg_k;
+            cache_turbo_valid 30s;
+            cache_turbo_purge on;
+            deny all;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
@@ -1524,6 +1571,36 @@ def test_invalid_auto_mode(ng: Nginx) -> None:
         f"missing/odd diagnostic for bad mode:\n{r.stdout}"
 
 
+def test_empty_l2_prefix_rejected(ng: Nginx) -> None:
+    """An empty L2 prefix must fail nginx -t: Redis all-purge would otherwise
+    become SCAN MATCH * and delete the selected database."""
+    cases = []
+    if ng.redis_port is not None:
+        cases.append(("redis", "prefix=ct:", "prefix="))
+    if ng.memcached_port is not None:
+        cases.append(("memcached", "prefix=mc:", "prefix="))
+
+    for name, old, new in cases:
+        bad = ng.root.parent / f"bad-empty-{name}-prefix"
+        (bad / "conf").mkdir(parents=True, exist_ok=True)
+        (bad / "logs").mkdir(parents=True, exist_ok=True)
+        cfg = nginx_config(
+            bad, ng.port, ng.module, ng.origin_port, 1, ng.redis_port,
+            ng.redis_auth_port, ng.redis_password, ng.redis_tls_port,
+            ng.redis_tls_ca, ng.memcached_port)
+        assert old in cfg, f"test fixture missing {old!r}"
+        cfg = cfg.replace(old, new, 1)
+        (bad / "conf" / "nginx.conf").write_text(cfg, encoding="ascii")
+        cmd = ng.runner + [str(ng.binary), "-p", str(bad),
+                           "-c", str(bad / "conf" / "nginx.conf"), "-t"]
+        r = subprocess.run(cmd, text=True, stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, timeout=20)
+        assert r.returncode != 0, \
+            f"empty {name} prefix was accepted by nginx -t:\n{r.stdout}"
+        assert "empty prefix" in r.stdout.lower(), \
+            f"missing empty-prefix diagnostic for {name}:\n{r.stdout}"
+
+
 def test_max_size_not_cached(ng: Nginx) -> None:
     """Responses larger than cache_turbo_max_size are never cached (Q2: the
     body filter early-aborts capture the moment body_len crosses max_size, so
@@ -1568,11 +1645,25 @@ def test_no_cache_cc_nostore(ng: Nginx) -> None:
 
 def test_no_cache_authorization(ng: Nginx) -> None:
     """RFC 9111 floor: a request carrying Authorization yields a per-user
-    response that must not be stored in (or served from) the shared cache."""
+    response that must not be stored in or served from the shared cache,
+    including when an anonymous representation was already primed."""
     hdr = {"Authorization": "Bearer secrettoken"}
-    _, b1, h1 = fetch(ng.port, "/c/authreq", headers=hdr)
+
+    # Prime an anonymous representation first. A store-only Authorization guard
+    # misses this case and would replay the anonymous HIT to the credentialed
+    # request.
+    _, anon, _ = fetch(ng.port, "/c/authreq-primed")
+    _, anon_hit, hp = fetch(ng.port, "/c/authreq-primed")
+    assert hp.get("x-cache") == "HIT" and anon_hit == anon
+    _, auth_body, ha = fetch(ng.port, "/c/authreq-primed", headers=hdr)
+    assert "x-cache" not in ha, \
+        "Authorization request was served a primed anonymous cache entry"
+    assert auth_body != anon, "authorized request did not reach the origin"
+
+    # A cold authorized request must also remain uncacheable.
+    _, b1, h1 = fetch(ng.port, "/c/authreq-cold", headers=hdr)
     assert "x-cache" not in h1
-    _, b2, h2 = fetch(ng.port, "/c/authreq", headers=hdr)
+    _, b2, h2 = fetch(ng.port, "/c/authreq-cold", headers=hdr)
     assert "x-cache" not in h2, "Authorization request must not be cached"
     assert b1 != b2
 
@@ -1744,6 +1835,31 @@ def test_purge_method(ng: Nginx) -> None:
     assert json.loads(b)["purged"] == 1, f"purge count: {b}"
     _, _, h2 = fetch(ng.port, "/pg/x")
     assert "x-cache" not in h2, "entry should be gone after PURGE (a MISS)"
+
+
+def test_cache_and_purge_respect_access_control(ng: Nginx) -> None:
+    """A cached GET and PURGE must run after allow/deny. Both locations share
+    one cache key, proving the denied request cannot serve or delete the entry
+    that the allowed location primed."""
+    key = f"acl-{time.time_ns()}"
+    seed = f"/acl-seed/x?k={key}"
+    denied = f"/acl-denied/x?k={key}"
+
+    _, body, _ = fetch(ng.port, seed)
+    _, hit_body, hh = fetch(ng.port, seed)
+    assert hh.get("x-cache") == "HIT" and hit_body == body, \
+        "failed to prime shared access-control test entry"
+
+    s, _, hd = fetch(ng.port, denied)
+    assert s == 403, f"denied cached GET returned {s}, expected 403"
+    assert "x-cache" not in hd, "denied GET was served from cache"
+
+    s, _, _ = fetch_raw(ng.port, denied, method="PURGE")
+    assert s == 403, f"denied PURGE returned {s}, expected 403"
+
+    _, body_after, ha = fetch(ng.port, seed)
+    assert ha.get("x-cache") == "HIT" and body_after == body, \
+        "denied PURGE deleted the protected cache entry"
 
 
 def test_bypass(ng: Nginx) -> None:
@@ -2257,6 +2373,36 @@ def test_l2_keepalive_reuse(ng: Nginx, origin: Origin,
     assert h.get("x-cache") == "HIT", "keepalive location broke the hot path"
 
 
+def test_l2_keepalive_db_isolation(ng: Nginx, origin: Origin,
+                                   redis: RedisServer) -> None:
+    """Pooled Redis connections must not cross SELECT state. Alternate two
+    locations sharing one address/pool but selecting DB 0 and DB 1; every key
+    must land only in its configured database."""
+    stamp = time.time_ns()
+
+    for i in range(8):
+        k0 = f"ka-db0-{stamp}-{i}"
+        k1 = f"ka-db1-{stamp}-{i}"
+        key0 = l2_key(k0, prefix="kais:")
+        key1 = l2_key(k1, prefix="kais:")
+        redis.cli("-n", "0", "DEL", key0, key1)
+        redis.cli("-n", "1", "DEL", key0, key1)
+
+        fetch(ng.port, f"/l2ka0/x?k={k0}")
+        assert wait_for(
+            lambda: redis.cli("-n", "0", "EXISTS", key0) == "1",
+            timeout=4.0), f"DB 0 keepalive write missing for {k0}"
+        assert redis.cli("-n", "1", "EXISTS", key0) == "0", \
+            f"DB 0 key leaked into DB 1 through keepalive reuse: {k0}"
+
+        fetch(ng.port, f"/l2ka1/x?k={k1}")
+        assert wait_for(
+            lambda: redis.cli("-n", "1", "EXISTS", key1) == "1",
+            timeout=4.0), f"DB 1 keepalive write missing for {k1}"
+        assert redis.cli("-n", "0", "EXISTS", key1) == "0", \
+            f"DB 1 key leaked into DB 0 through keepalive reuse: {k1}"
+
+
 def test_l2_cross_instance_fill(ng: Nginx, origin: Origin,
                                 redis: RedisServer) -> None:
     """P2: an L1 miss fills from L2. A second, independent nginx with a cold L1
@@ -2304,12 +2450,14 @@ def test_l2_cross_instance_fill(ng: Nginx, origin: Origin,
         b.stop()
 
 
-def make_ctb1_blob(body: bytes, status: int = 200,
-                   headers: dict[str, str] | None = None) -> bytes:
-    """Hand-build a CTB1 cache blob exactly as the module serialises it
-    (ngx_http_cache_turbo_blob_hdr_t + name/value pairs + body, all native
-    little-endian uint32). Lets a test seed L2 directly with a valid object."""
+def make_ctb2_blob(body: bytes, status: int = 200,
+                   headers: dict[str, str] | None = None,
+                   created: int | None = None, fresh_ttl: int = 60,
+                   stale_ttl: int = 240) -> bytes:
+    """Hand-build a CTB2 cache blob exactly as the module serialises it.
+    The 4-byte pad before int64 created mirrors the native C struct layout."""
     headers = headers or {"Content-Type": "text/plain"}
+    created = int(time.time()) if created is None else created
     hdr_block = b""
     nheaders = 0
     for name, value in headers.items():
@@ -2318,9 +2466,9 @@ def make_ctb1_blob(body: bytes, status: int = 200,
         hdr_block += struct.pack("<I", len(nb)) + nb
         hdr_block += struct.pack("<I", len(vb)) + vb
         nheaders += 1
-    magic = 0x43544231
-    head = struct.pack("<IIIII", magic, nheaders, len(hdr_block),
-                       len(body), status)
+    magic = 0x43544232
+    head = struct.pack("<IIIII4xqII", magic, nheaders, len(hdr_block),
+                       len(body), status, created, fresh_ttl, stale_ttl)
     return head + hdr_block + body
 
 
@@ -2443,7 +2591,7 @@ def test_l2_expired_consults_l2(ng: Nginx, origin: Origin,
     time.sleep(4.3)                                # past stale_until (valid*4=4s)
     # both L1 and L2 are expired now; reseed ONLY L2 with a fresh, valid blob
     seeded = b"l2-seeded\n"
-    blob = make_ctb1_blob(seeded, headers={"Content-Type": "text/plain"})
+    blob = make_ctb2_blob(seeded, headers={"Content-Type": "text/plain"})
     redis.set_raw(l2_key(uri), blob, 60_000)       # binary-safe raw RESP SET
     assert redis.cli("EXISTS", l2_key(uri)) == "1", "failed to seed L2"
 
@@ -2455,6 +2603,35 @@ def test_l2_expired_consults_l2(ng: Nginx, origin: Origin,
     assert body == seeded.decode(), f"served body {body!r} != seeded L2 blob"
     assert origin.hits == origin_before, \
         "origin was hit even though L2 held a fresh copy (P6 regression)"
+
+
+def test_l2_preserves_original_freshness(ng: Nginx, origin: Origin,
+                                         redis: RedisServer) -> None:
+    """An L2 hit restores remaining freshness instead of resetting the location
+    TTL. Seed an already-stale CTB2 object with one second left in its original
+    stale window: first read is STALE, then it expires and the origin is used."""
+    uri = "/l2e/original-lifetime"
+    key = l2_key(uri)
+    redis.cli("DEL", key, lock_key(uri))
+    seeded = b"l2-aged\n"
+    blob = make_ctb2_blob(
+        seeded, created=int(time.time()) - 2, fresh_ttl=1, stale_ttl=4)
+    redis.set_raw(key, blob, 60_000)
+
+    origin_before = origin.hits
+    s, body, h = fetch(ng.port, uri)
+    assert s == 200 and body == seeded.decode()
+    assert h.get("x-cache") == "STALE", \
+        f"aged L2 object was re-promoted as {h.get('x-cache')}, expected STALE"
+    assert origin.hits == origin_before, "stale L2 hit unexpectedly used origin"
+
+    time.sleep(2.3)
+    s, body2, h2 = fetch(ng.port, uri)
+    assert s == 200 and "x-cache" not in h2, \
+        f"expired L2 object was still served as {h2.get('x-cache')}"
+    assert origin.hits == origin_before + 1, \
+        "expired L2 object did not fall through to origin"
+    assert body2 != seeded.decode()
 
 
 def tag_key(name: str, prefix: str = "ct:") -> str:
@@ -2707,6 +2884,25 @@ def test_purge_all_clears_l2(ng: Nginx, origin: Origin,
     assert origin.hits == origin_before + 1, \
         "origin was not consulted after all-purge (L2 still served)"
     assert body_b != body_a, "post-purge body should be a fresh generation"
+
+
+def test_purge_all_escapes_redis_prefix_glob(ng: Nginx,
+                                             redis: RedisServer) -> None:
+    """SCAN MATCH must treat glob metacharacters in the configured prefix
+    literally. Purging prefix 'ct*:' deletes 'ct*:owned' but not 'ctX:foreign'."""
+    owned = f"ct*:owned:{time.time_ns()}"
+    foreign = owned.replace("ct*:", "ctX:", 1)
+    redis.cli("-n", "0", "SET", owned, "owned")
+    redis.cli("-n", "0", "SET", foreign, "foreign")
+
+    s, b, _ = fetch(ng.port, "/_cache_l2glob?all=1", method="POST")
+    assert s == 200 and "purged" in json.loads(b), \
+        f"glob-prefix all-purge failed: {s} {b}"
+    assert redis.cli("-n", "0", "EXISTS", owned) == "0", \
+        "literal glob-prefix key was not purged"
+    assert redis.cli("-n", "0", "EXISTS", foreign) == "1", \
+        "glob prefix widened SCAN and deleted an unrelated key"
+    redis.cli("-n", "0", "DEL", foreign)
 
 
 def test_normalize_arg_order(ng: Nginx, origin: Origin) -> None:
@@ -3298,6 +3494,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_suppress_native_e2e_proxy_cache(ng)
     test_invalid_backend_name(ng)
     test_invalid_auto_mode(ng)
+    test_empty_l2_prefix_rejected(ng)
     test_no_cache_set_cookie(ng)
     test_no_cache_cc_private(ng)
     test_no_cache_cc_nostore(ng)
@@ -3315,6 +3512,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_conditional_ims_old_full(ng)
     test_conditional_inm_beats_ims(ng)
     test_purge_method(ng)
+    test_cache_and_purge_respect_access_control(ng)
     test_bypass(ng)
     test_no_store(ng)
     test_native_cache_headers_stripped(ng)
@@ -3366,9 +3564,11 @@ def run_all(ng: Nginx, origin: Origin,
     if redis is not None:
         test_l2_write_through(ng, origin, redis)
         test_l2_keepalive_reuse(ng, origin, redis)
+        test_l2_keepalive_db_isolation(ng, origin, redis)
         test_l2_cross_instance_fill(ng, origin, redis)
         test_l2_purge_key_drops_l2(ng, origin, redis)
         test_l2_expired_consults_l2(ng, origin, redis)
+        test_l2_preserves_original_freshness(ng, origin, redis)
         test_l2_tag_add_on_store(ng, origin, redis)
         test_l2_tag_purge(ng, origin, redis)
         test_multinode_lock(ng, origin, redis)
@@ -3376,6 +3576,7 @@ def run_all(ng: Nginx, origin: Origin,
         test_cold_single_flight_cross_node(ng, origin, redis)
         test_l2_miss_counted_once_on_cold_park(ng, origin)  # double-count guard
         test_l2_db_select(ng, origin, redis)         # SELECT-only preamble
+        test_purge_all_escapes_redis_prefix_glob(ng, redis)
         test_purge_all_clears_l2(ng, origin, redis)  # last L2: empties L2
     if redis_auth is not None:
         test_l2_dsn_auth_db(ng, origin, redis_auth)  # AUTH+SELECT preamble
