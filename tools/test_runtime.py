@@ -1458,6 +1458,32 @@ def test_cold_lock_off_stampedes(ng: Nginx, origin: Origin) -> None:
     drain_origin(origin)
 
 
+def _admin_l2_misses(ng: Nginx) -> int:
+    import json
+    _, b, _ = fetch(ng.port, "/_cache")
+    return int(json.loads(b).get("l2_misses", 0))
+
+
+def test_l2_miss_counted_once_on_cold_park(ng: Nginx, origin: Origin) -> None:
+    """metrics: a single cold miss on an L2-backed, lock-ON location parks TWICE
+    (once on the async L2 GET, once on the v4-2 NX lock) and re-enters the access
+    handler from the top on each resume. The l2_misses counter must rise by
+    exactly 1 across the whole request, not once per re-entry — guarded by
+    ctx->l2_miss_counted (issues.md 'l2_misses double-count on the cold path').
+    /coldl2/ is L2-backed with cache_turbo_lock default ON, so a virgin key
+    exercises both parks."""
+    uri = "/coldl2/misscount"                      # virgin key, lock default ON
+    misses0 = _admin_l2_misses(ng)
+    s, _, h = fetch(ng.port, uri)
+    assert s == 200, f"cold L2 fetch status {s}"
+    assert "x-cache" not in h, \
+        f"first cold fetch must reach origin, not HIT: {h.get('x-cache')}"
+    delta = _admin_l2_misses(ng) - misses0
+    assert delta == 1, \
+        f"l2_misses rose by {delta}, expected exactly 1 (cold-path double-count)"
+    drain_origin(origin)
+
+
 def _admin_min_uses_skips(ng: Nginx) -> int:
     import json
     _, b, _ = fetch(ng.port, "/_cache")
@@ -2692,6 +2718,7 @@ def run_all(ng: Nginx, origin: Origin,
         test_multinode_lock(ng, origin, redis)
         test_lock_self_heal(ng, origin, redis)
         test_cold_single_flight_cross_node(ng, origin, redis)
+        test_l2_miss_counted_once_on_cold_park(ng, origin)  # double-count guard
         test_l2_db_select(ng, origin, redis)         # SELECT-only preamble
         test_purge_all_clears_l2(ng, origin, redis)  # last L2: empties L2
     if redis_auth is not None:

@@ -441,6 +441,7 @@ typedef struct {
     ngx_int_t                l2_result;   /* NGX_OK = L2 hit; else miss      */
     u_char                  *l2_blob;     /* L2-hit blob, copied to r->pool  */
     size_t                   l2_blob_len;
+    unsigned                 l2_miss_counted:1;/* l2_misses stat already bumped*/
     /* Cross-node dogpile (v4-2). On a stale L1 dice win the request parks for a
      * Redis SET NX PX reply: lock_result == NGX_OK means this node holds the
      * cluster-wide regen lock (go to origin); anything else means another node

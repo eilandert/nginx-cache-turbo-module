@@ -900,8 +900,12 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
         /* corrupt/short blob: treat as a miss, fall through to origin */
     }
 
-    /* L2 was consulted but did not satisfy the request (v12 metric). */
-    if (clcf->backend && ctx->l2_done) {
+    /* L2 was consulted but did not satisfy the request (v12 metric). Count it
+     * at most once per request: a cold miss parks on the L2 GET and then parks
+     * AGAIN on the v4-2 NX lock / v10 cold-wait, re-entering this handler from
+     * the top each resume — l2_miss_counted guards the double/triple count. */
+    if (clcf->backend && ctx->l2_done && !ctx->l2_miss_counted) {
+        ctx->l2_miss_counted = 1;
         (void) ngx_atomic_fetch_add(&z->sh->l2_misses, 1);
     }
 
