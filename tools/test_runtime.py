@@ -838,6 +838,26 @@ def test_admin_stats(ng: Nginx) -> None:
     assert data["hits"] >= 1 and data["misses"] >= 1, f"counters look wrong: {data}"
 
 
+def test_admin_prometheus(ng: Nginx) -> None:
+    """GET /_cache?format=prometheus renders the Prometheus text exposition
+    format: right content-type, HELP/TYPE lines, zone-labelled samples."""
+    import re
+    fetch(ng.port, "/c/prom1")           # miss
+    fetch(ng.port, "/c/prom1")           # hit -> hits_total >= 1
+    s, b, h = fetch(ng.port, "/_cache?format=prometheus")
+    assert s == 200, f"metrics status {s}"
+    ct = h.get("content-type", "")
+    assert "text/plain" in ct and "0.0.4" in ct, f"bad content-type: {ct}"
+    for line in ("# TYPE cache_turbo_hits_total counter",
+                 "# TYPE cache_turbo_misses_total counter",
+                 "# TYPE cache_turbo_regen_cost_ms gauge",
+                 "# TYPE cache_turbo_autotuned_beta gauge"):
+        assert line in b, f"metrics missing line: {line!r}"
+    m = re.search(r'cache_turbo_hits_total\{zone="main"\} (\d+)', b)
+    assert m, f"no zone-labelled hits sample:\n{b[:300]}"
+    assert int(m.group(1)) >= 1, "hits_total should be >= 1"
+
+
 def test_admin_purge_key(ng: Nginx) -> None:
     """POST /_cache?key=<uri> drops that entry; next read is a MISS again."""
     import json
@@ -1642,6 +1662,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_concurrent_hits_no_deadlock(ng)
     test_lru_eviction(ng)
     test_admin_stats(ng)
+    test_admin_prometheus(ng)
     test_admin_purge_key(ng)
     test_admin_gating(ng)
     test_warm_populates(ng, origin)
@@ -1719,7 +1740,7 @@ def main() -> int:
     print("OK: miss/hit, header fidelity, max_size, "
           "cacheability floor (Set-Cookie/CC-private/CC-no-store/Authorization "
           "not cached), default-key Host split, admin purge w/ body, "
-          "concurrency (R1), "
+          "concurrency (R1), prometheus metrics, "
           "LRU eviction (R6), stale serve (R3), single-flight (R4), "
           "admin stats/purge/gating, warm (v3-3: populates/multi/no-url), "
           "key normalize (v3-1: order/tracking/"

@@ -1331,19 +1331,20 @@ ngx_http_cache_turbo_redis_conf(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 }
 
 
-/* Send a small JSON body with the given status. Shared by the admin handler and
- * the async tag-purge completion. Returns the rc to propagate/finalize with. */
+/* Send a small body with the given status and content-type. Returns the rc to
+ * propagate/finalize with. */
 static ngx_int_t
-ngx_http_cache_turbo_send_json(ngx_http_request_t *r, ngx_uint_t status,
-    ngx_str_t *body)
+ngx_http_cache_turbo_send_body(ngx_http_request_t *r, ngx_uint_t status,
+    ngx_str_t *body, const char *ctype, size_t ctype_len)
 {
     ngx_int_t     rc;
     ngx_buf_t    *b;
     ngx_chain_t   out;
 
     r->headers_out.status = status;
-    ngx_str_set(&r->headers_out.content_type, "application/json");
-    r->headers_out.content_type_len = r->headers_out.content_type.len;
+    r->headers_out.content_type.data = (u_char *) ctype;
+    r->headers_out.content_type.len = ctype_len;
+    r->headers_out.content_type_len = ctype_len;
     r->headers_out.content_length_n = body->len;
 
     rc = ngx_http_send_header(r);
@@ -1363,6 +1364,17 @@ ngx_http_cache_turbo_send_json(ngx_http_request_t *r, ngx_uint_t status,
     out.buf = b;
     out.next = NULL;
     return ngx_http_output_filter(r, &out);
+}
+
+
+/* Send a small JSON body. Shared by the admin handler and the async tag-purge
+ * completion. */
+static ngx_int_t
+ngx_http_cache_turbo_send_json(ngx_http_request_t *r, ngx_uint_t status,
+    ngx_str_t *body)
+{
+    return ngx_http_cache_turbo_send_body(r, status, body,
+               "application/json", sizeof("application/json") - 1);
 }
 
 
@@ -1661,8 +1673,9 @@ ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
     /* GET / HEAD -> stats. `?autotune=1` first forces an immediate autotune
      * recompute over the window since the last tick (operator "recompute now"),
      * so the returned autotuned_beta reflects current stats without waiting on the
-     * interval. Snapshot the counters through the L1 backend rather than reading
-     * the live shctx here. */
+     * interval. `?format=prometheus` renders the Prometheus text exposition
+     * format (for a scrape) instead of JSON. Snapshot the counters through the L1
+     * backend rather than reading the live shctx here. */
     {
         ngx_http_cache_turbo_stats_t  st;
         ngx_str_t                     arg;
@@ -1674,6 +1687,52 @@ ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
         }
 
         clcf->l1->stats(z, &st);
+
+        if (r->args.len
+            && ngx_http_arg(r, (u_char *) "format", 6, &arg) == NGX_OK
+            && arg.len == sizeof("prometheus") - 1
+            && ngx_strncmp(arg.data, "prometheus", arg.len) == 0)
+        {
+            ngx_str_t  zname = clcf->admin_zone->shm.name;
+
+            /* Five counters (*_total) + two gauges, each labelled by zone so one
+             * Prometheus job can scrape many zones. Exposition format 0.0.4. */
+            len = 2048 + 7 * zname.len + 7 * NGX_ATOMIC_T_LEN;
+            p = ngx_pnalloc(r->pool, len);
+            if (p == NULL) {
+                return NGX_HTTP_INTERNAL_SERVER_ERROR;
+            }
+            body.data = p;
+            body.len = ngx_snprintf(p, len,
+                "# HELP cache_turbo_hits_total Fresh L1 cache hits served.\n"
+                "# TYPE cache_turbo_hits_total counter\n"
+                "cache_turbo_hits_total{zone=\"%V\"} %uA\n"
+                "# HELP cache_turbo_misses_total Misses that went to the origin.\n"
+                "# TYPE cache_turbo_misses_total counter\n"
+                "cache_turbo_misses_total{zone=\"%V\"} %uA\n"
+                "# HELP cache_turbo_stale_serves_total Stale copies served while a refresh ran.\n"
+                "# TYPE cache_turbo_stale_serves_total counter\n"
+                "cache_turbo_stale_serves_total{zone=\"%V\"} %uA\n"
+                "# HELP cache_turbo_refreshes_total Background single-flight refreshes started.\n"
+                "# TYPE cache_turbo_refreshes_total counter\n"
+                "cache_turbo_refreshes_total{zone=\"%V\"} %uA\n"
+                "# HELP cache_turbo_evictions_total Entries evicted under memory pressure (LRU).\n"
+                "# TYPE cache_turbo_evictions_total counter\n"
+                "cache_turbo_evictions_total{zone=\"%V\"} %uA\n"
+                "# HELP cache_turbo_regen_cost_ms Average origin regeneration cost in milliseconds.\n"
+                "# TYPE cache_turbo_regen_cost_ms gauge\n"
+                "cache_turbo_regen_cost_ms{zone=\"%V\"} %uA\n"
+                "# HELP cache_turbo_autotuned_beta Live autotuned SWR beta (x1000; 0 = none).\n"
+                "# TYPE cache_turbo_autotuned_beta gauge\n"
+                "cache_turbo_autotuned_beta{zone=\"%V\"} %uA\n",
+                &zname, st.hits, &zname, st.misses, &zname, st.stale_serves,
+                &zname, st.refreshes, &zname, st.evictions,
+                &zname, st.cost_ms, &zname, st.autotuned_beta) - p;
+
+            return ngx_http_cache_turbo_send_body(r, NGX_HTTP_OK, &body,
+                "text/plain; version=0.0.4; charset=utf-8",
+                sizeof("text/plain; version=0.0.4; charset=utf-8") - 1);
+        }
 
         len = sizeof("{\"hits\":,\"misses\":,\"stale_serves\":,\"refreshes\":,"
                      "\"evictions\":,\"cost_ms\":,\"autotuned_beta\":}\n")

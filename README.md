@@ -209,10 +209,62 @@ $ curl -X POST 'localhost/_cache?url=/,/blog/,/about' # pre-warm cold pages
 | Request | Effect |
 |---|---|
 | `GET /_cache` | JSON stats (`?autotune=1` also forces an autotune recompute first). |
+| `GET /_cache?format=prometheus` | Same stats in Prometheus text format — scrape this. |
 | `POST /_cache?all=1` | Purge the whole zone (and the L2 keyspace, if Redis is on). |
 | `POST /_cache?key=<string>` | Purge one entry (hashed like the cache key). Drops L1 + L2. |
 | `POST /_cache?tag=<name>` | Purge every page tagged `<name>` across L1 + L2. |
 | `POST /_cache?url=<path[,path,...]>` | Warm those paths (background prefetch). |
+
+## Monitoring (Prometheus + Grafana)
+
+The admin endpoint speaks Prometheus. Point a scrape at it:
+
+```console
+$ curl 'localhost/_cache?format=prometheus'
+# HELP cache_turbo_hits_total Fresh L1 cache hits served.
+# TYPE cache_turbo_hits_total counter
+cache_turbo_hits_total{zone="ct"} 1240
+# TYPE cache_turbo_misses_total counter
+cache_turbo_misses_total{zone="ct"} 83
+cache_turbo_stale_serves_total{zone="ct"} 12
+cache_turbo_refreshes_total{zone="ct"} 11
+cache_turbo_evictions_total{zone="ct"} 0
+cache_turbo_regen_cost_ms{zone="ct"} 34
+cache_turbo_autotuned_beta{zone="ct"} 1700
+```
+
+Every sample is labelled by `zone`, so one job can scrape many zones. Metrics:
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `cache_turbo_hits_total` | counter | Fresh hits served from RAM. |
+| `cache_turbo_misses_total` | counter | Requests that fell through to the backend. |
+| `cache_turbo_stale_serves_total` | counter | Old copies served during a refresh. |
+| `cache_turbo_refreshes_total` | counter | Background refreshes started. |
+| `cache_turbo_evictions_total` | counter | Entries dropped under memory pressure (LRU). |
+| `cache_turbo_regen_cost_ms` | gauge | Average backend regeneration time (ms). |
+| `cache_turbo_autotuned_beta` | gauge | Live autotuned `beta` ×1000 (0 = none). |
+
+`prometheus.yml`:
+
+```yaml
+scrape_configs:
+  - job_name: cache_turbo
+    metrics_path: /_cache
+    params:
+      format: [prometheus]
+    static_configs:
+      - targets: ['nginx-host:80']
+```
+
+> Same `allow`/`deny` gate applies — let your Prometheus box reach it, keep the
+> public out.
+
+Useful Grafana/PromQL: **hit ratio**
+`rate(cache_turbo_hits_total[5m]) / (rate(cache_turbo_hits_total[5m]) +
+rate(cache_turbo_misses_total[5m]))`, **backend regen rate**
+`rate(cache_turbo_refreshes_total[5m])`, plus `cache_turbo_regen_cost_ms` and
+`cache_turbo_autotuned_beta` as plain gauges.
 
 ### Variables
 
