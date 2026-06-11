@@ -748,7 +748,10 @@ ngx_http_cache_turbo_response_cacheable(ngx_http_request_t *r)
  * by the header filter, so replaying any of these would duplicate or conflict
  * (e.g. two Content-Length lines, or chunked framing against a fixed length).
  * Set-Cookie is dropped defensively too, though response_cacheable already
- * refuses to store a Set-Cookie response at all.
+ * refuses to store a Set-Cookie response at all. Age and the X-Cache* status
+ * headers are dropped so that when a NATIVE nginx cache (proxy_cache / fastcgi_
+ * cache) sits behind us, we don't freeze and replay its per-response age/status
+ * on every L1 hit (see "Mixing with nginx's native cache" in the README).
  */
 static ngx_int_t
 ngx_http_cache_turbo_header_skip(u_char *name, size_t nlen)
@@ -756,7 +759,8 @@ ngx_http_cache_turbo_header_skip(u_char *name, size_t nlen)
     static const char  *skip[] = {
         "Connection", "Keep-Alive", "Proxy-Authenticate",
         "Proxy-Authorization", "TE", "Trailer", "Transfer-Encoding",
-        "Upgrade", "Content-Length", "Set-Cookie", "Date", "Server", NULL
+        "Upgrade", "Content-Length", "Set-Cookie", "Date", "Server",
+        "Age", "X-Cache", "X-Cache-Status", NULL
     };
     ngx_uint_t  i;
     size_t      sl;

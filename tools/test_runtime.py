@@ -129,6 +129,10 @@ class Origin:
                     self.send_header("Cache-Control", "private, max-age=60")
                 if "ccnostore" in self.path:
                     self.send_header("Cache-Control", "no-store")
+                if "nativecache" in self.path:
+                    # mimic a native nginx cache (proxy_cache) sitting behind us
+                    self.send_header("Age", "123")
+                    self.send_header("X-Cache-Status", "HIT")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 try:
@@ -852,6 +856,18 @@ def test_admin_purge_post_with_body(ng: Nginx) -> None:
         assert json.loads(r.read())["purged"] == 1
     _, _, h2 = fetch(ng.port, "/c/bodypurge")
     assert "x-cache" not in h2, "entry should be gone after purge (a MISS)"
+
+
+def test_native_cache_headers_stripped(ng: Nginx) -> None:
+    """When a native nginx cache (proxy_cache) sits behind us, its per-response
+    Age / X-Cache-Status must NOT be frozen into our blob and replayed on every
+    L1 hit. Our own X-Cache stays."""
+    fetch(ng.port, "/c/nativecache")                   # prime (origin Age=123)
+    _, _, h = fetch(ng.port, "/c/nativecache")         # HIT from shm
+    assert h.get("x-cache") == "HIT", "should be an L1 hit"
+    assert "age" not in h, f"upstream Age leaked into the HIT: {h.get('age')}"
+    assert "x-cache-status" not in h, \
+        f"upstream X-Cache-Status leaked: {h.get('x-cache-status')}"
 
 
 def test_stale_serves_stale(ng: Nginx, origin: Origin) -> None:
@@ -1794,6 +1810,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_no_cache_cc_nostore(ng)
     test_no_cache_authorization(ng)
     test_default_key_varies_by_host(ng)
+    test_native_cache_headers_stripped(ng)
     test_admin_purge_post_with_body(ng)
     test_concurrent_hits_no_deadlock(ng)
     test_lru_eviction(ng)
@@ -1912,7 +1929,8 @@ def main() -> int:
 
     print("OK: miss/hit, header fidelity, max_size, "
           "cacheability floor (Set-Cookie/CC-private/CC-no-store/Authorization "
-          "not cached), default-key Host split, admin purge w/ body, "
+          "not cached), default-key Host split, native-cache headers stripped, "
+          "admin purge w/ body, "
           "concurrency (R1), prometheus metrics, "
           "LRU eviction (R6), stale serve (R3), single-flight (R4), "
           "admin stats/purge/gating, warm (v3-3: populates/multi/no-url), "

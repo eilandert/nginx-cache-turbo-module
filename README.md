@@ -24,6 +24,98 @@ That "serve old now, quietly refresh one copy" trick is called
 Optional extras: a shared **Redis** tier so a cluster of nginx boxes share one
 cache, tag-based purging, cache warming, and live auto-tuning.
 
+## The tiers: L0 → L1 → L2
+
+cache-turbo is layered, fastest first. A request walks down only until something
+answers:
+
+```
+            ┌────────────────────────── one nginx box ──────────────────────────┐
+  client →  │  L1: shared-memory page cache  ──miss──▶  L2: Redis (optional)     │  ──miss──▶  origin
+            │     (RAM, sub-millisecond)                  (shared by the fleet)   │            (your backend)
+            └────────────────────────────────────────────────────────────────────┘
+```
+
+- **L1 — shared memory (always on).** The `cache_turbo_zone`. A hit here is
+  RAM-speed and never leaves the worker. This is where SWR / single-flight /
+  LRU eviction live. Per-box.
+- **L2 — Redis (optional, `cache_turbo_redis`).** A tier *shared by every nginx
+  box*. Touched only on an L1 **miss** (one `GET`) and on store (async
+  write-through) — never on an L1 hit. So one box warming a page warms the whole
+  fleet, and a restarted box refills from Redis instead of stampeding the origin.
+- **origin — your backend.** Reached only when both L1 and L2 miss. SWR + the
+  single-flight lock (and the cross-node Redis lock) keep origin hits to roughly
+  one per stale cycle even under a stampede.
+
+> Where's "L0"? When you put cache-turbo *in front of* nginx's own
+> `proxy_cache` (next section), cache-turbo becomes the L0 in front of that
+> on-disk L1 — see below.
+
+## Mixing with nginx's native cache (`proxy_cache`)
+
+You can run cache-turbo together with `proxy_cache` / `fastcgi_cache` — they sit
+at **different layers**, so they stack cleanly:
+
+```
+                cache-turbo (ACCESS phase, shm)         proxy_cache (content phase, disk)
+  request ─▶  ┌──────────────────────────────┐
+              │  L1 lookup                    │
+              │   ├─ HIT/STALE → serve, DONE ─┼──▶  (proxy_cache never runs)
+              │   └─ MISS ────────────────────┼──▶  proxy_pass + proxy_cache ─▶ origin
+              └──────────────────────────────┘            │
+                          ▲                                │
+                          └──── captures the response ◀────┘  (stores it in shm)
+```
+
+On a cache-turbo **hit** the request is finalized in the ACCESS phase and never
+reaches `proxy_pass`, so `proxy_cache` is skipped entirely. On a **miss** the
+request flows through `proxy_cache` as usual, and cache-turbo just captures
+whatever comes back (disk-hit or origin) into its shm. So cache-turbo is an L0
+in front of proxy_cache's disk L1.
+
+Two sane patterns:
+
+```nginx
+# A) split by content — shm for hot HTML, disk for big media
+location / {
+    cache_turbo       ct;          # shm front
+    cache_turbo_valid 60s;
+    proxy_pass        http://app;
+}
+location /media/ {
+    cache_turbo off;               # let the native disk cache handle bulk
+    proxy_cache disk;
+    proxy_pass  http://app;
+}
+```
+
+```nginx
+# B) stack both on the same location — shm L0 over a big disk L1
+location / {
+    cache_turbo       ct;
+    cache_turbo_valid 30s;
+    proxy_cache       disk;        # survives reloads, holds more than RAM
+    proxy_cache_valid 200 10m;
+    proxy_pass        http://app;
+}
+```
+
+**Things to know when stacking:**
+
+- **Independent storage + purge.** Same page may live in shm *and* on disk;
+  purging cache-turbo does not purge `proxy_cache` (and vice-versa). Keep the
+  disk TTL ≥ the shm TTL so the layers don't fight.
+- **No header clash.** cache-turbo strips the native cache's `Age`,
+  `X-Cache` and `X-Cache-Status` before storing, so an L1 hit never replays a
+  frozen age/status. cache-turbo's own `X-Cache: HIT/STALE` is the source of
+  truth; read `proxy_cache`'s state via `$upstream_cache_status` if you want it.
+- **Layered staleness.** A cache-turbo SWR refresh goes through `proxy_cache`,
+  which may serve *its* stale. If that matters, keep `proxy_cache` TTL ≤
+  cache-turbo's, or disable proxy stale (`proxy_cache_use_stale off`).
+- **Rule of thumb:** don't double-cache the *same* content. Use cache-turbo for
+  what benefits from shm speed + SWR + Redis L2 + tag purge; use `proxy_cache`
+  for a huge on-disk corpus that won't fit in RAM.
+
 ## Quick start
 
 ```nginx
