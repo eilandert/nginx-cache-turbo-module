@@ -49,6 +49,21 @@
 
 
 /*
+ * Auto-classify CMS backend presets (distinct from the stale-window PRESET_*
+ * above). A bitmask in loc_conf->backend_presets; each bit pulls in one row of
+ * the preset registry (cookie/URI/arg dynamic-surface rules). GENERIC is the
+ * union of all known backends — what bare `cache_turbo <zone> auto` applies.
+ */
+#define NGX_HTTP_CACHE_TURBO_BACKEND_WORDPRESS    0x0001
+#define NGX_HTTP_CACHE_TURBO_BACKEND_WOOCOMMERCE  0x0002
+#define NGX_HTTP_CACHE_TURBO_BACKEND_JOOMLA       0x0004
+#define NGX_HTTP_CACHE_TURBO_BACKEND_GENERIC                                   \
+    (NGX_HTTP_CACHE_TURBO_BACKEND_WORDPRESS                                    \
+     | NGX_HTTP_CACHE_TURBO_BACKEND_WOOCOMMERCE                                \
+     | NGX_HTTP_CACHE_TURBO_BACKEND_JOOMLA)
+
+
+/*
  * Live autotune within preset bands (#10, v4-3). Ported from the wp-redis PHP
  * implementation (eilandert/wp-redis/includes/class-swr-autotune.php) so the edge
  * cache and the object cache tune the same way with the same constants. When
@@ -292,6 +307,16 @@ typedef struct {
     ngx_array_t             *bypass;
     ngx_array_t             *no_store;
 
+    /* Auto-classify (cache_turbo <zone> auto / cache_turbo_backend <name>...).
+     * A bitmask of CMS cacheability presets; 0 = manual mode (off). Each set
+     * bit applies a curated set of "this request is dynamic, never cache it"
+     * heuristics (login/session cookie prefixes, backend URI prefixes, dynamic
+     * query args) evaluated in the access handler. `auto` and `backend generic`
+     * set the union of all presets; naming specific backends composes only
+     * those. Sits UNDER manual bypass/no_store overrides. See the preset
+     * registry and ngx_http_cache_turbo_auto_skip() in the .c. */
+    ngx_uint_t               backend_presets;
+
     /* Live autotune (v4-3). When on, the request path uses the zone's live
      * autotuned beta (clamped to this location's preset band) in place of the
      * static effective beta above; autotune_interval throttles the per-zone
@@ -453,6 +478,8 @@ typedef struct {
                                            * request (enabled, cacheable method,
                                            * not bypassed/no_store) -> the
                                            * $cache_turbo_active var reads 1     */
+    unsigned                 auto_skip:1; /* auto-classify ruled this request
+                                           * dynamic -> origin, never capture    */
     unsigned                 captured:1;  /* response captured for store    */
     unsigned                 served:1;    /* we served from cache           */
     unsigned                 stale_hit:1; /* served stale (for X-Cache)      */

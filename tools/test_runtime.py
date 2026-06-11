@@ -650,6 +650,31 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # auto-classify (generic union): anon pages cache, dynamic surfaces skip
+        location /auto/ {{
+            cache_turbo       main auto;
+            cache_turbo_key   $uri;
+            cache_turbo_valid 30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # auto-classify URI-prefix rule: r->uri starts with /wp-admin/ -> skip
+        location /wp-admin/ {{
+            cache_turbo       main auto;
+            cache_turbo_key   $uri;
+            cache_turbo_valid 30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # cache_turbo_backend woocommerce only: composes just that preset
+        location /woo/ {{
+            cache_turbo         main;
+            cache_turbo_backend woocommerce;
+            cache_turbo_key     $uri;
+            cache_turbo_valid   30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # tiny zone to force LRU eviction (R6)
         location /e/ {{
             cache_turbo          tiny;
@@ -1217,6 +1242,61 @@ def test_suppress_native_variable(ng: Nginx) -> None:
     _, _, h2b = fetch(ng.port, "/nosup/x")
     assert h2b.get("x-cache") == "HIT", \
         "second /nosup/ read should HIT (still caching, var just reads 0)"
+
+
+def test_auto_classify(ng: Nginx, origin: Origin) -> None:
+    """Auto-classify (cache_turbo <zone> auto): a normal anonymous page is
+    cached, but a request matching a dynamic surface of the generic preset —
+    login/session cookie, backend URI prefix, or dynamic query arg — skips the
+    cache entirely (origin every time, never an X-Cache HIT)."""
+    # normal anon page: cacheable
+    _, b1, _ = fetch(ng.port, "/auto/normal")
+    _, b2, h2 = fetch(ng.port, "/auto/normal")
+    assert h2.get("x-cache") == "HIT", \
+        f"anon page should cache, got x-cache={h2.get('x-cache')}"
+    assert b2 == b1, "cached body should be byte-identical"
+
+    # logged-in cookie: never cached (#1 footgun — a request Cookie alone does
+    # not block caching without auto-classify)
+    ck = {"Cookie": "wordpress_logged_in_abc=deadbeef"}
+    _, c1, hc1 = fetch(ng.port, "/auto/private", headers=ck)
+    _, c2, hc2 = fetch(ng.port, "/auto/private", headers=ck)
+    assert "x-cache" not in hc1 and "x-cache" not in hc2, \
+        "logged-in cookie must skip the cache"
+    assert c1 != c2, "logged-in requests must each reach the origin"
+
+    # dynamic query arg ?preview=true: never cached
+    _, p1, hp1 = fetch(ng.port, "/auto/post?preview=true")
+    _, p2, hp2 = fetch(ng.port, "/auto/post?preview=true")
+    assert "x-cache" not in hp1 and "x-cache" not in hp2, \
+        "preview arg must skip the cache"
+    assert p1 != p2, "preview requests must each reach the origin"
+
+    # backend URI prefix (/wp-admin/): never cached
+    _, _, ha1 = fetch(ng.port, "/wp-admin/index")
+    _, _, ha2 = fetch(ng.port, "/wp-admin/index")
+    assert "x-cache" not in ha1 and "x-cache" not in ha2, \
+        "/wp-admin/ must skip the cache"
+    drain_origin(origin)
+
+
+def test_auto_backend_composition(ng: Nginx, origin: Origin) -> None:
+    """cache_turbo_backend composes only the named presets: a woocommerce-only
+    location skips on a woo session cookie but NOT on a wordpress login cookie
+    (which that preset does not know about), so the WP-cookie page still caches
+    — proving the presets are selective, not a blanket union."""
+    woo = {"Cookie": "woocommerce_cart_hash=abc123"}
+    _, _, hw1 = fetch(ng.port, "/woo/cartpage", headers=woo)
+    _, _, hw2 = fetch(ng.port, "/woo/cartpage", headers=woo)
+    assert "x-cache" not in hw1 and "x-cache" not in hw2, \
+        "woo session cookie must skip on the woocommerce backend"
+
+    wp = {"Cookie": "wordpress_logged_in_x=1"}
+    fetch(ng.port, "/woo/wppage", headers=wp)
+    _, _, hp2 = fetch(ng.port, "/woo/wppage", headers=wp)
+    assert hp2.get("x-cache") == "HIT", \
+        f"woo backend should ignore a WP cookie and cache, got {hp2.get('x-cache')}"
+    drain_origin(origin)
 
 
 def test_max_size_not_cached(ng: Nginx) -> None:
@@ -2985,6 +3065,8 @@ def run_all(ng: Nginx, origin: Origin,
     test_header_fidelity(ng)
     test_max_size_not_cached(ng)
     test_suppress_native_variable(ng)
+    test_auto_classify(ng, origin)
+    test_auto_backend_composition(ng, origin)
     test_no_cache_set_cookie(ng)
     test_no_cache_cc_private(ng)
     test_no_cache_cc_nostore(ng)

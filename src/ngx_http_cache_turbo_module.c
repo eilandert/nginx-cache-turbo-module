@@ -48,6 +48,10 @@ static char *ngx_http_cache_turbo_zone(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 static char *ngx_http_cache_turbo(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
+static char *ngx_http_cache_turbo_backend(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
+static ngx_int_t ngx_http_cache_turbo_auto_skip(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf);
 static char *ngx_http_cache_turbo_key(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 static char *ngx_http_cache_turbo_valid_conf(ngx_conf_t *cf, ngx_command_t *cmd,
@@ -125,8 +129,15 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
       NULL },
 
     { ngx_string("cache_turbo"),
-      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
+      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE12,
       ngx_http_cache_turbo,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0,
+      NULL },
+
+    { ngx_string("cache_turbo_backend"),
+      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_1MORE,
+      ngx_http_cache_turbo_backend,
       NGX_HTTP_LOC_CONF_OFFSET,
       0,
       NULL },
@@ -605,6 +616,139 @@ ngx_http_cache_turbo_purge_request(ngx_http_request_t *r,
 }
 
 
+/*
+ * Auto-classify preset registry. Each row is one CMS backend: NULL-terminated
+ * lists of request-Cookie name substrings, r->uri prefixes, and query-arg keys
+ * that mark a request as a dynamic surface that must NOT be cached. Adding a
+ * backend is one row here — no new code path. `generic` (bare `auto`) is the
+ * union: a row is active when (clcf->backend_presets & row->bit). These mirror
+ * the disjoint cookie/URI namespaces WP/Woo/Joomla use, so the union does not
+ * collide. Curated heuristic, not a CMS fingerprint.
+ */
+typedef struct {
+    ngx_uint_t           bit;
+    const char *const   *cookies;  /* substrings in the request Cookie header */
+    const char *const   *uris;     /* r->uri prefixes                         */
+    const char *const   *args;     /* query-arg keys (presence => dynamic)    */
+} ngx_http_cache_turbo_preset_t;
+
+static const char *const  ct_wp_cookies[] = {
+    "wordpress_logged_in_", "wp-postpass_", "comment_author_", NULL };
+static const char *const  ct_wp_uris[] = {
+    "/wp-admin/", "/wp-login.php", "/wp-cron.php", "/xmlrpc.php",
+    "/wp-json/", NULL };
+static const char *const  ct_wp_args[] = { "preview", "s", NULL };
+
+static const char *const  ct_woo_cookies[] = {
+    "woocommerce_items_in_cart", "woocommerce_cart_hash",
+    "wp_woocommerce_session_", NULL };
+static const char *const  ct_woo_uris[] = {
+    "/cart", "/checkout", "/my-account", NULL };
+static const char *const  ct_woo_args[] = { NULL };
+
+static const char *const  ct_joomla_cookies[] = { NULL };
+static const char *const  ct_joomla_uris[] = { "/administrator/", NULL };
+static const char *const  ct_joomla_args[] = { NULL };
+
+static const ngx_http_cache_turbo_preset_t  ngx_http_cache_turbo_presets[] = {
+    { NGX_HTTP_CACHE_TURBO_BACKEND_WORDPRESS,
+      ct_wp_cookies, ct_wp_uris, ct_wp_args },
+    { NGX_HTTP_CACHE_TURBO_BACKEND_WOOCOMMERCE,
+      ct_woo_cookies, ct_woo_uris, ct_woo_args },
+    { NGX_HTTP_CACHE_TURBO_BACKEND_JOOMLA,
+      ct_joomla_cookies, ct_joomla_uris, ct_joomla_args },
+    { 0, NULL, NULL, NULL }
+};
+
+
+/* True if any request Cookie header contains one of the NULL-terminated name
+ * substrings (the login/session cookies carry dynamic suffixes, so a substring
+ * match on the distinctive prefix is the right test, not an exact-name lookup). */
+static ngx_int_t
+ngx_http_cache_turbo_cookie_has(ngx_http_request_t *r,
+    const char *const *subs)
+{
+    const char *const  *pp;
+#if (nginx_version >= 1023000)
+    ngx_table_elt_t    *ck;
+
+    for (ck = r->headers_in.cookie; ck; ck = ck->next) {
+        for (pp = subs; *pp; pp++) {
+            if (ngx_strnstr(ck->value.data, (char *) *pp, ck->value.len)
+                != NULL)
+            {
+                return 1;
+            }
+        }
+    }
+#else
+    ngx_table_elt_t   **ckp;
+    ngx_uint_t          i;
+
+    ckp = r->headers_in.cookies.elts;
+    for (i = 0; i < r->headers_in.cookies.nelts; i++) {
+        for (pp = subs; *pp; pp++) {
+            if (ngx_strnstr(ckp[i]->value.data, (char *) *pp,
+                            ckp[i]->value.len) != NULL)
+            {
+                return 1;
+            }
+        }
+    }
+#endif
+    return 0;
+}
+
+
+/*
+ * Auto-classify gate. Returns 1 when the request matches a dynamic surface of
+ * any active preset (login/session cookie, backend URI prefix, dynamic query
+ * arg) and must therefore skip the cache entirely (origin, never capture). 0 =
+ * treat as cacheable and continue. Runs only when backend_presets != 0; sits
+ * UNDER the manual bypass/no_store overrides (those are checked separately).
+ */
+static ngx_int_t
+ngx_http_cache_turbo_auto_skip(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf)
+{
+    const ngx_http_cache_turbo_preset_t  *ps;
+    const char *const                    *pp;
+    ngx_str_t                             val;
+    size_t                                l;
+
+    for (ps = ngx_http_cache_turbo_presets; ps->bit; ps++) {
+        if (!(clcf->backend_presets & ps->bit)) {
+            continue;
+        }
+
+        for (pp = ps->uris; *pp; pp++) {
+            l = ngx_strlen(*pp);
+            if (r->uri.len >= l
+                && ngx_strncmp(r->uri.data, *pp, l) == 0)
+            {
+                return 1;
+            }
+        }
+
+        if (r->args.len) {
+            for (pp = ps->args; *pp; pp++) {
+                if (ngx_http_arg(r, (u_char *) *pp, ngx_strlen(*pp), &val)
+                    == NGX_OK)
+                {
+                    return 1;
+                }
+            }
+        }
+
+        if (ngx_http_cache_turbo_cookie_has(r, ps->cookies)) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+
 static ngx_int_t
 ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
 {
@@ -667,6 +811,22 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
 
     z = clcf->shm_zone->data;
     hash = ngx_crc32_short(ctx->key_hash, 32);
+
+    /* Auto-classify (cache_turbo auto / cache_turbo_backend): a curated union of
+     * CMS cacheability heuristics. When the request matches a dynamic surface of
+     * an active preset (login/session cookie, backend URI, dynamic arg) skip the
+     * cache entirely — go to the origin and never capture (ctx->auto_skip vetoes
+     * the body filter). Sits under the manual bypass/no_store overrides below.
+     * honor_cc is auto-enabled with a preset so a plugin's own Cache-Control:
+     * no-cache on an anon page self-excludes at store time. */
+    if (clcf->backend_presets && ngx_http_cache_turbo_auto_skip(r, clcf)) {
+        ctx->auto_skip = 1;
+        (void) ngx_atomic_fetch_add(&z->sh->misses, 1);
+        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "cache_turbo: auto-classify dynamic \"%V\" -> origin",
+                       &r->uri);
+        return NGX_DECLINED;
+    }
 
     /* auto-Vary (v11 other half): probe the L1 vary marker for this base key and,
      * if a previous store told us this URL varies, recompute key_hash to the
@@ -1605,6 +1765,7 @@ ngx_http_cache_turbo_header_filter(ngx_http_request_t *r)
         && !(r->method & NGX_HTTP_HEAD)
         && !ctx->vary_nocache
         && !ctx->min_uses_skip
+        && !ctx->auto_skip
         && ngx_http_cache_turbo_status_ttl(clcf, r->headers_out.status) >= 0
         && ngx_http_cache_turbo_response_cacheable(r)
         && (clcf->no_store == NULL
@@ -2056,6 +2217,59 @@ ngx_http_cache_turbo(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
     clcf->enable = 1;
     clcf->shm_zone = shm_zone;
+
+    /* "cache_turbo <zone> auto;" — shorthand for the generic auto-classify
+     * preset (the union of all CMS backends). Equivalent to also writing
+     * `cache_turbo_backend generic;`. Any other 2nd token is rejected. */
+    if (cf->args->nelts == 3) {
+        if (ngx_strcmp(value[2].data, "auto") != 0) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                "invalid cache_turbo mode \"%V\" (expected \"auto\")",
+                &value[2]);
+            return NGX_CONF_ERROR;
+        }
+        clcf->backend_presets |= NGX_HTTP_CACHE_TURBO_BACKEND_GENERIC;
+    }
+
+    return NGX_CONF_OK;
+}
+
+
+/* cache_turbo_backend <name>... — compose one or more CMS auto-classify presets
+ * (NGX_CONF_1MORE; listed names stack, e.g. `wordpress woocommerce`). "generic"
+ * (or "auto") is the union of all backends; naming specific backends is tighter.
+ * Sets bits in clcf->backend_presets consumed by ngx_http_cache_turbo_auto_skip. */
+static char *
+ngx_http_cache_turbo_backend(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_http_cache_turbo_loc_conf_t  *clcf = conf;
+    ngx_str_t                        *value;
+    ngx_uint_t                        i;
+
+    value = cf->args->elts;
+
+    for (i = 1; i < cf->args->nelts; i++) {
+        if (ngx_strcmp(value[i].data, "generic") == 0
+            || ngx_strcmp(value[i].data, "auto") == 0)
+        {
+            clcf->backend_presets |= NGX_HTTP_CACHE_TURBO_BACKEND_GENERIC;
+
+        } else if (ngx_strcmp(value[i].data, "wordpress") == 0) {
+            clcf->backend_presets |= NGX_HTTP_CACHE_TURBO_BACKEND_WORDPRESS;
+
+        } else if (ngx_strcmp(value[i].data, "woocommerce") == 0) {
+            clcf->backend_presets |= NGX_HTTP_CACHE_TURBO_BACKEND_WOOCOMMERCE;
+
+        } else if (ngx_strcmp(value[i].data, "joomla") == 0) {
+            clcf->backend_presets |= NGX_HTTP_CACHE_TURBO_BACKEND_JOOMLA;
+
+        } else {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                "unknown cache_turbo_backend \"%V\" (want "
+                "generic|wordpress|woocommerce|joomla)", &value[i]);
+            return NGX_CONF_ERROR;
+        }
+    }
 
     return NGX_CONF_OK;
 }
@@ -3995,6 +4209,14 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_size_value(conf->max_size, prev->max_size, 1024 * 1024);
     ngx_conf_merge_value(conf->suppress_native, prev->suppress_native, 0);
 
+    /* backend_presets is an accumulated bitmask (0 = unset), so the standard
+     * UNSET-sentinel merge can't be used; inherit the parent's set when this
+     * location named no backend of its own (an explicit backend fully
+     * overrides, it does not OR with the parent's). */
+    if (conf->backend_presets == 0) {
+        conf->backend_presets = prev->backend_presets;
+    }
+
     /*
      * Presets (v3-2). Two-stage so a location's preset can still set the band
      * defaults even when an ANCESTOR already resolved its own effective knobs:
@@ -4050,6 +4272,13 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_ptr_value(conf->no_store, prev->no_store, NULL);
 
     /* Honor upstream Cache-Control/Expires (v7): off by default. */
+    /* Auto-classify auto-enables honor_cc (unless explicitly set), so a
+     * backend plugin's own Cache-Control: no-cache on an anon page
+     * self-excludes at store time. Done before the merge so an explicit
+     * `cache_turbo_honor_cache_control off;` still wins. */
+    if (conf->backend_presets != 0 && conf->honor_cc == NGX_CONF_UNSET) {
+        conf->honor_cc = 1;
+    }
     ngx_conf_merge_value(conf->honor_cc, prev->honor_cc, 0);
     ngx_conf_merge_value(conf->auto_vary, prev->auto_vary, 0);
 
