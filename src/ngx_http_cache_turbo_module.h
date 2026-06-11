@@ -207,6 +207,13 @@ typedef struct ngx_cache_turbo_l1_backend_s  ngx_cache_turbo_l1_backend_t;
 typedef struct ngx_cache_turbo_backend_s     ngx_cache_turbo_backend_t;
 
 
+/* One per-status fresh-TTL rule (v6): "cache this status for this long". */
+typedef struct {
+    ngx_uint_t   status;     /* HTTP status code (e.g. 301, 404)  */
+    time_t       valid;      /* fresh TTL in seconds (0 = forever) */
+} ngx_http_cache_turbo_valid_t;
+
+
 /* location-level configuration */
 typedef struct {
     ngx_flag_t               enable;
@@ -233,6 +240,13 @@ typedef struct {
     ngx_int_t                beta;        /* SWR aggressiveness /1000, eff  */
     time_t                   lock_ttl;    /* single-flight lock window, eff */
     ngx_int_t                stale_mult;  /* stale window multiplier, eff   */
+
+    /* Per-status TTLs (v6). cache_turbo_valid with leading status codes, e.g.
+     * `cache_turbo_valid 301 302 1h; cache_turbo_valid 404 410 1m;`. Lets the
+     * cache store redirects and negative responses, each with its own fresh TTL.
+     * Array of ngx_http_cache_turbo_valid_t; NULL = only 200 is cacheable (at
+     * clcf->valid). 200's TTL stays the bare `cache_turbo_valid TIME` value. */
+    ngx_array_t             *valid_status;
 
     /* Live autotune (v4-3). When on, the request path uses the zone's live
      * autotuned beta (clamped to this location's preset band) in place of the

@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import hashlib
+import http.client
 import http.server
 import json
 import pathlib
@@ -86,6 +87,21 @@ def fetch(port: int, path: str, headers: dict | None = None,
         return exc.code, body, {k.lower(): v for k, v in exc.headers.items()}
 
 
+def fetch_raw(port: int, path: str, method: str = "GET",
+              headers: dict | None = None):
+    """Like fetch(), but does NOT follow redirects and supports HEAD — returns
+    (status, body_str, headers_dict). Uses http.client so a 3xx is observable."""
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    try:
+        conn.request(method, path, headers=headers or {})
+        resp = conn.getresponse()
+        body = resp.read().decode("utf-8", "replace")
+        return (resp.status, body,
+                {k.lower(): v for k, v in resp.getheaders()})
+    finally:
+        conn.close()
+
+
 # --------------------------------------------------------------------------- #
 # Counting origin: every GET returns a unique body and bumps a hit counter.
 # --------------------------------------------------------------------------- #
@@ -108,12 +124,40 @@ class Origin:
         origin = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
+            def do_HEAD(self):  # noqa: N802
+                # A HEAD must reach the origin (no body); the module must NOT
+                # store it as the GET entry.
+                with origin._lock:
+                    origin._n += 1
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
             def do_GET(self):  # noqa: N802
                 if origin.delay:
                     time.sleep(origin.delay)
                 with origin._lock:
                     origin._n += 1
                     n = origin._n
+                # Per-status caching markers (v6): redirects + negative responses.
+                if "redir" in self.path:
+                    self.send_response(301)
+                    self.send_header("Location", f"/dest-{n}")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                if "notfound" in self.path:
+                    body = f"missing-{n}\n".encode()
+                    self.send_response(404)
+                    self.send_header("Content-Type", "text/plain")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    try:
+                        self.wfile.write(body)
+                    except BrokenPipeError:
+                        pass
+                    return
                 body = f"gen-{n}\n".encode()
                 self.send_response(200)
                 self.send_header("Content-Type",
@@ -323,6 +367,16 @@ http {{
         location /dk/ {{
             cache_turbo          main;
             cache_turbo_valid    30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # per-status caching (v6): cache redirects + negative responses too
+        location /st/ {{
+            cache_turbo       main;
+            cache_turbo_key   $uri;
+            cache_turbo_valid 30s;
+            cache_turbo_valid 301 302 308 30s;
+            cache_turbo_valid 404 410 30s;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
@@ -856,6 +910,39 @@ def test_admin_purge_post_with_body(ng: Nginx) -> None:
         assert json.loads(r.read())["purged"] == 1
     _, _, h2 = fetch(ng.port, "/c/bodypurge")
     assert "x-cache" not in h2, "entry should be gone after purge (a MISS)"
+
+
+def test_cache_redirect(ng: Nginx) -> None:
+    """v6: a 301 (empty body) is cached and replayed with its Location intact."""
+    s1, _, h1 = fetch_raw(ng.port, "/st/redir")
+    assert s1 == 301 and "x-cache" not in h1, f"first 301 should miss: {s1} {h1}"
+    loc1 = h1.get("location")
+    s2, _, h2 = fetch_raw(ng.port, "/st/redir")
+    assert s2 == 301 and h2.get("x-cache") == "HIT", \
+        f"second 301 should be a HIT: {s2} {h2.get('x-cache')}"
+    assert h2.get("location") == loc1, \
+        f"Location not preserved on cached 301: {h2.get('location')} vs {loc1}"
+
+
+def test_cache_negative_404(ng: Nginx) -> None:
+    """v6: a 404 is cached (negative caching) — the body is preserved on HIT."""
+    s1, b1, h1 = fetch_raw(ng.port, "/st/notfound")
+    assert s1 == 404 and "x-cache" not in h1, f"first 404 should miss: {s1}"
+    s2, b2, h2 = fetch_raw(ng.port, "/st/notfound")
+    assert s2 == 404 and h2.get("x-cache") == "HIT", "second 404 should HIT"
+    assert b1 == b2 and b2, f"404 body not preserved: {b1!r} vs {b2!r}"
+
+
+def test_head_not_stored(ng: Nginx) -> None:
+    """v6: a HEAD must never populate the cache as the GET entry — the following
+    GET is still a MISS (and then caches normally)."""
+    sh, _, hh = fetch_raw(ng.port, "/c/headonly", method="HEAD")
+    assert sh == 200, f"HEAD status {sh}"
+    assert "x-cache" not in hh, "HEAD should not be served from cache here"
+    _, _, h1 = fetch_raw(ng.port, "/c/headonly", method="GET")
+    assert "x-cache" not in h1, "GET after HEAD should still be a MISS"
+    _, _, h2 = fetch_raw(ng.port, "/c/headonly", method="GET")
+    assert h2.get("x-cache") == "HIT", "GET should cache normally after the HEAD"
 
 
 def test_native_cache_headers_stripped(ng: Nginx) -> None:
@@ -1810,6 +1897,9 @@ def run_all(ng: Nginx, origin: Origin,
     test_no_cache_cc_nostore(ng)
     test_no_cache_authorization(ng)
     test_default_key_varies_by_host(ng)
+    test_cache_redirect(ng)
+    test_cache_negative_404(ng)
+    test_head_not_stored(ng)
     test_native_cache_headers_stripped(ng)
     test_admin_purge_post_with_body(ng)
     test_concurrent_hits_no_deadlock(ng)
@@ -1929,7 +2019,9 @@ def main() -> int:
 
     print("OK: miss/hit, header fidelity, max_size, "
           "cacheability floor (Set-Cookie/CC-private/CC-no-store/Authorization "
-          "not cached), default-key Host split, native-cache headers stripped, "
+          "not cached), default-key Host split, "
+          "per-status caching (301/404 cached, HEAD not stored), "
+          "native-cache headers stripped, "
           "admin purge w/ body, "
           "concurrency (R1), prometheus metrics, "
           "LRU eviction (R6), stale serve (R3), single-flight (R4), "

@@ -150,9 +150,18 @@ runs. No header = it went to the backend (a miss).
 
 ## What it will and won't cache
 
-It only stores a `200 OK` to a `GET`/`HEAD`. And it **refuses** to cache
-anything that looks per-user, so you don't accidentally serve Alice's logged-in
-page to Bob:
+By default it stores a `200 OK` to a `GET` (never a `HEAD` — that would store an
+empty body). You can also cache **redirects and negative responses** by giving
+their status codes a TTL:
+
+```nginx
+cache_turbo_valid 30s;              # the default / 200 TTL
+cache_turbo_valid 301 302 308 1h;   # cache redirects
+cache_turbo_valid 404 410 1m;       # negative caching
+```
+
+And it **refuses** to cache anything that looks per-user, so you don't
+accidentally serve Alice's logged-in page to Bob:
 
 - request had an `Authorization` header → not cached
 - response sets a cookie (`Set-Cookie`) → not cached
@@ -283,7 +292,7 @@ $ curl -X POST 'localhost/_cache?url=/,/blog/,/about' # pre-warm cold pages
 | `cache_turbo NAME` / `off` | `server`, `location` | `off` | Turn caching on (bind a zone) or off. |
 | `cache_turbo_key STRING` | `server`, `location` | `$host$request_uri` | What makes two requests "the same page". |
 | `cache_turbo_preset NAME` | `server`, `location` | `balanced` | `conservative` / `balanced` / `aggressive` — sets the four knobs below at once. |
-| `cache_turbo_valid TIME` | `server`, `location` | preset (`60s`) | How long a copy stays *fresh*. After this it's *stale* (still served). |
+| `cache_turbo_valid [CODE...] TIME` | `server`, `location` | preset (`60s`) | How long a copy stays *fresh* (then *stale*, still served). Bare `TIME` = the default/200 TTL. With leading status codes (`cache_turbo_valid 301 404 1m;`) it makes those statuses cacheable too — redirects + negative caching. Repeatable. |
 | `cache_turbo_beta N` | `server`, `location` | preset (`1000`) | Refresh eagerness, ×1000 (1000 = 1.0). Higher = refresh sooner/more often. |
 | `cache_turbo_lock_ttl TIME` | `server`, `location` | preset (`5s`) | Single-flight window: once one refresh is claimed, others serve stale until it finishes. Caps backend regens to ~one per cycle. |
 | `cache_turbo_max_size SIZE` | `server`, `location` | `1m` | Don't cache responses bigger than this. |

@@ -41,6 +41,8 @@ static char *ngx_http_cache_turbo(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 static char *ngx_http_cache_turbo_key(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
+static char *ngx_http_cache_turbo_valid_conf(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
 static char *ngx_http_cache_turbo_admin(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 static char *ngx_http_cache_turbo_redis_conf(ngx_conf_t *cf,
@@ -114,10 +116,10 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
       NULL },
 
     { ngx_string("cache_turbo_valid"),
-      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
-      ngx_conf_set_sec_slot,
+      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_1MORE,
+      ngx_http_cache_turbo_valid_conf,
       NGX_HTTP_LOC_CONF_OFFSET,
-      offsetof(ngx_http_cache_turbo_loc_conf_t, valid_raw),
+      0,
       NULL },
 
     { ngx_string("cache_turbo_beta"),
@@ -321,6 +323,36 @@ ngx_http_cache_turbo_effective_beta(ngx_http_cache_turbo_loc_conf_t *clcf,
     }
 
     return ab;
+}
+
+
+/*
+ * Fresh TTL (seconds) to cache a response with this status, or -1 if the status
+ * is not cacheable here (v6). 200 always caches at clcf->valid; any other status
+ * caches only if a `cache_turbo_valid <code> <time>` rule named it. A 0 TTL
+ * ("forever") is a valid return, so the not-cacheable sentinel is -1.
+ */
+static time_t
+ngx_http_cache_turbo_status_ttl(ngx_http_cache_turbo_loc_conf_t *clcf,
+    ngx_uint_t status)
+{
+    ngx_http_cache_turbo_valid_t  *v;
+    ngx_uint_t                     i;
+
+    if (status == NGX_HTTP_OK) {
+        return clcf->valid;
+    }
+
+    if (clcf->valid_status != NULL) {
+        v = clcf->valid_status->elts;
+        for (i = 0; i < clcf->valid_status->nelts; i++) {
+            if (v[i].status == status) {
+                return v[i].valid;
+            }
+        }
+    }
+
+    return -1;
 }
 
 
@@ -644,11 +676,17 @@ ngx_http_cache_turbo_serve(ngx_http_request_t *r, u_char *copy, size_t len,
         return NGX_ERROR;
     }
 
-    if (r->header_only || body_len == 0) {
+    /* HEAD: header already sent, no body expected — done. */
+    if (r->header_only) {
         ngx_http_finalize_request(r, NGX_OK);
         return NGX_DONE;
     }
 
+    /* For a GET we must still push a terminating last_buf through the output
+     * filter, even when the body is empty (a cached 301/302/308/204, v6): just
+     * finalizing without a last buffer leaves the response chain unterminated
+     * and the client hangs. An empty memory buffer with last_buf set is the
+     * standard end-of-response signal. */
     b = ngx_calloc_buf(r->pool);
     if (b == NULL) {
         return NGX_ERROR;
@@ -656,9 +694,12 @@ ngx_http_cache_turbo_serve(ngx_http_request_t *r, u_char *copy, size_t len,
 
     b->pos = body;
     b->last = body + body_len;
-    b->memory = 1;
+    b->memory = (body_len > 0) ? 1 : 0;
     b->last_buf = (r == r->main) ? 1 : 0;
     b->last_in_chain = 1;
+    if (body_len == 0) {
+        b->sync = 1;                 /* zero-size control buffer */
+    }
 
     out.buf = b;
     out.next = NULL;
@@ -792,11 +833,13 @@ ngx_http_cache_turbo_header_filter(ngx_http_request_t *r)
 
     clcf = ngx_http_get_module_loc_conf(r, ngx_http_cache_turbo_module);
 
-    /* Only capture cacheable success responses. Normally the main request only;
-     * a warm subrequest (ctx->warm) is the deliberate exception — we want its
-     * origin response captured and stored even though r != r->main. */
+    /* Only capture cacheable responses. 200 always, plus any status named by a
+     * cache_turbo_valid <code> rule (redirects / negative caching, v6). Never a
+     * HEAD — its empty body must not overwrite the GET entry. Normally the main
+     * request only; a warm subrequest (ctx->warm) is the deliberate exception. */
     if (clcf->enable && (r == r->main || ctx->warm)
-        && r->headers_out.status == NGX_HTTP_OK
+        && !(r->method & NGX_HTTP_HEAD)
+        && ngx_http_cache_turbo_status_ttl(clcf, r->headers_out.status) >= 0
         && ngx_http_cache_turbo_response_cacheable(r))
     {
         /* A warm subrequest never ran the access phase (nginx skips it for
@@ -883,7 +926,10 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
         }
     }
 
-    if (last && ctx->body_len > 0
+    /* Store once the response is complete and within max_size. A zero-length
+     * body is allowed (v6): a 301/302/308 redirect or a 204 has no body but is
+     * worth caching for its headers. (HEAD is already excluded at capture.) */
+    if (last
         && (clcf->max_size == 0 || ctx->body_len <= clcf->max_size))
     {
         ngx_list_part_t                  *part;
@@ -893,6 +939,12 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
         uint32_t                          nheaders = 0;
         u_char                           *blob, *w;
         ngx_uint_t                        i;
+        time_t                            ttl;
+
+        ttl = ngx_http_cache_turbo_status_ttl(clcf, r->headers_out.status);
+        if (ttl < 0) {
+            return ngx_http_next_body_filter(r, in);   /* not cacheable */
+        }
 
         /* Synthesise a Content-Type entry from the typed field (it is not in
          * the headers list). Everything else comes from headers_out.headers. */
@@ -993,7 +1045,7 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
             hash = ngx_crc32_short(ctx->key_hash, 32);
 
             (void) clcf->l1->store(z, ctx->key_hash, hash,
-                       blob, blob_len, r->headers_out.status, clcf->valid,
+                       blob, blob_len, r->headers_out.status, ttl,
                        clcf->stale_mult);
 
             /* Record this origin regeneration's cost for the autotune (v4-3).
@@ -1016,7 +1068,7 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
              * its own pool, so it is safe even though `blob` lives in r->pool. */
             if (clcf->backend) {
                 clcf->backend->set(r, clcf, ctx->key_hash,
-                                   blob, blob_len, clcf->valid);
+                                   blob, blob_len, ttl);
             }
 
             /* Tag index (v2c): for each tag in the cache_turbo_tag expression,
@@ -1031,7 +1083,7 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
                     time_t   stale_ttl;
                     u_char  *s, *e, *tok;
 
-                    stale_ttl = ngx_http_cache_turbo_stale_ttl(clcf->valid,
+                    stale_ttl = ngx_http_cache_turbo_stale_ttl(ttl,
                                     clcf->stale_mult);
                     s = tagval.data;
                     e = tagval.data + tagval.len;
@@ -1175,6 +1227,67 @@ ngx_http_cache_turbo_key(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
     if (ngx_http_compile_complex_value(&ccv) != NGX_OK) {
         return NGX_CONF_ERROR;
+    }
+
+    return NGX_CONF_OK;
+}
+
+
+/*
+ * "cache_turbo_valid [code ...] time;"
+ *   - bare `cache_turbo_valid 30s;`  => the default/200 fresh TTL (valid_raw),
+ *     which also drives the stale window + autotune (back-compatible).
+ *   - `cache_turbo_valid 301 302 1h;` / `cache_turbo_valid 404 1m;` => per-status
+ *     fresh TTLs, so redirects and negative responses get cached too.
+ * Last arg is always the time; any leading args are HTTP status codes.
+ */
+static char *
+ngx_http_cache_turbo_valid_conf(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_http_cache_turbo_loc_conf_t  *clcf = conf;
+
+    ngx_str_t                     *value;
+    time_t                         valid;
+    ngx_uint_t                     i;
+    ngx_int_t                      code;
+    ngx_http_cache_turbo_valid_t  *v;
+
+    value = cf->args->elts;
+
+    valid = ngx_parse_time(&value[cf->args->nelts - 1], 1);   /* seconds */
+    if (valid == (time_t) NGX_ERROR) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "cache_turbo_valid: bad time \"%V\"",
+                           &value[cf->args->nelts - 1]);
+        return NGX_CONF_ERROR;
+    }
+
+    if (cf->args->nelts == 2) {
+        clcf->valid_raw = valid;           /* default / 200 TTL */
+        return NGX_CONF_OK;
+    }
+
+    if (clcf->valid_status == NULL) {
+        clcf->valid_status = ngx_array_create(cf->pool, 4,
+                                 sizeof(ngx_http_cache_turbo_valid_t));
+        if (clcf->valid_status == NULL) {
+            return NGX_CONF_ERROR;
+        }
+    }
+
+    for (i = 1; i < cf->args->nelts - 1; i++) {
+        code = ngx_atoi(value[i].data, value[i].len);
+        if (code < 100 || code > 599) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                "cache_turbo_valid: bad status code \"%V\"", &value[i]);
+            return NGX_CONF_ERROR;
+        }
+        v = ngx_array_push(clcf->valid_status);
+        if (v == NULL) {
+            return NGX_CONF_ERROR;
+        }
+        v->status = (ngx_uint_t) code;
+        v->valid = valid;
     }
 
     return NGX_CONF_OK;
@@ -2605,6 +2718,11 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
         conf->lock_ttl = (conf->lock_ttl_raw == NGX_CONF_UNSET)
                           ? band->lock_ttl : conf->lock_ttl_raw;
         conf->stale_mult = band->stale_mult;
+    }
+
+    /* Per-status TTLs (v6): inherit the rule list if this level set none. */
+    if (conf->valid_status == NULL) {
+        conf->valid_status = prev->valid_status;
     }
 
     /* Live autotune (v4-3): off by default; default recompute cadence when on. */
