@@ -1792,6 +1792,9 @@ ngx_http_cache_turbo_redis_parse_scan(ngx_http_cache_turbo_redis_op_t *op,
     if (len == NGX_ERROR || len < 0) {
         return NGX_DECLINED;
     }
+    if (len > NGX_HTTP_CACHE_TURBO_REDIS_MAX_REPLY) {
+        return NGX_DECLINED;               /* bound before len + 2 (no overflow) */
+    }
     p = crlf + 2;
     if (end - p < len + 2) {
         return NGX_AGAIN;

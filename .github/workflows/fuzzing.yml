@@ -1,0 +1,100 @@
+name: Fuzzing
+
+# Coverage-guided fuzzing of the RESP reply parsers
+# (ngx_http_cache_turbo_redis_parse / _parse_array / _parse_scan), which read
+# attacker-influenceable bytes from a shared L2. Heavy job: monthly on a
+# schedule + manual only, matching valgrind.yml / codeql.yml — NOT on every
+# push/PR (build-test.yml already runs ASan+UBSan on each change for fast
+# feedback). The fuzz target is built from the SHIPPED parser via
+# fuzz/extract_parser.sh, so there is no copy to drift.
+#
+# Third-party actions pinned to commit SHAs (same pins as the other workflows):
+# actions/checkout@v5         -> 93cb6efe18208431cddfb8368fd83d5badbf9bfd
+# actions/upload-artifact@v5  -> 330a01c490aca151604b8cf639adc76d48f6c5d4
+
+on:
+  schedule:
+    - cron: "11 5 1 * *"   # 05:11 on the 1st of each month
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: "Fuzz duration in seconds"
+        required: false
+        default: "900"
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    name: RESP parser fuzz
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout module
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Install clang + libFuzzer
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang
+
+      - name: Build fuzz target
+        run: bash fuzz/build.sh "$GITHUB_WORKSPACE/fuzz_resp_parser"
+
+      - name: Select fuzz duration
+        run: |
+          # Manual dispatch can override; the monthly run uses the default.
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "FUZZ_SECS=${{ github.event.inputs.duration }}" >> "$GITHUB_ENV"
+          else
+            echo "FUZZ_SECS=900" >> "$GITHUB_ENV"
+          fi
+
+      - name: Run fuzzer
+        run: |
+          cd fuzz
+          set +e
+          ./../fuzz_resp_parser \
+            -max_total_time="$FUZZ_SECS" \
+            -print_final_stats=1 \
+            -artifact_prefix=crash- \
+            corpus/
+          rc=$?
+          set -e
+          if [ $rc -ne 0 ]; then
+            echo "❌ Fuzzer found a crash (exit $rc)"
+            exit 1
+          fi
+          echo "✓ No crashes in ${FUZZ_SECS}s"
+
+      - name: Minimize and persist corpus growth
+        if: success() && github.event_name == 'schedule'
+        run: |
+          cd fuzz
+          mkdir -p corpus-min
+          ./../fuzz_resp_parser -merge=1 corpus-min/ corpus/
+          merged=$(find corpus-min -type f | wc -l)
+          echo "Merged corpus: $merged units"
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: fuzz-crashes
+          path: |
+            ${{ github.workspace }}/fuzz/crash-*
+          retention-days: 30
+
+      - name: Upload minimized corpus
+        if: success() && github.event_name == 'schedule'
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: fuzz-corpus
+          path: ${{ github.workspace }}/fuzz/corpus-min
+          retention-days: 30

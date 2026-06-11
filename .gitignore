@@ -5,3 +5,14 @@ __pycache__/
 build/
 objs/
 valgrind-*.log
+
+# Fuzzing build artifacts (seed corpus IS tracked; everything else is not)
+fuzz/fuzz_resp_parser
+fuzz/generated_parser.inc
+fuzz/crash-*
+fuzz/corpus-min/
+fuzz/*.profraw
+# Local fuzz runs dump discovered units into corpus/; keep only the
+# hand-written NN_* seeds, ignore libFuzzer's hash-named discoveries.
+fuzz/corpus/*
+!fuzz/corpus/[0-9][0-9]_*
