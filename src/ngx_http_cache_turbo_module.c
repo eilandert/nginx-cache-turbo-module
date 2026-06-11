@@ -1120,6 +1120,96 @@ ngx_http_cache_turbo_add_header(ngx_http_request_t *r,
 }
 
 
+/*
+ * RFC 7232 conditional evaluation for a cache HIT (v11). Returns 1 when the
+ * client's validators match the stored representation and we should reply 304
+ * instead of the body. If-None-Match takes precedence; If-Modified-Since is
+ * only consulted when If-None-Match is absent (RFC 7232 §6). etag/lm are the
+ * raw stored validator values (including ETag's surrounding quotes), captured
+ * out of the blob; either may be empty when the response carried no such
+ * header. The If-None-Match walk mirrors core's ngx_http_test_if_match with the
+ * weak comparator (correct for GET/HEAD): strip an optional "W/" from both the
+ * stored tag and each list entry, then octet-compare the quoted opaque tag.
+ */
+static ngx_uint_t
+ngx_http_cache_turbo_not_modified(ngx_http_request_t *r,
+    u_char *etag, size_t etag_len, u_char *lm, size_t lm_len)
+{
+    ngx_table_elt_t  *inm = r->headers_in.if_none_match;
+    ngx_table_elt_t  *ims = r->headers_in.if_modified_since;
+
+    if (inm != NULL) {
+        u_char  *start = inm->value.data;
+        u_char  *end = start + inm->value.len;
+        u_char   ch;
+
+        /* "*" matches any current representation (we have one cached). */
+        if (inm->value.len == 1 && start[0] == '*') {
+            return 1;
+        }
+
+        if (etag_len == 0) {
+            return 0;
+        }
+
+        if (etag_len > 2 && etag[0] == 'W' && etag[1] == '/') {
+            etag += 2;
+            etag_len -= 2;
+        }
+
+        while (start < end) {
+
+            if (end - start > 2 && start[0] == 'W' && start[1] == '/') {
+                start += 2;
+            }
+
+            if (etag_len > (size_t) (end - start)) {
+                return 0;
+            }
+
+            if (ngx_strncmp(start, etag, etag_len) != 0) {
+                goto skip;
+            }
+
+            start += etag_len;
+
+            while (start < end) {
+                ch = *start;
+                if (ch == ' ' || ch == '\t') { start++; continue; }
+                break;
+            }
+
+            if (start == end || *start == ',') {
+                return 1;
+            }
+
+        skip:
+            while (start < end && *start != ',') { start++; }
+            while (start < end) {
+                ch = *start;
+                if (ch == ' ' || ch == '\t' || ch == ',') { start++; continue; }
+                break;
+            }
+        }
+
+        return 0;
+    }
+
+    if (ims != NULL && lm_len) {
+        time_t  ims_t, lm_t;
+
+        ims_t = ngx_parse_http_time(ims->value.data, ims->value.len);
+        lm_t  = ngx_parse_http_time(lm, lm_len);
+
+        if (ims_t != NGX_ERROR && lm_t != NGX_ERROR && lm_t <= ims_t) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+
 /* Serve a cached object from a pool-owned snapshot (caller already copied it
  * out of shm and released the zone lock). */
 static ngx_int_t
@@ -1135,6 +1225,8 @@ ngx_http_cache_turbo_serve(ngx_http_request_t *r, u_char *copy, size_t len,
     ngx_http_cache_turbo_blob_hdr_t  *bh;
     ngx_http_cache_turbo_ctx_t       *ctx;
     uint32_t                          i;
+    u_char                           *etag = NULL, *lastmod = NULL;
+    size_t                            etag_len = 0, lastmod_len = 0;
 
     ctx = ngx_http_get_module_ctx(r, ngx_http_cache_turbo_module);
     if (ctx) {
@@ -1197,7 +1289,45 @@ ngx_http_cache_turbo_serve(ngx_http_request_t *r, u_char *copy, size_t len,
             continue;
         }
 
+        /* v11: remember the stored validators so we can answer a conditional
+         * request with 304 below. They are still emitted as normal headers. */
+        if (nl == sizeof("ETag") - 1
+            && ngx_strncasecmp(nm, (u_char *) "ETag", nl) == 0)
+        {
+            etag = vv;
+            etag_len = vl;
+
+        } else if (nl == sizeof("Last-Modified") - 1
+                   && ngx_strncasecmp(nm, (u_char *) "Last-Modified", nl) == 0)
+        {
+            lastmod = vv;
+            lastmod_len = vl;
+        }
+
         (void) ngx_http_cache_turbo_add_header(r, nm, nl, vv, vl);
+    }
+
+    /* Conditional request (v11): a fresh OR stale 200 HIT whose stored ETag /
+     * Last-Modified satisfy the client's If-None-Match / If-Modified-Since is
+     * answered 304 with no body. Only 200 is validated this way (redirects and
+     * other cached statuses serve normally); GET/HEAD only. Pre-converting the
+     * status keeps core's not-modified header filter a no-op (it bails unless
+     * status == 200), so there is no double handling. */
+    if (bh->status == NGX_HTTP_OK
+        && (r->method & (NGX_HTTP_GET | NGX_HTTP_HEAD))
+        && ngx_http_cache_turbo_not_modified(r, etag, etag_len,
+                                             lastmod, lastmod_len))
+    {
+        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "cache_turbo: conditional HIT -> 304");
+
+        r->headers_out.status = NGX_HTTP_NOT_MODIFIED;
+        r->headers_out.status_line.len = 0;
+        r->headers_out.content_length_n = -1;
+        r->headers_out.content_type.len = 0;
+        r->headers_out.content_type.data = NULL;
+        r->header_only = 1;        /* serve() short-circuits the body below */
+        body_len = 0;
     }
 
     /* X-Cache debug header */

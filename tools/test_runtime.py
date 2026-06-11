@@ -193,6 +193,12 @@ class Origin:
                 if "ttl1" in self.path:
                     # upstream-declared 1s freshness (v7 honor_cache_control)
                     self.send_header("Cache-Control", "public, max-age=1")
+                if "cond" in self.path:
+                    # v11 conditional-304: stable validators so a stored entry
+                    # can answer If-None-Match / If-Modified-Since from cache.
+                    self.send_header("ETag", '"v11etag"')
+                    self.send_header("Last-Modified",
+                                     "Wed, 21 Oct 2015 07:28:00 GMT")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 try:
@@ -433,6 +439,16 @@ http {{
         location /dk/ {{
             cache_turbo          main;
             cache_turbo_valid    30s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # conditional requests (v11): origin emits ETag + Last-Modified; a HIT
+        # whose stored validators satisfy If-None-Match / If-Modified-Since is
+        # answered 304 (no body) straight from cache.
+        location /cond/ {{
+            cache_turbo       main;
+            cache_turbo_key   $uri;
+            cache_turbo_valid 30s;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
@@ -1125,6 +1141,74 @@ def test_honor_cache_control(ng: Nginx) -> None:
     assert h2.get("x-cache") == "STALE", \
         ("honor_cache_control: entry should be STALE at 2s (max-age=1 < 60s), "
          f"got {h2.get('x-cache')}")
+
+
+def test_conditional_inm_304(ng: Nginx, origin: Origin) -> None:
+    """v11: a HIT whose stored ETag matches If-None-Match is answered 304 with no
+    body, served from cache (the origin is not hit again)."""
+    s0, _, h0 = fetch_raw(ng.port, "/cond/cond-inm")
+    assert s0 == 200 and "x-cache" not in h0, f"prime should miss: {s0} {h0}"
+    assert h0.get("etag") == '"v11etag"', f"etag not surfaced: {h0.get('etag')}"
+    before = origin.hits
+    s1, b1, h1 = fetch_raw(ng.port, "/cond/cond-inm",
+                           headers={"If-None-Match": '"v11etag"'})
+    assert s1 == 304, f"matching If-None-Match should be 304, got {s1}"
+    assert b1 == "", f"304 must have no body, got {b1!r}"
+    assert h1.get("x-cache") == "HIT", f"304 should be a cache HIT: {h1}"
+    assert origin.hits == before, "304 must be served from cache, not origin"
+
+
+def test_conditional_inm_star(ng: Nginx) -> None:
+    """v11: If-None-Match: * matches any cached representation -> 304."""
+    fetch_raw(ng.port, "/cond/cond-star")                          # prime
+    s, b, h = fetch_raw(ng.port, "/cond/cond-star",
+                        headers={"If-None-Match": "*"})
+    assert s == 304 and b == "", f"INM '*' should be 304/no-body: {s} {b!r}"
+    assert h.get("x-cache") == "HIT"
+
+
+def test_conditional_inm_mismatch_full(ng: Nginx) -> None:
+    """v11: a non-matching If-None-Match serves the full cached body (200 HIT)."""
+    _, b0, _ = fetch_raw(ng.port, "/cond/cond-miss")               # prime
+    s, b, h = fetch_raw(ng.port, "/cond/cond-miss",
+                        headers={"If-None-Match": '"other"'})
+    assert s == 200, f"non-matching INM should be 200, got {s}"
+    assert b == b0 and b, f"full body expected on mismatch: {b!r} vs {b0!r}"
+    assert h.get("x-cache") == "HIT"
+
+
+def test_conditional_ims_304(ng: Nginx) -> None:
+    """v11: If-Modified-Since later than the stored Last-Modified -> 304."""
+    fetch_raw(ng.port, "/cond/cond-ims")                           # prime (LM=2015-10-21)
+    s, b, h = fetch_raw(ng.port, "/cond/cond-ims",
+                        headers={"If-Modified-Since":
+                                 "Thu, 22 Oct 2015 07:28:00 GMT"})
+    assert s == 304 and b == "", f"IMS-after-LM should be 304: {s} {b!r}"
+    assert h.get("x-cache") == "HIT"
+
+
+def test_conditional_ims_old_full(ng: Nginx) -> None:
+    """v11: If-Modified-Since earlier than Last-Modified means the client's copy
+    is stale -> serve the full body (200 HIT), not 304."""
+    _, b0, _ = fetch_raw(ng.port, "/cond/cond-imsold")             # prime
+    s, b, h = fetch_raw(ng.port, "/cond/cond-imsold",
+                        headers={"If-Modified-Since":
+                                 "Tue, 20 Oct 2015 07:28:00 GMT"})
+    assert s == 200, f"IMS-before-LM should be 200, got {s}"
+    assert b == b0 and b, "full body expected when client copy is older"
+    assert h.get("x-cache") == "HIT"
+
+
+def test_conditional_inm_beats_ims(ng: Nginx) -> None:
+    """v11 / RFC 7232 precedence: when both are present, If-None-Match decides.
+    A matching INM yields 304 even though the IMS is older than Last-Modified."""
+    fetch_raw(ng.port, "/cond/cond-prec")                          # prime
+    s, b, _ = fetch_raw(ng.port, "/cond/cond-prec",
+                        headers={"If-None-Match": '"v11etag"',
+                                 "If-Modified-Since":
+                                 "Tue, 20 Oct 2015 07:28:00 GMT"})
+    assert s == 304 and b == "", \
+        f"INM match must win over older IMS (304 expected): {s} {b!r}"
 
 
 def test_purge_method(ng: Nginx) -> None:
@@ -2318,6 +2402,12 @@ def run_all(ng: Nginx, origin: Origin,
     test_cache_negative_404(ng)
     test_head_not_stored(ng)
     test_honor_cache_control(ng)
+    test_conditional_inm_304(ng, origin)
+    test_conditional_inm_star(ng)
+    test_conditional_inm_mismatch_full(ng)
+    test_conditional_ims_304(ng)
+    test_conditional_ims_old_full(ng)
+    test_conditional_inm_beats_ims(ng)
     test_purge_method(ng)
     test_bypass(ng)
     test_no_store(ng)
@@ -2448,7 +2538,10 @@ def main() -> int:
           "cacheability floor (Set-Cookie/CC-private/CC-no-store/Authorization "
           "not cached), default-key Host split, "
           "per-status caching (301/404 cached, HEAD not stored), "
-          "honor upstream Cache-Control, PURGE method, bypass + no_store, "
+          "honor upstream Cache-Control, "
+          "conditional 304 (v11: If-None-Match/*/mismatch, "
+          "If-Modified-Since fresh/stale, INM-beats-IMS precedence), "
+          "PURGE method, bypass + no_store, "
           "native-cache headers stripped, "
           "admin purge w/ body, "
           "concurrency (R1), prometheus metrics (incl L2 hit/miss), "

@@ -188,6 +188,16 @@ Hop-by-hop / framing headers (`Connection`, `Transfer-Encoding`,
 storing; nginx rebuilds them on the way out, so a cached response is still
 well-formed.
 
+### Conditional requests (`304 Not Modified`)
+
+If the origin gave the cached `200` an `ETag` or `Last-Modified`, the module
+answers conditional requests straight from cache — no body, no origin round
+trip. A `GET`/`HEAD` carrying `If-None-Match` (matched with the weak comparator,
+`*` matches any cached entry) or `If-Modified-Since` gets a `304 Not Modified`
+when the client's copy is still current; `If-None-Match` wins when both are
+present (RFC 7232). Anything else serves the full cached body. This is automatic
+— there is no directive to set.
+
 > ⚠️ The cache keys on the **request**, not on the response's `Vary`. If your
 > page differs by gzip-vs-brotli or mobile-vs-desktop, split the key yourself
 > with `cache_turbo_normalize_vary` (below) — otherwise the first variant stored
