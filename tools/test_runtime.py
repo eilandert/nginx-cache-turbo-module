@@ -112,6 +112,11 @@ class Origin:
         self.port = port
         self.delay = delay
         self.fail = False          # when True, every GET answers 503 (v8 SIE)
+        self.drop = False          # when True, every GET drops the connection
+                                   # with no response (transport-level failure:
+                                   # nginx sees a 502, a different error class
+                                   # than the clean 503 `fail` mode — Goal-2
+                                   # hard-dead-upstream coverage)
         self._n = 0
         self._paths: list[tuple[float, str]] = []   # DEBUG: (time, path) log
         self._lock = threading.Lock()
@@ -146,6 +151,14 @@ class Origin:
                     origin._paths.append((time.time(), self.path))
                     if len(origin._paths) > 64:        # ring: diagnostics only
                         del origin._paths[:-64]
+                # Hard upstream failure (Goal-2): drop the connection with no
+                # response so nginx's upstream sees a transport error (502),
+                # exercising a different error class than the clean 503 `fail`
+                # mode. The hit is already counted above (proves the bg refresh
+                # reached the origin); serving stale must not depend on it.
+                if origin.drop:
+                    self.close_connection = True
+                    return
                 # Origin failure injection (v8 stale-if-error): the hit is still
                 # counted (so a test can prove the refresh reached the origin),
                 # but the response is a 5xx the module must NOT cache or surface.
@@ -1163,10 +1176,17 @@ def test_header_fidelity(ng: Nginx) -> None:
 
 
 def test_max_size_not_cached(ng: Nginx) -> None:
-    """Responses larger than cache_turbo_max_size are never cached."""
+    """Responses larger than cache_turbo_max_size are never cached (Q2: the
+    body filter early-aborts capture the moment body_len crosses max_size, so
+    the oversize blob is delegated to a stacked native cache instead of being
+    fully copied into the request pool and discarded). Repeated reads must keep
+    reaching the origin (no stale cached copy) and never surface an error."""
     fetch(ng.port, "/big/x")
-    _, _, h = fetch(ng.port, "/big/x")
-    assert "x-cache" not in h, "oversized response should not be cached"
+    for _ in range(3):
+        s, b, h = fetch(ng.port, "/big/x")
+        assert s == 200, f"oversize delegate served {s}, expected live 200"
+        assert b, "oversize response lost its body"
+        assert "x-cache" not in h, "oversized response should not be cached"
 
 
 def test_no_cache_set_cookie(ng: Nginx) -> None:
@@ -1489,6 +1509,41 @@ def test_stale_if_error(ng: Nginx, origin: Origin) -> None:
             "no background refresh reached the origin during the stale window"
     finally:
         origin.fail = False
+        drain_origin(origin)   # settle the failing bg refreshes before next test
+
+
+def test_stale_serves_stale_origin_hard_dead(ng: Nginx, origin: Origin) -> None:
+    """Goal-2: serve-stale-on-dead-upstream. Within the stale window a read is
+    answered from shm WITHOUT contacting the origin, so a hard upstream failure
+    (connection dropped, not a clean 503) still yields a stale 200 — the error
+    is never surfaced. This is the transport-level (502) counterpart to
+    test_stale_if_error's clean-5xx case, and exercises the bg-refresh path
+    against an origin that resets the connection.
+
+    Boundary (intentional, RFC-5861 extension out of v8 scope): this holds for
+    the SWR window with background_update on (the default). A key already past
+    its stale_until, a cold key, or background_update=off all surface the live
+    origin error by design — the module does not serve expired/never-cached
+    content on error."""
+    s0, b0, _ = fetch(ng.port, "/sie/x2")          # prime: 200, cached fresh
+    assert s0 == 200 and b0, f"prime failed: {s0} {b0!r}"
+    base = origin.hits
+    time.sleep(2.3)                                # past fresh (2s), inside the
+                                                   # stale window (×4 = 8s)
+    origin.drop = True
+    try:
+        for _ in range(8):
+            s, b, h = fetch(ng.port, "/sie/x2")
+            assert s == 200, f"hard-dead origin served {s}, expected stale 200"
+            assert b == b0, f"served {b!r}, expected stale {b0!r}"
+            assert h.get("x-cache") == "STALE", \
+                f"expected STALE serve, got x-cache={h.get('x-cache')}"
+            time.sleep(0.1)
+        # the background refresh did reach the dropped-connection origin
+        assert origin.hits > base, \
+            "no background refresh reached the origin during the stale window"
+    finally:
+        origin.drop = False
         drain_origin(origin)   # settle the failing bg refreshes before next test
 
 
@@ -2922,6 +2977,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_min_uses(ng, origin)
     test_min_uses_off_by_default(ng)
     test_stale_if_error(ng, origin)
+    test_stale_serves_stale_origin_hard_dead(ng, origin)
     test_background_update_off_regenerates_inline(ng, origin)
     test_normalize_arg_order(ng, origin)
     test_normalize_strips_tracking(ng, origin)

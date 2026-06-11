@@ -1685,6 +1685,27 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
             ll = &ncl->next;
 
             ctx->body_len += n;
+
+            /* Q2: oversize early-abort. Once the captured body crosses
+             * max_size we know we will never store this response (the store
+             * gate below refuses it), so stop copying the rest of the blob
+             * into the request pool just to discard it at last_buf. Drop the
+             * partial capture, mark the request non-capturing for the rest of
+             * the body, and forward downstream untouched. A stacked native
+             * proxy_cache (README pattern B) keeps the object on disk;
+             * cache-turbo delegates oversize media with ~zero shm/pool
+             * overhead instead of a full memcpy-then-discard every request.
+             * Any cold-miss stub is cleared by the pool-cleanup backstop at
+             * request end (same as the non-cacheable path). */
+            if (clcf->max_size > 0 && ctx->body_len > clcf->max_size) {
+                ctx->captured = 0;
+                ctx->body = NULL;
+                ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                               "cache_turbo: oversize capture aborted \"%V\" "
+                               "body>%uz -> delegate to native",
+                               &r->uri, clcf->max_size);
+                return ngx_http_next_body_filter(r, in);
+            }
         }
 
         if (b->last_buf || b->last_in_chain) {
