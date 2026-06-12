@@ -34,7 +34,13 @@ fi
 # sync with the module's yield points (L2 vtable ->get/->lock park; serve and
 # warm_one drive the output filter / a subrequest; run_phases / posted_requests
 # / finalize re-enter the engine; add_timer defers; NGX_AGAIN returns parked).
-forbidden='ngx_http_output_filter|ngx_http_finalize_request|ngx_http_core_run_phases|ngx_http_run_posted_requests|ngx_http_subrequest|ngx_add_timer|ngx_http_cache_turbo_serve|ngx_http_cache_turbo_warm_one|ngx_http_cache_turbo_cold_wait|return[[:space:]]+NGX_AGAIN|->[[:space:]]*get[[:space:]]*\(|->[[:space:]]*lock[[:space:]]*\('
+# NOTE: paren matched with the bracket expression [(] rather than \( on
+# purpose. This string is handed to awk via -v, and awk's -v assignment runs
+# backslash-escape processing on the value, which strips the \ from \( and
+# leaves a bare ( -> "fatal: invalid regexp: Unmatched (" on gawk (mawk was
+# lenient, which is why CI caught this and a local mawk run did not). [(]
+# carries no backslash, so it survives -v unchanged on every awk.
+forbidden='ngx_http_output_filter|ngx_http_finalize_request|ngx_http_core_run_phases|ngx_http_run_posted_requests|ngx_http_subrequest|ngx_add_timer|ngx_http_cache_turbo_serve|ngx_http_cache_turbo_warm_one|ngx_http_cache_turbo_cold_wait|return[[:space:]]+NGX_AGAIN|->[[:space:]]*get[[:space:]]*[(]|->[[:space:]]*lock[[:space:]]*[(]'
 
 status=0
 
