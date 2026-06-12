@@ -250,6 +250,11 @@ class Origin:
                 if "ccmaxage0" in self.path:
                     # max-age=0 = already stale: a shared cache must not store it.
                     self.send_header("Cache-Control", "max-age=0")
+                if "swrdur" in self.path:
+                    # RFC-2: response stale-while-revalidate=10 extends the stale
+                    # window well past the cache_turbo_stale_mult default.
+                    self.send_header("Cache-Control",
+                                     "stale-while-revalidate=10")
                 if "cond" in self.path:
                     # v11 conditional-304: stable validators so a stored entry
                     # can answer If-None-Match / If-Modified-Since from cache.
@@ -655,6 +660,17 @@ http {{
         # STALE entry. beta 1 ~ never rolls a refresh, so the read is a
         # deterministic STALE serve - and a 304 must NOT be answered from it.
         location /condst/ {{
+            cache_turbo       main;
+            cache_turbo_key   $uri;
+            cache_turbo_valid 1s;
+            cache_turbo_beta  1;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # RFC-2: fresh 1s; default stale window would be 3s (stale_mult 4 ->
+        # expire at 4s), but the origin's stale-while-revalidate=10 extends it,
+        # so the entry is still STALE-serveable at 5s. beta 1 ~ no refresh.
+        location /swrdur/ {{
             cache_turbo       main;
             cache_turbo_key   $uri;
             cache_turbo_valid 1s;
@@ -2336,6 +2352,73 @@ def test_rfc1_request_max_age_zero_revalidates(ng: Nginx, origin: Origin) -> Non
     assert s == 200, f"max-age=0 should still serve 200: {s}"
     assert "x-cache" not in h, "max-age=0 must revalidate at origin, not HIT"
     assert origin.hits == before + 1, "max-age=0 must reach the origin"
+
+
+def test_rfc1_request_max_age_n(ng: Nginx, origin: Origin) -> None:
+    """RFC-1 (§5.2.1.1): request max-age=N rejects an entry older than N seconds
+    (revalidate at origin); a generous N still HITs the same entry."""
+    fetch_raw(ng.port, "/cond/man")                                # prime
+    time.sleep(2.2)
+    before = origin.hits
+    s0, _, h0 = fetch_raw(ng.port, "/cond/man",
+                          headers={"Cache-Control": "max-age=30"})
+    assert h0.get("x-cache") == "HIT" and origin.hits == before, \
+        f"max-age=30 on a ~2s entry should HIT: {h0}"
+    s1, _, h1 = fetch_raw(ng.port, "/cond/man",
+                          headers={"Cache-Control": "max-age=1"})
+    assert s1 == 200 and "x-cache" not in h1, \
+        f"max-age=1 on a ~2s entry must revalidate at origin: {h1}"
+    assert origin.hits == before + 1, "tight max-age must reach the origin"
+
+
+def test_rfc1_request_min_fresh(ng: Nginx, origin: Origin) -> None:
+    """RFC-1 (§5.2.1.3): request min-fresh=N rejects an entry that will not stay
+    fresh for at least N more seconds."""
+    fetch_raw(ng.port, "/cond/mf")                                 # prime, fresh 30s
+    before = origin.hits
+    s0, _, h0 = fetch_raw(ng.port, "/cond/mf",
+                          headers={"Cache-Control": "min-fresh=5"})
+    assert h0.get("x-cache") == "HIT" and origin.hits == before, \
+        f"min-fresh=5 with ~30s left should HIT: {h0}"
+    s1, _, h1 = fetch_raw(ng.port, "/cond/mf",
+                          headers={"Cache-Control": "min-fresh=600"})
+    assert s1 == 200 and "x-cache" not in h1, \
+        f"min-fresh=600 with ~30s left must revalidate: {h1}"
+    assert origin.hits == before + 1, "unmet min-fresh must reach the origin"
+
+
+def test_rfc1_request_max_stale(ng: Nginx, origin: Origin) -> None:
+    """RFC-1 (§5.2.1.2): on a stale entry, a client sending max-age WITHOUT
+    max-stale gets a revalidation; adding max-stale re-permits the stale serve."""
+    fetch_raw(ng.port, "/condst/cond-ms")                          # prime, fresh 1s
+    time.sleep(1.5)                                                # now stale
+    before = origin.hits
+    # max-stale present -> accept the stale copy (beta 1, no refresh)
+    s0, b0, h0 = fetch_raw(ng.port, "/condst/cond-ms",
+                           headers={"Cache-Control": "max-age=1, max-stale=30"})
+    assert s0 == 200 and b0 and h0.get("x-cache") == "STALE", \
+        f"max-stale must permit the stale serve: {s0} {h0}"
+    assert origin.hits == before, "max-stale stale serve must not hit origin"
+    # same tight max-age but NO max-stale -> no stale tolerance -> revalidate
+    s1, _, h1 = fetch_raw(ng.port, "/condst/cond-ms",
+                          headers={"Cache-Control": "max-age=1"})
+    assert s1 == 200 and "x-cache" not in h1, \
+        f"max-age without max-stale must revalidate a stale entry: {h1}"
+    assert origin.hits == before + 1, "no-max-stale revalidation must hit origin"
+
+
+def test_rfc2_swr_duration_extends_stale(ng: Nginx, origin: Origin) -> None:
+    """RFC-2: a response stale-while-revalidate=10 extends the stale window past
+    the cache_turbo_stale_mult default (which would expire the 1s entry at ~4s),
+    so the copy is still STALE-serveable at ~5s."""
+    fetch_raw(ng.port, "/swrdur/swrdur-x")                         # prime, fresh 1s
+    time.sleep(5)                                                  # > default 4s window
+    before = origin.hits
+    s, b, h = fetch_raw(ng.port, "/swrdur/swrdur-x")
+    assert s == 200 and b, f"SWR-extended entry should still serve: {s}"
+    assert h.get("x-cache") == "STALE", \
+        f"stale-while-revalidate must keep it serveable past the default: {h}"
+    assert origin.hits == before, "SWR stale serve (beta 1) must not hit origin"
 
 
 def test_purge_method(ng: Nginx) -> None:
@@ -4225,6 +4308,10 @@ def run_all(ng: Nginx, origin: Origin,
     test_rfc1_only_if_cached_hit(ng, origin)
     test_rfc1_request_no_store(ng, origin)
     test_rfc1_request_max_age_zero_revalidates(ng, origin)
+    test_rfc1_request_max_age_n(ng, origin)
+    test_rfc1_request_min_fresh(ng, origin)
+    test_rfc1_request_max_stale(ng, origin)
+    test_rfc2_swr_duration_extends_stale(ng, origin)
     test_purge_method(ng)
     test_cor5_l1only_variant_purge(ng, origin)
     test_cache_and_purge_respect_access_control(ng)

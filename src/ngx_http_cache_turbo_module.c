@@ -936,6 +936,28 @@ ngx_http_cache_turbo_response_must_revalidate(ngx_http_request_t *r)
 
 
 /*
+ * RFC 5861 §3 / RFC 9111: response Cache-Control: stale-while-revalidate=N — the
+ * origin tells the cache how long past freshness it may serve a stale copy while
+ * a refresh runs. Returns N (>=0) or -1 when absent / no numeric value. Honoured
+ * at store by sizing the stale window to N instead of the cache_turbo_stale_mult
+ * default (RFC-2). Walks the (small) response header list once on the store path.
+ */
+static time_t
+ngx_http_cache_turbo_response_swr(ngx_http_request_t *r)
+{
+    ngx_str_t  cc;
+
+    cc = ngx_http_cache_turbo_header_find(&r->headers_out.headers,
+             "Cache-Control", sizeof("Cache-Control") - 1);
+    if (cc.data == NULL) {
+        return -1;
+    }
+    return ngx_http_cache_turbo_cc_delta(cc.data, cc.data + cc.len,
+               "stale-while-revalidate", sizeof("stale-while-revalidate") - 1);
+}
+
+
+/*
  * RFC 9111 §5.2.1.4 / §5.2.1.1: a request Cache-Control: no-cache (or the
  * legacy Pragma: no-cache), or a request max-age=0, means "do not reuse a
  * stored response without successful validation". max-age=0 is what browsers
@@ -1008,6 +1030,102 @@ ngx_http_cache_turbo_request_no_store(ngx_http_request_t *r)
     return (cc.data != NULL
             && ngx_http_cache_turbo_cc_has(cc.data, cc.data + cc.len,
                    "no-store", sizeof("no-store") - 1)) ? 1 : 0;
+}
+
+
+/*
+ * RFC 9111 §5.2.1: parse the request freshness bounds once into the ctx.
+ *   max-age=N   (§5.2.1.1) the client won't accept a response older than N.
+ *   min-fresh=N (§5.2.1.3) it must stay fresh for at least N more seconds.
+ *   max-stale[=N] (§5.2.1.2) it WILL accept a stale response, up to N seconds
+ *                 past expiry (bare = any staleness).
+ * Sentinels: -1 = absent. max-stale presence/bare tracked by the two bits.
+ */
+static void
+ngx_http_cache_turbo_request_freshness_bounds(ngx_http_request_t *r,
+    ngx_http_cache_turbo_ctx_t *ctx)
+{
+    ngx_str_t  cc;
+    u_char    *v, *e, *q;
+    size_t     vlen;
+
+    ctx->req_max_age = -1;
+    ctx->req_min_fresh = -1;
+    ctx->req_max_stale = -1;
+
+    cc = ngx_http_cache_turbo_header_find(&r->headers_in.headers,
+             "Cache-Control", sizeof("Cache-Control") - 1);
+    if (cc.data == NULL) {
+        return;
+    }
+    v = cc.data;
+    e = cc.data + cc.len;
+
+    ctx->req_max_age = ngx_http_cache_turbo_cc_delta(v, e, "max-age",
+                           sizeof("max-age") - 1);
+    ctx->req_min_fresh = ngx_http_cache_turbo_cc_delta(v, e, "min-fresh",
+                             sizeof("min-fresh") - 1);
+
+    q = ngx_http_cache_turbo_cc_token(v, e, "max-stale",
+            sizeof("max-stale") - 1, &vlen);
+    if (q != NULL) {
+        ctx->req_max_stale_set = 1;
+        if (vlen == 0) {
+            ctx->req_max_stale_any = 1;          /* bare: accept any staleness */
+        } else {
+            time_t  d = ngx_http_cache_turbo_cc_delta(v, e, "max-stale",
+                            sizeof("max-stale") - 1);
+            if (d >= 0) {
+                ctx->req_max_stale = d;
+            } else {
+                ctx->req_max_stale_any = 1;      /* unparseable value: be lenient */
+            }
+        }
+    }
+}
+
+
+/*
+ * RFC-1 serve verdict for an EXISTING entry vs the request freshness bounds.
+ * fresh_ok: a fresh entry (now < fresh_until) is acceptable to this client.
+ * stale_ok: a stale entry (within the serveable window) may be served.
+ * `created` is read from the blob header so age is exact. The default (client
+ * sent none of these directives) preserves the pre-RFC-1 behaviour: fresh hits
+ * serve, stale hits serve (a cache MAY serve stale by its own policy). A client
+ * that sends max-age/min-fresh (wants fresh) but NO max-stale gets no stale
+ * tolerance; max-stale explicitly re-permits (and loosens) stale serving.
+ */
+static void
+ngx_http_cache_turbo_req_serve_verdict(ngx_http_cache_turbo_ctx_t *ctx,
+    time_t created, time_t now, time_t fresh_until,
+    ngx_int_t *fresh_ok, ngx_int_t *stale_ok)
+{
+    time_t  age = now - created;
+
+    if (age < 0) {
+        age = 0;
+    }
+
+    *fresh_ok = 1;
+    if (ctx->req_max_age >= 0 && age > ctx->req_max_age) {
+        *fresh_ok = 0;
+    }
+    if (ctx->req_min_fresh >= 0 && (fresh_until - now) < ctx->req_min_fresh) {
+        *fresh_ok = 0;
+    }
+
+    if (ctx->req_max_stale_set) {
+        time_t  staleness = now - fresh_until;
+        if (staleness < 0) {
+            staleness = 0;
+        }
+        *stale_ok = (ctx->req_max_stale_any || staleness <= ctx->req_max_stale)
+                    ? 1 : 0;
+    } else if (ctx->req_max_age >= 0 || ctx->req_min_fresh >= 0) {
+        *stale_ok = 0;          /* client asked for fresh, no stale tolerance */
+    } else {
+        *stale_ok = 1;          /* default: serve stale per cache policy */
+    }
 }
 
 
@@ -1402,6 +1520,7 @@ ngx_http_cache_turbo_access_prologue(ngx_http_request_t *r,
      * vetoes capture in the header filter. */
     ctx->req_only_if_cached = ngx_http_cache_turbo_request_only_if_cached(r);
     ctx->req_no_store = ngx_http_cache_turbo_request_no_store(r);
+    ngx_http_cache_turbo_request_freshness_bounds(r, ctx);
 
     /* Request Cache-Control: no-cache / Pragma: no-cache / max-age=0 (RFC 9111
      * §5.2.1.1/§5.2.1.4): do not reuse a stored response without validation.
@@ -1492,8 +1611,39 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
         time_t     stale_until = ctn->stale_until;
         time_t     stale_window;
         ngx_int_t  refresh;
+        ngx_int_t  fresh_ok = 1, stale_ok = 1;
 
-        if (now < fresh_until) {
+        /* RFC-1 request freshness bounds (max-age / min-fresh / max-stale): an
+         * existing entry may be unacceptable to THIS client even when the cache
+         * would serve it. Read the blob's created stamp (offset 24) for an exact
+         * age; the verdict gates the two serve blocks below. When a serveable
+         * entry is blocked by the bounds, req_reval makes this a revalidation:
+         * the cold-miss CLAIM_FRESH path must not re-serve the raced-in fresh
+         * entry, and only-if-cached still 504s at the post-L2 chokepoint. */
+        if (ctn->len > 0) {
+            /* len > 0 implies data != NULL (a real entry always has both; a
+             * stub/counter node is len == 0) — the serve blocks below already
+             * rely on this when they memcpy ctn->data. */
+            time_t  created = (time_t)
+                ngx_http_cache_turbo_get_u64(ctn->data + 24);
+            ngx_int_t  in_window = (now < fresh_until)
+                || (stale_until == 0 || now < stale_until);
+
+            ngx_http_cache_turbo_req_serve_verdict(ctx, created, now,
+                fresh_until, &fresh_ok, &stale_ok);
+
+            if (in_window
+                && !((now < fresh_until) && fresh_ok)
+                && !(((stale_until == 0) || now < stale_until) && stale_ok))
+            {
+                ctx->req_reval = 1;
+                ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                    "cache_turbo: entry fails request freshness bounds "
+                    "\"%V\" -> revalidate", &r->uri);
+            }
+        }
+
+        if (now < fresh_until && fresh_ok) {
             /* fresh hit: copy out of shm under lock, send after unlocking */
             u_char *snap = ngx_pnalloc(r->pool, ctn->len);
             size_t  snap_len = ctn->len;
@@ -1515,7 +1665,7 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
             return ngx_http_cache_turbo_serve(r, snap, snap_len, 0);
         }
 
-        if ((stale_until == 0 || now < stale_until) && ctn->len > 0) {
+        if ((stale_until == 0 || now < stale_until) && ctn->len > 0 && stale_ok) {
             /* stale-but-serveable. The `len > 0` guard skips a cold-miss
              * single-flight STUB (v10: data == NULL, len == 0, stale_until == 0)
              * — a stub is an in-flight marker, never serveable; it falls through
@@ -1735,19 +1885,39 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
                                "cache_turbo: L2 blob expired \"%V\" key=%ui "
                                "-> origin", &r->uri, (ngx_uint_t) hash);
             } else {
-                /* The blob passed full validation above, so the slot we put in
-                 * L1 is guaranteed serveable (no poisoned L1 node). */
-                (void) clcf->l1->store(z, ctx->key_hash, hash,
-                           ctx->l2_blob, ctx->l2_blob_len,
-                           rem_fresh, rem_stale);
-                (void) ngx_atomic_fetch_add(&z->sh->hits, 1);
-                (void) ngx_atomic_fetch_add(&z->sh->l2_hits, 1);
-                ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                               "cache_turbo: L2 HIT \"%V\" key=%ui len=%uz "
-                               "(filled L1)", &r->uri, (ngx_uint_t) hash,
-                               ctx->l2_blob_len);
-                return ngx_http_cache_turbo_serve(r, ctx->l2_blob,
-                           ctx->l2_blob_len, rem_fresh <= 0 ? 1 : 0);
+                /* RFC-1: the L2 copy must also satisfy the request freshness
+                 * bounds. An L2 entry can be younger than the L1 one (a peer
+                 * refreshed it), so evaluate it on its own age, not the L1
+                 * verdict. If it fails, revalidate at origin instead of serving
+                 * the rejected copy (req_reval blocks the cold-claim re-serve). */
+                ngx_int_t  l2_fresh_ok = 1, l2_stale_ok = 1;
+
+                ngx_http_cache_turbo_req_serve_verdict(ctx, (time_t) bh.created,
+                    ngx_time(), (time_t) bh.created + (time_t) bh.fresh_ttl,
+                    &l2_fresh_ok, &l2_stale_ok);
+
+                if ((rem_fresh > 0 && !l2_fresh_ok)
+                    || (rem_fresh <= 0 && !l2_stale_ok))
+                {
+                    ctx->req_reval = 1;
+                    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                        "cache_turbo: L2 blob fails request freshness bounds "
+                        "\"%V\" key=%ui -> origin", &r->uri, (ngx_uint_t) hash);
+                } else {
+                    /* The blob passed full validation above, so the slot we put
+                     * in L1 is guaranteed serveable (no poisoned L1 node). */
+                    (void) clcf->l1->store(z, ctx->key_hash, hash,
+                               ctx->l2_blob, ctx->l2_blob_len,
+                               rem_fresh, rem_stale);
+                    (void) ngx_atomic_fetch_add(&z->sh->hits, 1);
+                    (void) ngx_atomic_fetch_add(&z->sh->l2_hits, 1);
+                    ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                                   "cache_turbo: L2 HIT \"%V\" key=%ui len=%uz "
+                                   "(filled L1)", &r->uri, (ngx_uint_t) hash,
+                                   ctx->l2_blob_len);
+                    return ngx_http_cache_turbo_serve(r, ctx->l2_blob,
+                               ctx->l2_blob_len, rem_fresh <= 0 ? 1 : 0);
+                }
             }
         }
         /* corrupt/short/expired blob: treat as a miss, fall through to origin */
@@ -1848,8 +2018,13 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
 
             ngx_shmtx_lock(&z->shpool->mutex);
             fresh = clcf->l1->lookup(z, ctx->key_hash, hash);
+            /* RFC-1: do NOT re-serve the raced-in fresh entry when this request
+             * is a revalidation forced by its own freshness bounds (max-age /
+             * min-fresh) — that entry is exactly what the client rejected. Fall
+             * through to the origin instead. */
             if (fresh != NULL && fresh->len > 0
-                && ngx_time() < fresh->fresh_until)
+                && ngx_time() < fresh->fresh_until
+                && !ctx->req_reval)
             {
                 snap_len = fresh->len;
                 snap = ngx_pnalloc(r->pool, snap_len);
@@ -2708,6 +2883,24 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
         /* Absolute serveable window (fresh + stale) from now, reused by the blob
          * metadata, the L1 store, and the L2 EXPIRE so all three agree. */
         stale_window = ngx_http_cache_turbo_stale_ttl(ttl, clcf->stale_mult);
+
+        /* RFC 5861 / RFC-2: a response stale-while-revalidate=N sets the stale
+         * window explicitly (fresh + N), overriding the cache_turbo_stale_mult
+         * default. The existing SWR machinery (background_update) then serves
+         * stale + refreshes within it. must-revalidate below still wins (it
+         * collapses the window). Only meaningful for a finite TTL. */
+        if (ttl > 0) {
+            time_t  swr = ngx_http_cache_turbo_response_swr(r);
+            if (swr >= 0) {
+                stale_window = ttl + swr;
+                if (stale_window > NGX_HTTP_CACHE_TURBO_TTL_MAX) {
+                    stale_window = NGX_HTTP_CACHE_TURBO_TTL_MAX;
+                }
+                ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                               "cache_turbo: stale-while-revalidate=%T \"%V\"",
+                               swr, &r->uri);
+            }
+        }
 
         /* RFC 9111 must-revalidate / proxy-revalidate: once stale, the response
          * must NOT be served without revalidation. We have no validation channel
