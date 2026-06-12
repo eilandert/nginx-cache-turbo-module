@@ -368,13 +368,253 @@ ngx_module_t  ngx_http_cache_turbo_module = {
 };
 
 
+/* ------------------------------------------------------------------------- *
+ * SEC-2: 256-bit content digest.
+ *
+ * The cache key hash is a 32-byte slot (the redis key is hex(slot[32]) = 64
+ * chars). MD5 alone filled only the low 16 bytes (the high 16 stayed zero) =>
+ * a 128-bit identity with no second-preimage/collision margin beyond MD5's
+ * (broken) one. We now fill the whole slot with a real 256-bit digest:
+ *
+ *   - SHA-256 when built with SSL (libcrypto is linked — the shipped build uses
+ *     --with-http_ssl_module). EVP one-shot/streaming API (not the deprecated
+ *     SHA256_* low-level calls, which warn under -Werror on OpenSSL 3).
+ *   - a double independent MD5 fold otherwise, so a no-SSL build still fills the
+ *     full 32-byte slot with no OpenSSL dependency: low 16 = MD5(data),
+ *     high 16 = MD5(domain-tag . data). Weaker than true SHA-256 but strictly
+ *     wider than the old single-MD5-with-zero-pad.
+ *
+ * Either way the on-wire key is hex(slot[32]); the digest choice only changes
+ * which bytes, so the keyspace turnover self-heals (old keys just miss). All
+ * key-derivation sites (build_key, the variant/marker hashes, the admin
+ * ?key= purge) MUST go through this one helper so they agree.
+ * ------------------------------------------------------------------------- */
+
+typedef struct {
+#if (NGX_SSL)
+    EVP_MD_CTX  *md;
+    ngx_int_t    ok;
+#else
+    ngx_md5_t    lo;
+    ngx_md5_t    hi;
+#endif
+} ngx_http_cache_turbo_digest_t;
+
+
+static void
+ngx_http_cache_turbo_digest_init(ngx_http_cache_turbo_digest_t *d)
+{
+#if (NGX_SSL)
+    d->md = EVP_MD_CTX_new();
+    d->ok = (d->md != NULL
+             && EVP_DigestInit_ex(d->md, EVP_sha256(), NULL) == 1) ? 1 : 0;
+#else
+    static const u_char  tag[] = "ngx_http_cache_turbo\x1Fhi";
+
+    ngx_md5_init(&d->lo);
+    ngx_md5_init(&d->hi);
+    ngx_md5_update(&d->hi, tag, sizeof(tag) - 1);
+#endif
+}
+
+
+static void
+ngx_http_cache_turbo_digest_update(ngx_http_cache_turbo_digest_t *d,
+    const void *data, size_t len)
+{
+#if (NGX_SSL)
+    if (d->ok) {
+        (void) EVP_DigestUpdate(d->md, data, len);
+    }
+#else
+    ngx_md5_update(&d->lo, data, len);
+    ngx_md5_update(&d->hi, data, len);
+#endif
+}
+
+
+/* Finalise into the 32-byte slot. */
+static void
+ngx_http_cache_turbo_digest_final(ngx_http_cache_turbo_digest_t *d,
+    u_char out[32])
+{
+#if (NGX_SSL)
+    unsigned int  n = 0;
+
+    if (d->ok && EVP_DigestFinal_ex(d->md, out, &n) == 1 && n == 32) {
+        /* ok */
+    } else {
+        /* EVP_MD_CTX alloc/finalise failure (OOM) — degrade to a fixed slot
+         * rather than read uninitialised bytes. Practically unreachable. */
+        ngx_memzero(out, 32);
+    }
+    if (d->md != NULL) {
+        EVP_MD_CTX_free(d->md);
+        d->md = NULL;
+    }
+#else
+    ngx_md5_final(out, &d->lo);          /* low 16 */
+    ngx_md5_final(out + 16, &d->hi);     /* high 16 */
+#endif
+}
+
+
+/* One-shot convenience for a single contiguous input. */
+static void
+ngx_http_cache_turbo_digest(const void *data, size_t len, u_char out[32])
+{
+    ngx_http_cache_turbo_digest_t  d;
+
+    ngx_http_cache_turbo_digest_init(&d);
+    ngx_http_cache_turbo_digest_update(&d, data, len);
+    ngx_http_cache_turbo_digest_final(&d, out);
+}
+
+
+/* ------------------------------------------------------------------------- *
+ * STAB-4: fixed little-endian, padding-free blob wire header (40 bytes).
+ * Written/read only through these helpers so the on-disk format is independent
+ * of struct padding and host endianness. See the layout comment on
+ * ngx_http_cache_turbo_blob_hdr_t in the header.
+ * ------------------------------------------------------------------------- */
+
+static ngx_inline void
+ngx_http_cache_turbo_put_u16(u_char *p, uint16_t v)
+{
+    p[0] = (u_char) (v & 0xff);
+    p[1] = (u_char) ((v >> 8) & 0xff);
+}
+
+static ngx_inline void
+ngx_http_cache_turbo_put_u32(u_char *p, uint32_t v)
+{
+    p[0] = (u_char) (v & 0xff);
+    p[1] = (u_char) ((v >> 8) & 0xff);
+    p[2] = (u_char) ((v >> 16) & 0xff);
+    p[3] = (u_char) ((v >> 24) & 0xff);
+}
+
+static ngx_inline void
+ngx_http_cache_turbo_put_u64(u_char *p, uint64_t v)
+{
+    ngx_http_cache_turbo_put_u32(p, (uint32_t) (v & 0xffffffffULL));
+    ngx_http_cache_turbo_put_u32(p + 4, (uint32_t) ((v >> 32) & 0xffffffffULL));
+}
+
+static ngx_inline uint16_t
+ngx_http_cache_turbo_get_u16(const u_char *p)
+{
+    return (uint16_t) (p[0] | ((uint16_t) p[1] << 8));
+}
+
+static ngx_inline uint32_t
+ngx_http_cache_turbo_get_u32(const u_char *p)
+{
+    return (uint32_t) p[0]
+         | ((uint32_t) p[1] << 8)
+         | ((uint32_t) p[2] << 16)
+         | ((uint32_t) p[3] << 24);
+}
+
+static ngx_inline uint64_t
+ngx_http_cache_turbo_get_u64(const u_char *p)
+{
+    return (uint64_t) ngx_http_cache_turbo_get_u32(p)
+         | ((uint64_t) ngx_http_cache_turbo_get_u32(p + 4) << 32);
+}
+
+
+/* Serialise the parsed header into NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE bytes. */
+static void
+ngx_http_cache_turbo_blob_hdr_write(u_char *dst,
+    const ngx_http_cache_turbo_blob_hdr_t *h)
+{
+    ngx_http_cache_turbo_put_u32(dst + 0,  NGX_HTTP_CACHE_TURBO_BLOB_MAGIC);
+    ngx_http_cache_turbo_put_u16(dst + 4,  NGX_HTTP_CACHE_TURBO_BLOB_VERSION);
+    ngx_http_cache_turbo_put_u16(dst + 6,  0);            /* flags reserved */
+    ngx_http_cache_turbo_put_u32(dst + 8,  h->status);
+    ngx_http_cache_turbo_put_u32(dst + 12, h->nheaders);
+    ngx_http_cache_turbo_put_u32(dst + 16, h->headers_len);
+    ngx_http_cache_turbo_put_u32(dst + 20, h->body_len);
+    ngx_http_cache_turbo_put_u64(dst + 24, (uint64_t) h->created);
+    ngx_http_cache_turbo_put_u32(dst + 32, h->fresh_ttl);
+    ngx_http_cache_turbo_put_u32(dst + 36, h->stale_ttl);
+}
+
+
+/*
+ * Parse AND fully validate a stored blob in one place (STAB-4). On NGX_OK *out
+ * holds the parsed header and (when non-NULL) *hdr_block / *body point at the
+ * interior header block and body. Validates: minimum length, magic, version,
+ * that the header block and body fit inside the buffer, AND that every TLV
+ * header entry lies within the header block (a full walk). Doing the walk here
+ * lets the L2-fill path reject a malformed blob BEFORE inserting it into L1 —
+ * the old code stored first and only failed later in serve(), poisoning the L1
+ * slot with a node that could never be served.
+ */
+static ngx_int_t
+ngx_http_cache_turbo_blob_validate(const u_char *blob, size_t len,
+    ngx_http_cache_turbo_blob_hdr_t *out, const u_char **hdr_block,
+    const u_char **body)
+{
+    const u_char  *p, *end;
+    uint32_t       i;
+
+    if (len < NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE) {
+        return NGX_ERROR;
+    }
+    if (ngx_http_cache_turbo_get_u32(blob) != NGX_HTTP_CACHE_TURBO_BLOB_MAGIC
+        || ngx_http_cache_turbo_get_u16(blob + 4)
+               != NGX_HTTP_CACHE_TURBO_BLOB_VERSION)
+    {
+        return NGX_ERROR;
+    }
+
+    out->magic       = NGX_HTTP_CACHE_TURBO_BLOB_MAGIC;
+    out->version     = NGX_HTTP_CACHE_TURBO_BLOB_VERSION;
+    out->status      = ngx_http_cache_turbo_get_u32(blob + 8);
+    out->nheaders    = ngx_http_cache_turbo_get_u32(blob + 12);
+    out->headers_len = ngx_http_cache_turbo_get_u32(blob + 16);
+    out->body_len    = ngx_http_cache_turbo_get_u32(blob + 20);
+    out->created     = (int64_t) ngx_http_cache_turbo_get_u64(blob + 24);
+    out->fresh_ttl   = ngx_http_cache_turbo_get_u32(blob + 32);
+    out->stale_ttl   = ngx_http_cache_turbo_get_u32(blob + 36);
+
+    /* header block + body must fit (subtract on the remaining len — no overflow) */
+    if (out->headers_len > len - NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE
+        || out->body_len
+               > len - NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE - out->headers_len)
+    {
+        return NGX_ERROR;
+    }
+
+    p   = blob + NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE;
+    end = p + out->headers_len;
+
+    for (i = 0; i < out->nheaders; i++) {
+        uint32_t  nl, vl;
+
+        if ((size_t) (end - p) < 4) { return NGX_ERROR; }
+        nl = ngx_http_cache_turbo_get_u32(p); p += 4;
+        if ((size_t) (end - p) < nl) { return NGX_ERROR; }
+        p += nl;
+        if ((size_t) (end - p) < 4) { return NGX_ERROR; }
+        vl = ngx_http_cache_turbo_get_u32(p); p += 4;
+        if ((size_t) (end - p) < vl) { return NGX_ERROR; }
+        p += vl;
+    }
+
+    if (hdr_block) { *hdr_block = blob + NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE; }
+    if (body)      { *body = end; }
+    return NGX_OK;
+}
+
+
 /* Build the cache key string and its hash into the request ctx. */
 static ngx_int_t
 ngx_http_cache_turbo_build_key(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf, ngx_http_cache_turbo_ctx_t *ctx)
 {
-    ngx_md5_t  md5;
-
     if (clcf->key) {
         if (ngx_http_complex_value(r, clcf->key, &ctx->cache_key) != NGX_OK) {
             return NGX_ERROR;
@@ -401,14 +641,14 @@ ngx_http_cache_turbo_build_key(ngx_http_request_t *r,
     }
 
     /*
-     * key_hash is a 32-byte slot; MD5 fills the low 16 and the high 16 stay
-     * zero (ctx is pcalloc'd). The collision guard is therefore effectively
-     * 128-bit — ample for cache keying, and the redis hex key/lockkey encode
-     * the full 32-byte slot so the on-wire layout is stable.
+     * key_hash is a 32-byte slot filled with a 256-bit digest (SEC-2): the
+     * redis hex key/lockkey encode the full slot, so the on-wire layout is
+     * stable and the whole 256 bits are the collision guard (was MD5 in the low
+     * 16 with the high 16 zeroed = effectively 128-bit). ctx is pcalloc'd, but
+     * the digest fills all 32 bytes regardless.
      */
-    ngx_md5_init(&md5);
-    ngx_md5_update(&md5, ctx->cache_key.data, ctx->cache_key.len);
-    ngx_md5_final(ctx->key_hash, &md5);
+    ngx_http_cache_turbo_digest(ctx->cache_key.data, ctx->cache_key.len,
+                                ctx->key_hash);
 
     return NGX_OK;
 }
@@ -1318,45 +1558,46 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
     }
 
     if (ctx->l2_done && ctx->l2_result == NGX_OK && ctx->l2_blob) {
-        /* L2 hit: validate the blob, populate L1 so later reads hit shm,
-         * then serve it as a normal HIT. */
+        /* L2 hit: FULLY validate the blob (STAB-4) before touching L1, populate
+         * L1 so later reads hit shm, then serve it as a normal HIT. */
         ngx_http_cache_turbo_blob_hdr_t  bh;
 
-        if (ctx->l2_blob_len >= sizeof(bh)) {
-            ngx_memcpy(&bh, ctx->l2_blob, sizeof(bh));
-            if (bh.magic == NGX_HTTP_CACHE_TURBO_BLOB_MAGIC) {
-                time_t  age, rem_fresh, rem_stale;
+        if (ngx_http_cache_turbo_blob_validate(ctx->l2_blob, ctx->l2_blob_len,
+                                               &bh, NULL, NULL) == NGX_OK)
+        {
+            time_t  age, rem_fresh, rem_stale;
 
-                /* Restore the object's REMAINING lifetime, not the location
-                 * default — otherwise every L2 hit re-promotes a stale object as
-                 * fresh and it never expires (and per-status/upstream TTLs are
-                 * lost across the L2 round-trip). */
-                age = ngx_time() - (time_t) bh.created;
-                if (age < 0) {                 /* clock skew between writers */
-                    age = 0;
-                }
-                rem_fresh = (time_t) bh.fresh_ttl - age;   /* <=0 => stale */
-                rem_stale = (time_t) bh.stale_ttl - age;   /* total window left */
+            /* Restore the object's REMAINING lifetime, not the location
+             * default — otherwise every L2 hit re-promotes a stale object as
+             * fresh and it never expires (and per-status/upstream TTLs are
+             * lost across the L2 round-trip). */
+            age = ngx_time() - (time_t) bh.created;
+            if (age < 0) {                 /* clock skew between writers */
+                age = 0;
+            }
+            rem_fresh = (time_t) bh.fresh_ttl - age;   /* <=0 => stale */
+            rem_stale = (time_t) bh.stale_ttl - age;   /* total window left */
 
-                if (rem_stale <= 0) {
-                    /* Object outlived its serveable window in L2 (Redis TTL
-                     * slack): treat as a miss and go to origin. */
-                    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                                   "cache_turbo: L2 blob expired \"%V\" key=%ui "
-                                   "-> origin", &r->uri, (ngx_uint_t) hash);
-                } else {
-                    (void) clcf->l1->store(z, ctx->key_hash, hash,
-                               ctx->l2_blob, ctx->l2_blob_len,
-                               rem_fresh, rem_stale);
-                    (void) ngx_atomic_fetch_add(&z->sh->hits, 1);
-                    (void) ngx_atomic_fetch_add(&z->sh->l2_hits, 1);
-                    ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                                   "cache_turbo: L2 HIT \"%V\" key=%ui len=%uz "
-                                   "(filled L1)", &r->uri, (ngx_uint_t) hash,
-                                   ctx->l2_blob_len);
-                    return ngx_http_cache_turbo_serve(r, ctx->l2_blob,
-                               ctx->l2_blob_len, rem_fresh <= 0 ? 1 : 0);
-                }
+            if (rem_stale <= 0) {
+                /* Object outlived its serveable window in L2 (Redis TTL
+                 * slack): treat as a miss and go to origin. */
+                ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                               "cache_turbo: L2 blob expired \"%V\" key=%ui "
+                               "-> origin", &r->uri, (ngx_uint_t) hash);
+            } else {
+                /* The blob passed full validation above, so the slot we put in
+                 * L1 is guaranteed serveable (no poisoned L1 node). */
+                (void) clcf->l1->store(z, ctx->key_hash, hash,
+                           ctx->l2_blob, ctx->l2_blob_len,
+                           rem_fresh, rem_stale);
+                (void) ngx_atomic_fetch_add(&z->sh->hits, 1);
+                (void) ngx_atomic_fetch_add(&z->sh->l2_hits, 1);
+                ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                               "cache_turbo: L2 HIT \"%V\" key=%ui len=%uz "
+                               "(filled L1)", &r->uri, (ngx_uint_t) hash,
+                               ctx->l2_blob_len);
+                return ngx_http_cache_turbo_serve(r, ctx->l2_blob,
+                           ctx->l2_blob_len, rem_fresh <= 0 ? 1 : 0);
             }
         }
         /* corrupt/short/expired blob: treat as a miss, fall through to origin */
@@ -1766,20 +2007,19 @@ ngx_http_cache_turbo_serve(ngx_http_request_t *r, u_char *copy, size_t len,
         ctx->served = 1;           /* stop our filters re-capturing */
     }
 
-    /* Backward/safety: blob must carry our header. The blob is byte-aligned
-     * (ngx_pnalloc), so copy the header into a properly-aligned local rather
-     * than casting the buffer to the struct (which is misaligned UB). */
-    if (len < sizeof(ngx_http_cache_turbo_blob_hdr_t)) {
+    /* STAB-4: one validated parse. blob_validate checks magic+version, that the
+     * header block and body fit, AND walks every TLV header entry — so the
+     * restore loop below cannot run off the end. The blob is byte-aligned
+     * (ngx_pnalloc); the validator reads the wire header with fixed-endian
+     * getters, no misaligned struct cast. */
+    if (ngx_http_cache_turbo_blob_validate(copy, len, &hdr, NULL, NULL)
+        != NGX_OK)
+    {
         return NGX_ERROR;
     }
-
-    ngx_memcpy(&hdr, copy, sizeof(hdr));
     bh = &hdr;
-    if (bh->magic != NGX_HTTP_CACHE_TURBO_BLOB_MAGIC) {
-        return NGX_ERROR;
-    }
 
-    p   = copy + sizeof(ngx_http_cache_turbo_blob_hdr_t);
+    p   = copy + NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE;
     end = p + bh->headers_len;
     body = end;
     body_len = bh->body_len;
@@ -1787,13 +2027,6 @@ ngx_http_cache_turbo_serve(ngx_http_request_t *r, u_char *copy, size_t len,
     ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                    "cache_turbo: serve status=%ui body=%uz stale=%ui",
                    (ngx_uint_t) bh->status, body_len, stale);
-
-    /* guard: header block must fit inside the blob */
-    if (bh->headers_len > len - sizeof(hdr)
-        || body_len > len - sizeof(hdr) - bh->headers_len)
-    {
-        return NGX_ERROR;
-    }
 
     r->headers_out.status = bh->status;
     r->headers_out.content_length_n = body_len;
@@ -1804,12 +2037,12 @@ ngx_http_cache_turbo_serve(ngx_http_request_t *r, u_char *copy, size_t len,
         uint32_t  nl, vl;
         u_char   *nm, *vv;
 
-        ngx_memcpy(&nl, p, 4); p += 4;
+        nl = ngx_http_cache_turbo_get_u32(p); p += 4;
         if (p + nl > end) { break; }
         nm = p; p += nl;
 
         if (p + 4 > end) { break; }
-        ngx_memcpy(&vl, p, 4); p += 4;
+        vl = ngx_http_cache_turbo_get_u32(p); p += 4;
         if (p + vl > end) { break; }
         vv = p; p += vl;
 
@@ -2328,7 +2561,7 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
                           "exceeds the 4 GiB blob field limit", &r->uri);
             blob = NULL;
         } else {
-            blob_len = sizeof(ngx_http_cache_turbo_blob_hdr_t)
+            blob_len = NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE
                        + hdr_bytes + ctx->body_len;
             blob = ngx_pnalloc(r->pool, blob_len);
         }
@@ -2337,9 +2570,7 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
             ngx_http_cache_turbo_blob_hdr_t  bhw;
             u_char                           store_key[32];
 
-            /* blob is byte-aligned; build the header in an aligned local and
-             * memcpy it in rather than writing through a misaligned cast. */
-            bhw.magic = NGX_HTTP_CACHE_TURBO_BLOB_MAGIC;
+            /* STAB-4: serialise the header into the fixed 40-byte LE wire form. */
             bhw.nheaders = nheaders;
             bhw.headers_len = (uint32_t) hdr_bytes;
             bhw.body_len = (uint32_t) ctx->body_len;
@@ -2350,17 +2581,16 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
             bhw.created = (int64_t) ngx_time();
             bhw.fresh_ttl = (uint32_t) (ttl > 0 ? ttl : 0);
             bhw.stale_ttl = (uint32_t) stale_window;
-            ngx_memcpy(blob, &bhw, sizeof(bhw));
+            ngx_http_cache_turbo_blob_hdr_write(blob, &bhw);
 
-            w = blob + sizeof(ngx_http_cache_turbo_blob_hdr_t);
+            w = blob + NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE;
 
-            /* write a single name/value pair */
+            /* write a single name/value pair (lengths fixed-endian, STAB-4) */
             #define CT_PUT(np, nl, vp, vl)                                     \
                 do {                                                          \
-                    uint32_t _l;                                              \
-                    _l = (uint32_t) (nl); ngx_memcpy(w, &_l, 4); w += 4;      \
+                    ngx_http_cache_turbo_put_u32(w, (uint32_t) (nl)); w += 4; \
                     ngx_memcpy(w, (np), (nl)); w += (nl);                     \
-                    _l = (uint32_t) (vl); ngx_memcpy(w, &_l, 4); w += 4;      \
+                    ngx_http_cache_turbo_put_u32(w, (uint32_t) (vl)); w += 4; \
                     ngx_memcpy(w, (vp), (vl)); w += (vl);                     \
                 } while (0)
 
@@ -3517,14 +3747,12 @@ ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
         } else if (r->args.len
                    && ngx_http_arg(r, (u_char *) "key", 3, &arg) == NGX_OK)
         {
-            ngx_md5_t  md5;
             u_char     key_hash[32];
             uint32_t   hash;
 
-            ngx_memzero(key_hash, sizeof(key_hash));
-            ngx_md5_init(&md5);
-            ngx_md5_update(&md5, arg.data, arg.len);
-            ngx_md5_final(key_hash, &md5);
+            /* SEC-2: must match build_key's digest so ?key=<rendered key>
+             * resolves to the same slot. */
+            ngx_http_cache_turbo_digest(arg.data, arg.len, key_hash);
             hash = ngx_crc32_short(key_hash, 32);
 
             purged = clcf->l1->purge_key(z, key_hash, hash);
@@ -4168,42 +4396,41 @@ static void
 ngx_http_cache_turbo_variant_hash(ngx_http_request_t *r, ngx_str_t *base,
     ngx_int_t bits, u_char out[32])
 {
-    ngx_md5_t          md5;
-    const char        *cls;
-    ngx_str_t          v;
-    static const u_char us = 0x1F;
+    ngx_http_cache_turbo_digest_t  d;
+    const char                    *cls;
+    ngx_str_t                      v;
+    static const u_char            us = 0x1F;
 
-    ngx_memzero(out, 32);
-    ngx_md5_init(&md5);
-    ngx_md5_update(&md5, base->data, base->len);
+    ngx_http_cache_turbo_digest_init(&d);
+    ngx_http_cache_turbo_digest_update(&d, base->data, base->len);
 
     if (bits & NGX_HTTP_CACHE_TURBO_VARY_ENCODING) {
         cls = ngx_http_cache_turbo_ae_class(r);
-        ngx_md5_update(&md5, &us, 1);
-        ngx_md5_update(&md5, "ae=", 3);
-        ngx_md5_update(&md5, cls, ngx_strlen(cls));
+        ngx_http_cache_turbo_digest_update(&d, &us, 1);
+        ngx_http_cache_turbo_digest_update(&d, "ae=", 3);
+        ngx_http_cache_turbo_digest_update(&d, cls, ngx_strlen(cls));
     }
     if (bits & NGX_HTTP_CACHE_TURBO_VARY_DEVICE) {
         cls = ngx_http_cache_turbo_device_class(r);
-        ngx_md5_update(&md5, &us, 1);
-        ngx_md5_update(&md5, "dev=", 4);
-        ngx_md5_update(&md5, cls, ngx_strlen(cls));
+        ngx_http_cache_turbo_digest_update(&d, &us, 1);
+        ngx_http_cache_turbo_digest_update(&d, "dev=", 4);
+        ngx_http_cache_turbo_digest_update(&d, cls, ngx_strlen(cls));
     }
     if (bits & NGX_HTTP_CACHE_TURBO_VARY_LANG) {
         v = ngx_http_cache_turbo_req_header(r, "Accept-Language",
                                             sizeof("Accept-Language") - 1);
-        ngx_md5_update(&md5, &us, 1);
-        ngx_md5_update(&md5, "lang=", 5);
-        ngx_md5_update(&md5, v.data, v.len);
+        ngx_http_cache_turbo_digest_update(&d, &us, 1);
+        ngx_http_cache_turbo_digest_update(&d, "lang=", 5);
+        ngx_http_cache_turbo_digest_update(&d, v.data, v.len);
     }
     if (bits & NGX_HTTP_CACHE_TURBO_VARY_ORIGIN) {
         v = ngx_http_cache_turbo_req_header(r, "Origin", sizeof("Origin") - 1);
-        ngx_md5_update(&md5, &us, 1);
-        ngx_md5_update(&md5, "org=", 4);
-        ngx_md5_update(&md5, v.data, v.len);
+        ngx_http_cache_turbo_digest_update(&d, &us, 1);
+        ngx_http_cache_turbo_digest_update(&d, "org=", 4);
+        ngx_http_cache_turbo_digest_update(&d, v.data, v.len);
     }
 
-    ngx_md5_final(out, &md5);
+    ngx_http_cache_turbo_digest_final(&d, out);
 }
 
 
@@ -4213,15 +4440,14 @@ ngx_http_cache_turbo_variant_hash(ngx_http_request_t *r, ngx_str_t *base,
 static void
 ngx_http_cache_turbo_marker_hash(ngx_str_t *base, u_char out[32])
 {
-    ngx_md5_t          md5;
-    static const u_char us = 0x1F;
+    ngx_http_cache_turbo_digest_t  d;
+    static const u_char            us = 0x1F;
 
-    ngx_memzero(out, 32);
-    ngx_md5_init(&md5);
-    ngx_md5_update(&md5, base->data, base->len);
-    ngx_md5_update(&md5, &us, 1);
-    ngx_md5_update(&md5, "varymark", sizeof("varymark") - 1);
-    ngx_md5_final(out, &md5);
+    ngx_http_cache_turbo_digest_init(&d);
+    ngx_http_cache_turbo_digest_update(&d, base->data, base->len);
+    ngx_http_cache_turbo_digest_update(&d, &us, 1);
+    ngx_http_cache_turbo_digest_update(&d, "varymark", sizeof("varymark") - 1);
+    ngx_http_cache_turbo_digest_final(&d, out);
 }
 
 
@@ -4234,19 +4460,18 @@ ngx_http_cache_turbo_marker_store(ngx_http_cache_turbo_loc_conf_t *clcf,
     ngx_http_cache_turbo_zone_t *z, ngx_str_t *base, ngx_int_t bits, time_t ttl)
 {
     u_char                           mk[32];
-    u_char                           blob[sizeof(ngx_http_cache_turbo_blob_hdr_t)
+    u_char                           blob[NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE
                                           + 1];
     ngx_http_cache_turbo_blob_hdr_t  bh;
 
     ngx_memzero(&bh, sizeof(bh));
-    bh.magic = NGX_HTTP_CACHE_TURBO_BLOB_MAGIC;
     bh.body_len = 1;
     bh.created = (int64_t) ngx_time();
     bh.fresh_ttl = (uint32_t) (ttl > 0 ? ttl : 0);
     bh.stale_ttl = (uint32_t) ngx_http_cache_turbo_stale_ttl(ttl,
                        clcf->stale_mult);
-    ngx_memcpy(blob, &bh, sizeof(bh));
-    blob[sizeof(bh)] = (u_char) (bits & 0xFF);
+    ngx_http_cache_turbo_blob_hdr_write(blob, &bh);
+    blob[NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE] = (u_char) (bits & 0xFF);
 
     ngx_http_cache_turbo_marker_hash(base, mk);
 
@@ -4282,17 +4507,18 @@ ngx_http_cache_turbo_vary_resolve(ngx_http_request_t *r,
      * and re-fetched). The marker is refreshed on every variant store, so it
      * only goes stale alongside its objects. stale_until == 0 => forever. */
     if (m != NULL && m->data != NULL
-        && m->len >= sizeof(ngx_http_cache_turbo_blob_hdr_t) + 1
+        && m->len >= NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE + 1
         && (m->stale_until == 0 || ngx_time() < m->stale_until))
     {
-        /* Validate the marker's blob magic before trusting the bits byte (the
-         * marker key folds "varymark" so a real object can't normally land here,
-         * but a hash collision must not be read as an axis bitmask). The slot is
-         * slab-aligned; copy the header into an aligned local rather than casting. */
+        /* Validate the marker's blob magic+version before trusting the bits byte
+         * (the marker key folds "varymark" so a real object can't normally land
+         * here, but a hash collision must not be read as an axis bitmask). The
+         * 1-byte body sits just past the fixed wire header. */
         ngx_http_cache_turbo_blob_hdr_t  mh;
-        ngx_memcpy(&mh, m->data, sizeof(mh));
-        if (mh.magic == NGX_HTTP_CACHE_TURBO_BLOB_MAGIC) {
-            bits = m->data[sizeof(ngx_http_cache_turbo_blob_hdr_t)];
+        if (ngx_http_cache_turbo_blob_validate(m->data, m->len, &mh, NULL, NULL)
+            == NGX_OK)
+        {
+            bits = m->data[NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE];
         }
     }
     ngx_shmtx_unlock(&z->shpool->mutex);

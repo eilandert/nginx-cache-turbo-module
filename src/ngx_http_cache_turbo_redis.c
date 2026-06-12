@@ -129,7 +129,14 @@ typedef struct {
     ngx_connection_t  *connection;
     socklen_t          socklen;
     unsigned           tls:1;          /* pooled conn is TLS (match on reuse) */
-    uint32_t           ctx_fp;         /* security-context fingerprint (match) */
+    unsigned           tls_verify:1;   /* exact-match field (SEC-3)           */
+    uint32_t           ctx_fp;         /* security-context fingerprint (fast pre-filter) */
+    ngx_int_t          db;             /* SEC-3 exact-match profile fields...  */
+    ngx_str_t          user;           /* (data points into the config pool,  */
+    ngx_str_t          password;       /*  which outlives this worker, so no   */
+    ngx_str_t          tls_ca;         /*  copy is needed)                     */
+    ngx_str_t          tls_name;
+    ngx_str_t          host;
     ngx_sockaddr_t     sockaddr;       /* copy of peer addr, for match */
 } ngx_http_cache_turbo_redis_ka_item_t;
 
@@ -166,6 +173,35 @@ ngx_http_cache_turbo_redis_ka_fp(ngx_http_cache_turbo_loc_conf_t *clcf)
 
     ngx_crc32_final(crc);
     return crc;
+}
+
+
+static ngx_inline ngx_int_t
+ngx_http_cache_turbo_str_eq(ngx_str_t *a, ngx_str_t *b)
+{
+    return a->len == b->len
+           && (a->len == 0 || ngx_memcmp(a->data, b->data, a->len) == 0);
+}
+
+
+/* SEC-3: exact security-context match. The CRC fingerprint (ka_fp) is only a
+ * fast O(1) pre-filter — a 32-bit collision could otherwise hand a pooled conn
+ * (which skips the AUTH/SELECT/cert-verify preamble) to a location with a
+ * DIFFERENT db/credential/TLS-trust profile. This compares the profile fields
+ * byte-for-byte, so reuse is exact. The item's ngx_str_t values reference the
+ * config pool (process/worker lifetime), so no copy is needed. */
+static ngx_int_t
+ngx_http_cache_turbo_redis_ka_profile_eq(
+    ngx_http_cache_turbo_redis_ka_item_t *item,
+    ngx_http_cache_turbo_loc_conf_t *clcf)
+{
+    return item->db == clcf->redis_db
+        && item->tls_verify == (unsigned) (clcf->redis_tls_verify ? 1 : 0)
+        && ngx_http_cache_turbo_str_eq(&item->user, &clcf->redis_user)
+        && ngx_http_cache_turbo_str_eq(&item->password, &clcf->redis_password)
+        && ngx_http_cache_turbo_str_eq(&item->tls_ca, &clcf->redis_tls_ca)
+        && ngx_http_cache_turbo_str_eq(&item->tls_name, &clcf->redis_tls_name)
+        && ngx_http_cache_turbo_str_eq(&item->host, &clcf->redis_host);
 }
 
 typedef struct {
@@ -286,7 +322,8 @@ ngx_http_cache_turbo_redis_ka_get(ngx_http_cache_turbo_loc_conf_t *clcf,
         if (item->tls == want_tls
             && item->ctx_fp == want_fp
             && item->socklen == addr->socklen
-            && ngx_memcmp(&item->sockaddr, addr->sockaddr, addr->socklen) == 0)
+            && ngx_memcmp(&item->sockaddr, addr->sockaddr, addr->socklen) == 0
+            && ngx_http_cache_turbo_redis_ka_profile_eq(item, clcf))
         {
             c = item->connection;
 
@@ -358,6 +395,14 @@ ngx_http_cache_turbo_redis_ka_save(ngx_http_cache_turbo_redis_op_t *op)
     item->socklen = op->peer.socklen;
     item->tls = c->ssl ? 1 : 0;
     item->ctx_fp = ngx_http_cache_turbo_redis_ka_fp(op->clcf);
+    /* SEC-3 exact-match profile snapshot (config-pool-backed, no copy). */
+    item->tls_verify = op->clcf->redis_tls_verify ? 1 : 0;
+    item->db = op->clcf->redis_db;
+    item->user = op->clcf->redis_user;
+    item->password = op->clcf->redis_password;
+    item->tls_ca = op->clcf->redis_tls_ca;
+    item->tls_name = op->clcf->redis_tls_name;
+    item->host = op->clcf->redis_host;
     ngx_memcpy(&item->sockaddr, op->peer.sockaddr, op->peer.socklen);
 
     if (c->write->timer_set) {

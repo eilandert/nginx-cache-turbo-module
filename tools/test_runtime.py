@@ -1377,15 +1377,16 @@ class MemcachedServer:
 
 
 def l2_key(uri: str, prefix: str = "ct:") -> str:
-    """Mirror the module's L2 key: prefix + hex of the 32-byte key hash. The
-    key hash is md5(cache_key) widened into 32 bytes (upper 16 stay zero), and
-    cache_turbo_key is $uri in the test config."""
-    return prefix + hashlib.md5(uri.encode()).hexdigest() + "0" * 32
+    """Mirror the module's L2 key: prefix + hex of the 32-byte key hash. SEC-2:
+    the key hash is SHA-256(cache_key) filling the whole 32-byte slot (64 hex);
+    cache_turbo_key is $uri in the test config. (The module's no-SSL fallback is
+    a double-MD5 fold, but the test build always has --with-http_ssl_module.)"""
+    return prefix + hashlib.sha256(uri.encode()).hexdigest()
 
 
 def lock_key(uri: str, prefix: str = "ct:") -> str:
     """Mirror the module's cross-node lock key: <prefix>lock:<hex key hash>."""
-    return prefix + "lock:" + hashlib.md5(uri.encode()).hexdigest() + "0" * 32
+    return prefix + "lock:" + hashlib.sha256(uri.encode()).hexdigest()
 
 
 def wait_for(predicate, timeout: float = 3.0, interval: float = 0.05) -> bool:
@@ -2839,12 +2840,16 @@ def test_l2_cross_instance_fill(ng: Nginx, origin: Origin,
         b.stop()
 
 
-def make_ctb2_blob(body: bytes, status: int = 200,
+def make_ctb3_blob(body: bytes, status: int = 200,
                    headers: dict[str, str] | None = None,
                    created: int | None = None, fresh_ttl: int = 60,
-                   stale_ttl: int = 240) -> bytes:
-    """Hand-build a CTB2 cache blob exactly as the module serialises it.
-    The 4-byte pad before int64 created mirrors the native C struct layout."""
+                   stale_ttl: int = 240, magic: int = 0x43544233,
+                   version: int = 3) -> bytes:
+    """Hand-build a CTB3 cache blob exactly as the module serialises it (STAB-4:
+    fixed 40-byte little-endian, padding-free header). Pass a wrong magic/version
+    to exercise the validator's reject path. Wire layout (LE):
+      u32 magic, u16 version, u16 flags, u32 status, u32 nheaders,
+      u32 headers_len, u32 body_len, i64 created, u32 fresh_ttl, u32 stale_ttl."""
     headers = headers or {"Content-Type": "text/plain"}
     created = int(time.time()) if created is None else created
     hdr_block = b""
@@ -2855,9 +2860,8 @@ def make_ctb2_blob(body: bytes, status: int = 200,
         hdr_block += struct.pack("<I", len(nb)) + nb
         hdr_block += struct.pack("<I", len(vb)) + vb
         nheaders += 1
-    magic = 0x43544232
-    head = struct.pack("<IIIII4xqII", magic, nheaders, len(hdr_block),
-                       len(body), status, created, fresh_ttl, stale_ttl)
+    head = struct.pack("<IHHIIIIqII", magic, version, 0, status, nheaders,
+                       len(hdr_block), len(body), created, fresh_ttl, stale_ttl)
     return head + hdr_block + body
 
 
@@ -2980,7 +2984,7 @@ def test_l2_expired_consults_l2(ng: Nginx, origin: Origin,
     time.sleep(4.3)                                # past stale_until (valid*4=4s)
     # both L1 and L2 are expired now; reseed ONLY L2 with a fresh, valid blob
     seeded = b"l2-seeded\n"
-    blob = make_ctb2_blob(seeded, headers={"Content-Type": "text/plain"})
+    blob = make_ctb3_blob(seeded, headers={"Content-Type": "text/plain"})
     redis.set_raw(l2_key(uri), blob, 60_000)       # binary-safe raw RESP SET
     assert redis.cli("EXISTS", l2_key(uri)) == "1", "failed to seed L2"
 
@@ -3003,7 +3007,7 @@ def test_l2_preserves_original_freshness(ng: Nginx, origin: Origin,
     key = l2_key(uri)
     redis.cli("DEL", key, lock_key(uri))
     seeded = b"l2-aged\n"
-    blob = make_ctb2_blob(
+    blob = make_ctb3_blob(
         seeded, created=int(time.time()) - 2, fresh_ttl=1, stale_ttl=4)
     redis.set_raw(key, blob, 60_000)
 
@@ -3021,6 +3025,50 @@ def test_l2_preserves_original_freshness(ng: Nginx, origin: Origin,
     assert origin.hits == origin_before + 1, \
         "expired L2 object did not fall through to origin"
     assert body2 != seeded.decode()
+
+
+def test_l2_malformed_blob_rejected(ng: Nginx, origin: Origin,
+                                    redis: RedisServer) -> None:
+    """STAB-4: a malformed L2 blob must be fully validated and REJECTED before it
+    is inserted into L1 (the old code stored first and only failed in serve(),
+    poisoning the L1 slot). Each bad blob => a clean MISS to origin, a real body,
+    and a subsequent request that is a legitimate HIT (no poisoned L1, no crash).
+    The origin serves a dynamic gen-<n> body."""
+    cases = {
+        "wrong-magic":   make_ctb3_blob(b"x", magic=0x43544232),     # CTB2
+        "wrong-version": make_ctb3_blob(b"x", version=2),
+        # valid header+version but headers_len lies past the buffer end
+        "hdrlen-overflow": (
+            struct.pack("<IHHIIIIqII", 0x43544233, 3, 0, 200, 1,
+                        0xFFFF, 1, int(time.time()), 60, 240) + b"\x01"),
+        # body_len lies past the buffer end
+        "bodylen-overflow": (
+            struct.pack("<IHHIIIIqII", 0x43544233, 3, 0, 200, 0,
+                        0, 0xFFFF, int(time.time()), 60, 240)),
+    }
+
+    for name, blob in cases.items():
+        uri = f"/l2/bad-{name}"
+        key = l2_key(uri)
+        redis.cli("DEL", key, lock_key(uri))
+        redis.set_raw(key, blob, 60_000)
+
+        before = origin.hits
+        s, body, h = fetch(ng.port, uri)
+        assert s == 200, f"{name}: status {s}"
+        assert body.startswith("gen-"), \
+            f"{name}: served garbage body {body!r} from a malformed L2 blob"
+        assert "x-cache" not in h, \
+            f"{name}: malformed blob served as {h.get('x-cache')} (not a miss)"
+        assert origin.hits == before + 1, \
+            f"{name}: malformed blob did not fall through to origin"
+
+        # Second read must succeed AND be a real HIT — the rejected blob must not
+        # have poisoned L1, and the origin response is now legitimately cached.
+        s2, body2, h2 = fetch(ng.port, uri)
+        assert s2 == 200 and body2 == body and h2.get("x-cache") == "HIT", \
+            f"{name}: L1 poisoned/uncacheable after reject (2nd read {s2}, " \
+            f"x-cache={h2.get('x-cache')})"
 
 
 def tag_key(name: str, prefix: str = "ct:") -> str:
@@ -3974,6 +4022,7 @@ def run_all(ng: Nginx, origin: Origin,
         test_l2_purge_key_drops_l2(ng, origin, redis)
         test_l2_expired_consults_l2(ng, origin, redis)
         test_l2_preserves_original_freshness(ng, origin, redis)
+        test_l2_malformed_blob_rejected(ng, origin, redis)  # STAB-4 validate
         test_l2_tag_add_on_store(ng, origin, redis)
         test_l2_tag_purge(ng, origin, redis)
         test_multinode_lock(ng, origin, redis)
@@ -4110,6 +4159,7 @@ def main() -> int:
           "autotune (v4-3: raises beta within band/off-by-default/"
           "insufficient-data/churn-disqualify)"
           + (", L2 write-through (P4), keepalive pool reuse (v15), "
+             "malformed L2 blob rejected pre-L1 (STAB-4), "
              "L2 cross-instance fill (P2), "
              "L2-aware key purge (P6), expired-L1 consults L2 (P6), "
              "tag index add (v2c), tag purge both tiers (P4), "

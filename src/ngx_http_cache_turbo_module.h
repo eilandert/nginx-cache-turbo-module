@@ -587,8 +587,8 @@ typedef struct {
 /*
  * Serialised cache blob layout (one contiguous slab allocation):
  *
- *   [ ngx_http_cache_turbo_blob_hdr_t header ]
- *   [ nheaders * { u32 name_len, name, u32 val_len, value } ]
+ *   [ 40-byte fixed wire header (see ngx_http_cache_turbo_blob_hdr_write) ]
+ *   [ nheaders * { u32 name_len, name, u32 val_len, value } ]   (all u32 LE)
  *   [ body bytes ]
  *
  * The header block lets us restore Content-Type and any other response
@@ -598,11 +598,27 @@ typedef struct {
  * hit can rebuild L1 with the remaining lifetime instead of resetting it to the
  * location default — without these, every L2 hit would re-promote a stale object
  * as fresh and it could live forever (and per-status/upstream TTLs would be lost
- * across the L2 round-trip). All offsets are derived from sizeof(header), so the
- * body/header-block parse is unaffected by these fields.
+ * across the L2 round-trip).
+ *
+ * STAB-4: the wire header is a FIXED little-endian, 40-byte, padding-free layout
+ * (NOT this struct's native ABI) written/read only via the blob_hdr_write/
+ * blob_validate helpers in module.c — so the on-disk format is independent of
+ * compiler struct padding and host endianness. This struct is the in-memory
+ * PARSED form; its field order/size is irrelevant to the wire. A single
+ * ngx_http_cache_turbo_blob_validate() fully validates magic+version+all length
+ * fields+the TLV header walk in one place, so a malformed L2 blob is rejected
+ * BEFORE it is inserted into L1 (the old inline parse stored first, then serve()
+ * failed = a poisoned L1 slot).
+ *
+ * Wire offsets (little-endian):
+ *   0  u32 magic     ("CTB3")    16  u32 headers_len   32  u32 fresh_ttl
+ *   4  u16 version   (= 3)       20  u32 body_len      36  u32 stale_ttl
+ *   6  u16 flags     (reserved)  24  i64 created       40  = header size
+ *   8  u32 status    12 u32 nheaders
  */
 typedef struct {
-    uint32_t                 magic;       /* 0x43544232 = "CTB2"            */
+    uint32_t                 magic;       /* 0x43544233 = "CTB3"            */
+    uint32_t                 version;
     uint32_t                 nheaders;
     uint32_t                 headers_len; /* bytes of the header block      */
     uint32_t                 body_len;
@@ -612,9 +628,15 @@ typedef struct {
     uint32_t                 stale_ttl;   /* total serveable window (>=fresh) */
 } ngx_http_cache_turbo_blob_hdr_t;
 
-/* CTB2 added created/fresh_ttl/stale_ttl. Old CTB1 blobs in L2 fail the magic
- * check and are treated as a miss (cache self-heals), so no migration needed. */
-#define NGX_HTTP_CACHE_TURBO_BLOB_MAGIC  0x43544232
+/* CTB3 (STAB-4): fixed-endian versioned wire format. Old CTB1/CTB2 blobs in L2
+ * fail the magic/version check and are treated as a miss (cache self-heals), so
+ * no migration is needed. SEC-2 (SHA-256 keys) lands in the same release, so the
+ * keyspace turns over once anyway. */
+#define NGX_HTTP_CACHE_TURBO_BLOB_MAGIC    0x43544233
+#define NGX_HTTP_CACHE_TURBO_BLOB_VERSION  3
+/* Fixed wire size of the blob header (NOT sizeof the struct — that carries
+ * native padding). All blob offsets derive from this constant. */
+#define NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE 40
 
 
 extern ngx_module_t  ngx_http_cache_turbo_module;
