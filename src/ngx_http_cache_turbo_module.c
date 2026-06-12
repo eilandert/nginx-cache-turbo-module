@@ -486,7 +486,7 @@ ngx_http_cache_turbo_digest(const void *data, size_t len, u_char out[32])
 
 
 /* ------------------------------------------------------------------------- *
- * STAB-4: fixed little-endian, padding-free blob wire header (40 bytes).
+ * STAB-4: fixed little-endian, padding-free blob wire header (44 bytes, CTB4).
  * Written/read only through these helpers so the on-disk format is independent
  * of struct padding and host endianness. See the layout comment on
  * ngx_http_cache_turbo_blob_hdr_t in the header.
@@ -553,6 +553,7 @@ ngx_http_cache_turbo_blob_hdr_write(u_char *dst,
     ngx_http_cache_turbo_put_u64(dst + 24, (uint64_t) h->created);
     ngx_http_cache_turbo_put_u32(dst + 32, h->fresh_ttl);
     ngx_http_cache_turbo_put_u32(dst + 36, h->stale_ttl);
+    ngx_http_cache_turbo_put_u32(dst + 40, h->sie_ttl);   /* CTB4 (RFC-2 SIE) */
 }
 
 
@@ -593,6 +594,7 @@ ngx_http_cache_turbo_blob_validate(const u_char *blob, size_t len,
     out->created     = (int64_t) ngx_http_cache_turbo_get_u64(blob + 24);
     out->fresh_ttl   = ngx_http_cache_turbo_get_u32(blob + 32);
     out->stale_ttl   = ngx_http_cache_turbo_get_u32(blob + 36);
+    out->sie_ttl     = ngx_http_cache_turbo_get_u32(blob + 40);   /* CTB4 */
 
     /* header block + body must fit (subtract on the remaining len — no overflow) */
     if (out->headers_len > len - NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE
@@ -954,6 +956,29 @@ ngx_http_cache_turbo_response_swr(ngx_http_request_t *r)
     }
     return ngx_http_cache_turbo_cc_delta(cc.data, cc.data + cc.len,
                "stale-while-revalidate", sizeof("stale-while-revalidate") - 1);
+}
+
+
+/*
+ * RFC 5861 §4 / RFC 9111: response Cache-Control: stale-if-error=N — the origin
+ * tells the cache how long past freshness it may serve a stale copy when a
+ * revalidation to the origin fails (5xx / timeout / connect error). Returns N
+ * (>=0) or -1 when absent / no numeric value. Honoured at store by recording the
+ * absolute serve-on-error window (fresh + N) in the blob's sie_ttl (CTB4); the
+ * serve-on-error path consumes it. Walks the (small) response header list once.
+ */
+static time_t
+ngx_http_cache_turbo_response_sie(ngx_http_request_t *r)
+{
+    ngx_str_t  cc;
+
+    cc = ngx_http_cache_turbo_header_find(&r->headers_out.headers,
+             "Cache-Control", sizeof("Cache-Control") - 1);
+    if (cc.data == NULL) {
+        return -1;
+    }
+    return ngx_http_cache_turbo_cc_delta(cc.data, cc.data + cc.len,
+               "stale-if-error", sizeof("stale-if-error") - 1);
 }
 
 
@@ -2854,7 +2879,7 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
         uint32_t                          nheaders = 0;
         u_char                           *blob, *w;
         ngx_uint_t                        i;
-        time_t                            ttl, stale_window;
+        time_t                            ttl, stale_window, sie_window = 0;
 
         ttl = ngx_http_cache_turbo_status_ttl(clcf, r->headers_out.status);
         if (ttl < 0) {
@@ -2912,6 +2937,26 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
             ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                            "cache_turbo: must-revalidate \"%V\" -> no stale window",
                            &r->uri);
+
+        } else if (ttl > 0) {
+            /* RFC 5861 §4 / RFC-2: a response stale-if-error=N records an absolute
+             * serve-on-error window (fresh + N) in the blob's sie_ttl (CTB4), so a
+             * later origin failure may serve this copy PAST the normal stale
+             * window. 0 = absent => no serve-on-error beyond the stale window.
+             * Gated behind !must-revalidate above (must-revalidate forbids any
+             * stale serve, stale-if-error included). The serve-on-error path that
+             * consumes sie_ttl lands in a follow-up; the field is carried now so
+             * the wire format turns over once (single cold-cache event). */
+            time_t  sie = ngx_http_cache_turbo_response_sie(r);
+            if (sie >= 0) {
+                sie_window = ttl + sie;
+                if (sie_window > NGX_HTTP_CACHE_TURBO_TTL_MAX) {
+                    sie_window = NGX_HTTP_CACHE_TURBO_TTL_MAX;
+                }
+                ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                               "cache_turbo: stale-if-error=%T \"%V\"",
+                               sie, &r->uri);
+            }
         }
 
         /* Synthesise a Content-Type entry from the typed field (it is not in
@@ -2968,7 +3013,7 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
             ngx_http_cache_turbo_blob_hdr_t  bhw;
             u_char                           store_key[32];
 
-            /* STAB-4: serialise the header into the fixed 40-byte LE wire form. */
+            /* STAB-4: serialise the header into the fixed 44-byte LE wire form. */
             bhw.nheaders = nheaders;
             bhw.headers_len = (uint32_t) hdr_bytes;
             bhw.body_len = (uint32_t) ctx->body_len;
@@ -2979,6 +3024,7 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
             bhw.created = (int64_t) ngx_time();
             bhw.fresh_ttl = (uint32_t) (ttl > 0 ? ttl : 0);
             bhw.stale_ttl = (uint32_t) stale_window;
+            bhw.sie_ttl = (uint32_t) sie_window;   /* CTB4 (RFC-2 SIE) */
             ngx_http_cache_turbo_blob_hdr_write(blob, &bhw);
 
             w = blob + NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE;

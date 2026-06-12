@@ -623,20 +623,22 @@ typedef struct {
 /*
  * Serialised cache blob layout (one contiguous slab allocation):
  *
- *   [ 40-byte fixed wire header (see ngx_http_cache_turbo_blob_hdr_write) ]
+ *   [ 44-byte fixed wire header (see ngx_http_cache_turbo_blob_hdr_write) ]
  *   [ nheaders * { u32 name_len, name, u32 val_len, value } ]   (all u32 LE)
  *   [ body bytes ]
  *
  * The header block lets us restore Content-Type and any other response
  * headers on a cache hit, so cached responses are byte-identical to origin.
  *
- * created/fresh_ttl/stale_ttl carry the object's ORIGINAL freshness so an L2
- * hit can rebuild L1 with the remaining lifetime instead of resetting it to the
- * location default — without these, every L2 hit would re-promote a stale object
- * as fresh and it could live forever (and per-status/upstream TTLs would be lost
- * across the L2 round-trip).
+ * created/fresh_ttl/stale_ttl/sie_ttl carry the object's ORIGINAL freshness so
+ * an L2 hit can rebuild L1 with the remaining lifetime instead of resetting it
+ * to the location default — without these, every L2 hit would re-promote a stale
+ * object as fresh and it could live forever (and per-status/upstream TTLs would
+ * be lost across the L2 round-trip). sie_ttl (RFC-2 stale-if-error, CTB4) is the
+ * absolute serve-on-origin-error window from creation (fresh + stale-if-error N);
+ * 0 = no serve-on-error past the normal stale window.
  *
- * STAB-4: the wire header is a FIXED little-endian, 40-byte, padding-free layout
+ * STAB-4: the wire header is a FIXED little-endian, 44-byte, padding-free layout
  * (NOT this struct's native ABI) written/read only via the blob_hdr_write/
  * blob_validate helpers in module.c — so the on-disk format is independent of
  * compiler struct padding and host endianness. This struct is the in-memory
@@ -647,13 +649,13 @@ typedef struct {
  * failed = a poisoned L1 slot).
  *
  * Wire offsets (little-endian):
- *   0  u32 magic     ("CTB3")    16  u32 headers_len   32  u32 fresh_ttl
- *   4  u16 version   (= 3)       20  u32 body_len      36  u32 stale_ttl
- *   6  u16 flags     (reserved)  24  i64 created       40  = header size
- *   8  u32 status    12 u32 nheaders
+ *   0  u32 magic     ("CTB4")    16  u32 headers_len   32  u32 fresh_ttl
+ *   4  u16 version   (= 4)       20  u32 body_len      36  u32 stale_ttl
+ *   6  u16 flags     (reserved)  24  i64 created       40  u32 sie_ttl
+ *   8  u32 status    12 u32 nheaders                   44  = header size
  */
 typedef struct {
-    uint32_t                 magic;       /* 0x43544233 = "CTB3"            */
+    uint32_t                 magic;       /* 0x43544234 = "CTB4"            */
     uint32_t                 version;
     uint32_t                 nheaders;
     uint32_t                 headers_len; /* bytes of the header block      */
@@ -662,17 +664,18 @@ typedef struct {
     int64_t                  created;     /* unix time (s) the blob was made */
     uint32_t                 fresh_ttl;   /* freshness seconds from created  */
     uint32_t                 stale_ttl;   /* total serveable window (>=fresh) */
+    uint32_t                 sie_ttl;     /* abs serve-on-error window; 0=none */
 } ngx_http_cache_turbo_blob_hdr_t;
 
-/* CTB3 (STAB-4): fixed-endian versioned wire format. Old CTB1/CTB2 blobs in L2
+/* CTB4 (RFC-2 stale-if-error): fixed-endian versioned wire format. CTB4 adds the
+ * sie_ttl u32 after stale_ttl (44-byte header). Old CTB1/CTB2/CTB3 blobs in L2
  * fail the magic/version check and are treated as a miss (cache self-heals), so
- * no migration is needed. SEC-2 (SHA-256 keys) lands in the same release, so the
- * keyspace turns over once anyway. */
-#define NGX_HTTP_CACHE_TURBO_BLOB_MAGIC    0x43544233
-#define NGX_HTTP_CACHE_TURBO_BLOB_VERSION  3
+ * no migration is needed — the keyspace turns over once on upgrade. */
+#define NGX_HTTP_CACHE_TURBO_BLOB_MAGIC    0x43544234
+#define NGX_HTTP_CACHE_TURBO_BLOB_VERSION  4
 /* Fixed wire size of the blob header (NOT sizeof the struct — that carries
  * native padding). All blob offsets derive from this constant. */
-#define NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE 40
+#define NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE 44
 
 
 extern ngx_module_t  ngx_http_cache_turbo_module;

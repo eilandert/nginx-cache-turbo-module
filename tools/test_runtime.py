@@ -263,6 +263,11 @@ class Origin:
                     # window well past the cache_turbo_stale_mult default.
                     self.send_header("Cache-Control",
                                      "stale-while-revalidate=10")
+                if "siettl" in self.path:
+                    # RFC-2 (CTB4): response stale-if-error=30 records an absolute
+                    # serve-on-error window (fresh + 30) in the blob's sie_ttl.
+                    self.send_header("Cache-Control",
+                                     "max-age=60, stale-if-error=30")
                 if "cond" in self.path:
                     # v11 conditional-304: stable validators so a stored entry
                     # can answer If-None-Match / If-Modified-Since from cache.
@@ -428,6 +433,18 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             cache_turbo          main;
             cache_turbo_key      $uri;
             cache_turbo_valid    1s;
+            cache_turbo_redis    127.0.0.1:{redis_port} prefix=ct: timeout=250ms;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # RFC-2 (CTB4): origin emits stale-if-error=30; the store path records an
+        # absolute serve-on-error window (fresh + 30) in the blob's sie_ttl. L2 so
+        # the raw blob can be read back and the field unpacked. valid 60s => the
+        # stored fresh_ttl is 60 and sie_ttl is 90.
+        location /siettl/ {{
+            cache_turbo          main;
+            cache_turbo_key      $uri;
+            cache_turbo_valid    60s;
             cache_turbo_redis    127.0.0.1:{redis_port} prefix=ct: timeout=250ms;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
@@ -1384,6 +1401,32 @@ class RedisServer:
             s.sendall(cmd)
             if s.recv(64)[:1] != b"+":
                 raise RuntimeError("raw SET not acknowledged")
+
+    def get_raw(self, key: str) -> bytes | None:
+        """GET key over raw RESP — binary-safe, so a blob with embedded NULs is
+        returned intact (redis-cli text decoding would mangle it). Returns the
+        value bytes, or None on a miss ($-1)."""
+        args = [b"GET", key.encode()]
+        cmd = b"*%d\r\n" % len(args)
+        for a in args:
+            cmd += b"$%d\r\n%s\r\n" % (len(a), a)
+        with socket.create_connection(("127.0.0.1", self.port), 5) as s:
+            s.sendall(cmd)
+            s.settimeout(5)
+            buf = b""
+            # bulk reply: $<len>\r\n<payload>\r\n  (or $-1\r\n on miss)
+            while b"\r\n" not in buf:
+                buf += s.recv(4096)
+            hdr_end = buf.index(b"\r\n")
+            if buf[:1] != b"$":
+                raise RuntimeError(f"unexpected GET reply: {buf[:32]!r}")
+            n = int(buf[1:hdr_end])
+            if n < 0:
+                return None
+            payload = buf[hdr_end + 2:]
+            while len(payload) < n + 2:                # + trailing CRLF
+                payload += s.recv(65536)
+            return payload[:n]
 
     def stop(self) -> None:
         if self.process is None:
@@ -3134,16 +3177,17 @@ def test_l2_cross_instance_fill(ng: Nginx, origin: Origin,
         b.stop()
 
 
-def make_ctb3_blob(body: bytes, status: int = 200,
+def make_ctb4_blob(body: bytes, status: int = 200,
                    headers: dict[str, str] | None = None,
                    created: int | None = None, fresh_ttl: int = 60,
-                   stale_ttl: int = 240, magic: int = 0x43544233,
-                   version: int = 3) -> bytes:
-    """Hand-build a CTB3 cache blob exactly as the module serialises it (STAB-4:
-    fixed 40-byte little-endian, padding-free header). Pass a wrong magic/version
-    to exercise the validator's reject path. Wire layout (LE):
-      u32 magic, u16 version, u16 flags, u32 status, u32 nheaders,
-      u32 headers_len, u32 body_len, i64 created, u32 fresh_ttl, u32 stale_ttl."""
+                   stale_ttl: int = 240, sie_ttl: int = 0,
+                   magic: int = 0x43544234,
+                   version: int = 4) -> bytes:
+    """Hand-build a CTB4 cache blob exactly as the module serialises it (STAB-4 +
+    RFC-2: fixed 44-byte little-endian, padding-free header). Pass a wrong
+    magic/version to exercise the validator's reject path. Wire layout (LE):
+      u32 magic, u16 version, u16 flags, u32 status, u32 nheaders, u32 headers_len,
+      u32 body_len, i64 created, u32 fresh_ttl, u32 stale_ttl, u32 sie_ttl."""
     headers = headers or {"Content-Type": "text/plain"}
     created = int(time.time()) if created is None else created
     hdr_block = b""
@@ -3154,8 +3198,9 @@ def make_ctb3_blob(body: bytes, status: int = 200,
         hdr_block += struct.pack("<I", len(nb)) + nb
         hdr_block += struct.pack("<I", len(vb)) + vb
         nheaders += 1
-    head = struct.pack("<IHHIIIIqII", magic, version, 0, status, nheaders,
-                       len(hdr_block), len(body), created, fresh_ttl, stale_ttl)
+    head = struct.pack("<IHHIIIIqIII", magic, version, 0, status, nheaders,
+                       len(hdr_block), len(body), created, fresh_ttl, stale_ttl,
+                       sie_ttl)
     return head + hdr_block + body
 
 
@@ -3278,7 +3323,7 @@ def test_l2_expired_consults_l2(ng: Nginx, origin: Origin,
     time.sleep(4.3)                                # past stale_until (valid*4=4s)
     # both L1 and L2 are expired now; reseed ONLY L2 with a fresh, valid blob
     seeded = b"l2-seeded\n"
-    blob = make_ctb3_blob(seeded, headers={"Content-Type": "text/plain"})
+    blob = make_ctb4_blob(seeded, headers={"Content-Type": "text/plain"})
     redis.set_raw(l2_key(uri), blob, 60_000)       # binary-safe raw RESP SET
     assert redis.cli("EXISTS", l2_key(uri)) == "1", "failed to seed L2"
 
@@ -3295,13 +3340,13 @@ def test_l2_expired_consults_l2(ng: Nginx, origin: Origin,
 def test_l2_preserves_original_freshness(ng: Nginx, origin: Origin,
                                          redis: RedisServer) -> None:
     """An L2 hit restores remaining freshness instead of resetting the location
-    TTL. Seed an already-stale CTB2 object with one second left in its original
+    TTL. Seed an already-stale object with one second left in its original
     stale window: first read is STALE, then it expires and the origin is used."""
     uri = "/l2e/original-lifetime"
     key = l2_key(uri)
     redis.cli("DEL", key, lock_key(uri))
     seeded = b"l2-aged\n"
-    blob = make_ctb3_blob(
+    blob = make_ctb4_blob(
         seeded, created=int(time.time()) - 2, fresh_ttl=1, stale_ttl=4)
     redis.set_raw(key, blob, 60_000)
 
@@ -3329,16 +3374,19 @@ def test_l2_malformed_blob_rejected(ng: Nginx, origin: Origin,
     and a subsequent request that is a legitimate HIT (no poisoned L1, no crash).
     The origin serves a dynamic gen-<n> body."""
     cases = {
-        "wrong-magic":   make_ctb3_blob(b"x", magic=0x43544232),     # CTB2
-        "wrong-version": make_ctb3_blob(b"x", version=2),
+        "wrong-magic":   make_ctb4_blob(b"x", magic=0x43544232),     # CTB2
+        "wrong-version": make_ctb4_blob(b"x", version=2),
+        # CTB3 (prior wire format): a stale on-disk blob from the pre-RFC-2 build
+        # must miss-to-origin once (self-heal), not be parsed at a shifted layout.
+        "old-ctb3":      make_ctb4_blob(b"x", magic=0x43544233, version=3),
         # valid header+version but headers_len lies past the buffer end
         "hdrlen-overflow": (
-            struct.pack("<IHHIIIIqII", 0x43544233, 3, 0, 200, 1,
-                        0xFFFF, 1, int(time.time()), 60, 240) + b"\x01"),
+            struct.pack("<IHHIIIIqIII", 0x43544234, 4, 0, 200, 1,
+                        0xFFFF, 1, int(time.time()), 60, 240, 0) + b"\x01"),
         # body_len lies past the buffer end
         "bodylen-overflow": (
-            struct.pack("<IHHIIIIqII", 0x43544233, 3, 0, 200, 0,
-                        0, 0xFFFF, int(time.time()), 60, 240)),
+            struct.pack("<IHHIIIIqIII", 0x43544234, 4, 0, 200, 0,
+                        0, 0xFFFF, int(time.time()), 60, 240, 0)),
     }
 
     for name, blob in cases.items():
@@ -3363,6 +3411,49 @@ def test_l2_malformed_blob_rejected(ng: Nginx, origin: Origin,
         assert s2 == 200 and body2 == body and h2.get("x-cache") == "HIT", \
             f"{name}: L1 poisoned/uncacheable after reject (2nd read {s2}, " \
             f"x-cache={h2.get('x-cache')})"
+
+
+def test_sie_ttl_stored_in_blob(ng: Nginx, origin: Origin,
+                                redis: RedisServer) -> None:
+    """RFC-2 (CTB4): a response Cache-Control: stale-if-error=N is recorded as an
+    ABSOLUTE serve-on-error window (fresh_ttl + N) in the blob's sie_ttl field at
+    wire offset 40. Origin under /siettl/ emits max-age=60, stale-if-error=30;
+    cache_turbo_valid 60s (honor_cc off, so fresh_ttl is the location 60s), so the
+    stored blob carries fresh_ttl=60 and sie_ttl=90. This locks the CTB4 wire
+    format + the response_sie parse; the serve-on-error consumer of sie_ttl lands
+    in a follow-up."""
+    # proxy_pass strips the /siettl/ location prefix, so the origin marker must
+    # ride the request SUFFIX (origin sees /siettl-k1, not /k1).
+    uri = "/siettl/siettl-k1"
+    key = l2_key(uri)
+    redis.cli("DEL", key)
+    fetch(ng.port, uri)                            # miss -> store L1 + L2
+    assert wait_for(lambda: redis.cli("EXISTS", key) == "1"), \
+        "object never written to L2"
+
+    blob = redis.get_raw(key)
+    assert blob is not None and len(blob) >= 44, f"short/absent blob: {blob!r}"
+    magic, version = struct.unpack("<IH", blob[:6])
+    assert magic == 0x43544234, f"blob magic {magic:#x} != CTB4 (0x43544234)"
+    assert version == 4, f"blob version {version} != 4"
+    fresh_ttl, stale_ttl, sie_ttl = struct.unpack("<III", blob[32:44])
+    assert fresh_ttl == 60, f"fresh_ttl {fresh_ttl} != 60 (location valid)"
+    assert sie_ttl == 90, f"sie_ttl {sie_ttl} != fresh_ttl+30 (90)"
+    assert stale_ttl >= fresh_ttl, \
+        f"stale_ttl {stale_ttl} < fresh_ttl {fresh_ttl}"
+
+    # A response WITHOUT stale-if-error carries sie_ttl == 0 (no serve-on-error
+    # window beyond the normal stale window).
+    uri2 = "/l2e/no-sie"
+    key2 = l2_key(uri2)
+    redis.cli("DEL", key2)
+    fetch(ng.port, uri2)
+    assert wait_for(lambda: redis.cli("EXISTS", key2) == "1"), \
+        "control object never written to L2"
+    blob2 = redis.get_raw(key2)
+    assert blob2 is not None and len(blob2) >= 44
+    (sie_ttl2,) = struct.unpack("<I", blob2[40:44])
+    assert sie_ttl2 == 0, f"sie_ttl {sie_ttl2} != 0 for a no-SIE response"
 
 
 def tag_key(name: str, prefix: str = "ct:") -> str:
@@ -4387,6 +4478,7 @@ def run_all(ng: Nginx, origin: Origin,
         test_l2_expired_consults_l2(ng, origin, redis)
         test_l2_preserves_original_freshness(ng, origin, redis)
         test_l2_malformed_blob_rejected(ng, origin, redis)  # STAB-4 validate
+        test_sie_ttl_stored_in_blob(ng, origin, redis)      # RFC-2 CTB4 sie_ttl
         test_l2_tag_add_on_store(ng, origin, redis)
         test_l2_tag_purge(ng, origin, redis)
         test_l2_tag_purge_large(ng, origin, redis)  # STAB-3 + PERF-1/2 pipeline
