@@ -951,6 +951,27 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # cache_turbo_safe_key on (COR-1): no explicit cache_turbo_key, so the
+        # default key applies, but in safe mode it is $scheme$host$request_uri
+        # (full raw query, no strip/sort), so two distinct sessionid values get
+        # distinct entries instead of aliasing onto one stripped key.
+        location /safekey/ {{
+            cache_turbo          main;
+            cache_turbo_valid    30s;
+            cache_turbo_safe_key on;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # cache_turbo_vary_safe on (SEC-4) with auto_vary OFF: a response carrying
+        # a Vary header is refused (not stored), since the key ignores it.
+        location /varysafe/ {{
+            cache_turbo          main;
+            cache_turbo_key      $request_uri;
+            cache_turbo_valid    30s;
+            cache_turbo_vary_safe on;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # auto-Vary OFF (default): the same response Vary header is ignored, so
         # two encodings collapse onto one slot (back-compat proof).
         location /avoff/ {{
@@ -1993,6 +2014,42 @@ def test_206_never_cached(ng: Nginx, origin: Origin) -> None:
     assert s1 == 206 and "x-cache" not in h1, \
         f"206 must never be cached, got X-Cache={h1.get('x-cache')}"
     assert origin.hits == base + 2, "206 was wrongly served from cache"
+
+
+def test_safe_key_distinct_sessionids(ng: Nginx, origin: Origin) -> None:
+    """COR-1: with cache_turbo_safe_key on, the default key is the full raw
+    request URI, so two distinct sessionid values get DISTINCT cache entries
+    instead of aliasing onto one stripped key (which could serve user A's page to
+    user B). The same sessionid still HITs its own entry."""
+    base = origin.hits
+    _, ba, ha = fetch(ng.port, "/safekey/p?sessionid=AAA")
+    assert "x-cache" not in ha, "first (sessionid=AAA) should miss"
+    _, bb, hb = fetch(ng.port, "/safekey/p?sessionid=BBB")
+    assert "x-cache" not in hb, \
+        f"a different sessionid must NOT alias, got X-Cache={hb.get('x-cache')}"
+    assert bb != ba, "two sessionids shared one cache entry (cross-user leak)"
+    assert origin.hits == base + 2, "the two sessionids should each reach origin"
+    _, ba2, ha2 = fetch(ng.port, "/safekey/p?sessionid=AAA")
+    assert ha2.get("x-cache") == "HIT" and ba2 == ba, \
+        "the same sessionid must HIT its own entry"
+
+
+def test_vary_safe_refuses_varied_response(ng: Nginx, origin: Origin) -> None:
+    """SEC-4: with cache_turbo_vary_safe on and auto_vary off, a response that
+    carries a Vary header is refused (never stored), because the key does not
+    account for the varied axis — caching it would poison every client."""
+    base = origin.hits
+    _, _, h0 = fetch(ng.port, "/varysafe/p?v=ae")        # origin -> Vary: A-E
+    assert "x-cache" not in h0, "first should miss"
+    _, _, h1 = fetch(ng.port, "/varysafe/p?v=ae")
+    assert "x-cache" not in h1, \
+        f"a varied response must not be cached under vary_safe, got {h1.get('x-cache')}"
+    assert origin.hits == base + 2, "vary_safe wrongly cached a Vary response"
+    # control: a NON-varied response on the same location still caches normally.
+    _, _, h2 = fetch(ng.port, "/varysafe/plain")
+    _, _, h3 = fetch(ng.port, "/varysafe/plain")
+    assert h3.get("x-cache") == "HIT", \
+        f"a non-varied response must still cache under vary_safe, got {h3.get('x-cache')}"
 
 
 def test_conditional_inm_304(ng: Nginx, origin: Origin) -> None:
@@ -3784,6 +3841,8 @@ def run_all(ng: Nginx, origin: Origin,
     test_auto_vary_unknown_axis_uncacheable(ng, origin)
     test_auto_vary_stale_marker_reachable(ng, origin)
     test_206_never_cached(ng, origin)
+    test_safe_key_distinct_sessionids(ng, origin)
+    test_vary_safe_refuses_varied_response(ng, origin)
     test_conditional_inm_304(ng, origin)
     test_conditional_inm_list_short_first(ng, origin)
     test_conditional_inm_star(ng)
@@ -3958,6 +4017,8 @@ def main() -> int:
           "Accept-Encoding q-value (gzip;q=0 != gzip bucket), "
           "auto-Vary unknown-axis uncacheable, "
           "auto-Vary stale-marker still reachable, 206 never cached, "
+          "safe_key distinct sessionids (COR-1), "
+          "vary_safe refuses varied response (SEC-4), "
           "conditional 304 (v11: If-None-Match/*/mismatch, "
           "If-Modified-Since fresh/stale, INM-beats-IMS precedence), "
           "PURGE method, bypass + no_store, "

@@ -471,6 +471,25 @@ typedef struct {
      * Authorization make the response uncacheable. Off by default. */
     ngx_flag_t               auto_vary;
 
+    /* Safe default key (COR-1). Off by default = the back-compatible normalized
+     * default key ($host$uri$cache_turbo_normalized_args): tracking params are
+     * stripped and args are sorted, which can merge distinct private URLs (e.g.
+     * two sessionid values) onto one entry. When on, the default key (only when
+     * no explicit cache_turbo_key is set) becomes $scheme$host$request_uri — the
+     * full raw query, no stripping, no sorting — so distinct queries never alias.
+     * Recommended for any origin that does not reliably mark per-user responses
+     * private/Set-Cookie. No effect when cache_turbo_key is set explicitly. */
+    ngx_flag_t               safe_key;
+
+    /* Vary safety (SEC-4). Off by default = a response carrying a `Vary` header
+     * the module is not keying on is still cached under the base key (the classic
+     * proxy-cache behaviour), which lets an attacker prime one representation for
+     * every client. When on, a response whose Vary is NOT fully represented in
+     * the key is refused (not stored): with auto_vary off that means ANY Vary;
+     * with auto_vary on the un-keyable axes are already refused, so this only
+     * tightens the auto_vary-off case. Recommended whenever upstreams emit Vary. */
+    ngx_flag_t               vary_safe;
+
     /* Backend vtables (v4-1). l1 = the local store (shm); it is a stateless
      * dispatch table (the zone is passed as an argument), so it is set
      * unconditionally and is never NULL. backend = the remote L2 driver (redis),

@@ -93,6 +93,7 @@ static void ngx_http_cache_turbo_marker_store(ngx_http_cache_turbo_loc_conf_t *c
     ngx_http_cache_turbo_zone_t *z, ngx_str_t *base, ngx_int_t bits, time_t ttl);
 static void ngx_http_cache_turbo_classify_vary(ngx_http_request_t *r,
     ngx_int_t *bits_out, ngx_uint_t *nocache_out);
+static ngx_uint_t ngx_http_cache_turbo_response_has_vary(ngx_http_request_t *r);
 static ngx_int_t ngx_http_cache_turbo_init(ngx_conf_t *cf);
 
 
@@ -218,6 +219,20 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
       ngx_conf_set_flag_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_cache_turbo_loc_conf_t, auto_vary),
+      NULL },
+
+    { ngx_string("cache_turbo_safe_key"),
+      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_cache_turbo_loc_conf_t, safe_key),
+      NULL },
+
+    { ngx_string("cache_turbo_vary_safe"),
+      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_cache_turbo_loc_conf_t, vary_safe),
       NULL },
 
     { ngx_string("cache_turbo_purge"),
@@ -2054,6 +2069,16 @@ ngx_http_cache_turbo_header_filter(ngx_http_request_t *r)
         ngx_uint_t  nocache = 0;
         ngx_http_cache_turbo_classify_vary(r, &ctx->vary_bits, &nocache);
         ctx->vary_nocache = nocache ? 1 : 0;
+
+    } else if (clcf->vary_safe
+               && ngx_http_cache_turbo_response_has_vary(r))
+    {
+        /* Vary safety (SEC-4): auto_vary is off, so the key does NOT account for
+         * any Vary field. Caching such a response would serve one representation
+         * for every value of the varied axis (cache poisoning / cross-tenant
+         * leak). Refuse to store it. (With auto_vary on, the classify step above
+         * already refuses the un-keyable axes, so vary_safe is a no-op there.) */
+        ctx->vary_nocache = 1;
     }
 
     /* Only capture cacheable responses. 200 always, plus any status named by a
@@ -4250,6 +4275,43 @@ ngx_http_cache_turbo_vary_resolve(ngx_http_request_t *r,
 }
 
 
+/* True if the response carries at least one non-empty Vary header. Used by the
+ * vary_safe gate (SEC-4) to refuse caching a varied response when auto_vary is
+ * off and the key therefore ignores every Vary field. Walks the header list
+ * (not the typed r->headers_out.vary field, which only exists on nginx >= 1.23)
+ * so the legacy header path is covered too. */
+static ngx_uint_t
+ngx_http_cache_turbo_response_has_vary(ngx_http_request_t *r)
+{
+    ngx_list_part_t  *part = &r->headers_out.headers.part;
+    ngx_table_elt_t  *h = part->elts;
+    ngx_uint_t        i;
+
+    for (i = 0; /* void */ ; i++) {
+        if (i >= part->nelts) {
+            if (part->next == NULL) {
+                break;
+            }
+            part = part->next;
+            h = part->elts;
+            i = 0;
+        }
+        if (h[i].hash == 0) {
+            continue;
+        }
+        if (h[i].key.len == sizeof("Vary") - 1
+            && ngx_strncasecmp(h[i].key.data, (u_char *) "Vary",
+                               sizeof("Vary") - 1) == 0
+            && h[i].value.len != 0)
+        {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+
 /* Classify the response Vary header into a safe-axis bitmask (what we may key
  * on) and a nocache veto. Only the whitelist (Accept-Encoding, User-Agent,
  * Accept-Language, Origin) contributes to the key. Anything else — Vary: *,
@@ -4656,6 +4718,8 @@ ngx_http_cache_turbo_create_loc_conf(ngx_conf_t *cf)
     conf->autotune_interval = NGX_CONF_UNSET;
     conf->honor_cc = NGX_CONF_UNSET;
     conf->auto_vary = NGX_CONF_UNSET;
+    conf->safe_key = NGX_CONF_UNSET;
+    conf->vary_safe = NGX_CONF_UNSET;
     conf->purge = NGX_CONF_UNSET;
     conf->background_update = NGX_CONF_UNSET;
     conf->lock = NGX_CONF_UNSET;
@@ -4764,6 +4828,8 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     }
     ngx_conf_merge_value(conf->honor_cc, prev->honor_cc, 0);
     ngx_conf_merge_value(conf->auto_vary, prev->auto_vary, 0);
+    ngx_conf_merge_value(conf->safe_key, prev->safe_key, 0);
+    ngx_conf_merge_value(conf->vary_safe, prev->vary_safe, 0);
 
     /* PURGE method (v14): off by default. */
     ngx_conf_merge_value(conf->purge, prev->purge, 0);
@@ -4798,14 +4864,17 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
         conf->key = prev->key;
     }
 
-    /* Default cache key (no explicit cache_turbo_key) for an enabled location:
-     * $host$uri$cache_turbo_normalized_args — host so vhosts don't collide, $uri
-     * for the path, and the normalized args so tracking params are stripped and
-     * args are order-insensitive out of the box. Compiled lazily here; the
+    /* Default cache key (no explicit cache_turbo_key) for an enabled location.
+     * Normalized default: $host$uri$cache_turbo_normalized_args — tracking params
+     * stripped + args sorted out of the box. With cache_turbo_safe_key on (COR-1)
+     * the default instead becomes $scheme$host$request_uri — the full raw query,
+     * no stripping/sorting — so distinct private URLs (e.g. two sessionid values)
+     * can never alias onto one entry. Compiled lazily here; the normalized_args
      * variable was registered in preconfiguration. */
     if (conf->key == NULL && conf->enable) {
-        ngx_str_t                         defkey =
-            ngx_string("$host$uri$cache_turbo_normalized_args");
+        ngx_str_t                         defkey = conf->safe_key
+            ? (ngx_str_t) ngx_string("$scheme$host$request_uri")
+            : (ngx_str_t) ngx_string("$host$uri$cache_turbo_normalized_args");
         ngx_http_compile_complex_value_t  ccv;
 
         conf->key = ngx_palloc(cf->pool, sizeof(ngx_http_complex_value_t));
