@@ -602,6 +602,7 @@ http {{
     cache_turbo_zone name=main 16m;
     cache_turbo_zone name=tiny 8m;   # small zone for eviction test (R6)
     cache_turbo_zone name=at 16m;    # autotune raise/clamp/off (v4-3)
+    cache_turbo_zone name=atl 16m;   # autotune load-adaptive stale widen (v4-4)
     cache_turbo_zone name=ati 16m;   # autotune insufficient-data (v4-3)
     cache_turbo_zone name=atch 16m;  # autotune churn-disqualify (v4-3)
     cache_turbo_zone name=ka0 8m;    # Redis keepalive DB-isolation test
@@ -1168,6 +1169,21 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # v4-4 load-adaptive stale widen. conservative (stale_mult 2) + valid 1s =
+        # static serveable window 2s. A slow-miss window pumps the zone load factor
+        # to the cap (4x); the probe entry, hard-expired by its STATIC 2s window, is
+        # still STALE-serveable at t=3s because the load factor widened the
+        # serveable stale span. bg-update ON (default) so losers serve stale.
+        location /atl/ {{
+            cache_turbo          atl;
+            cache_turbo_key      $uri;
+            cache_turbo_preset   conservative;
+            cache_turbo_valid    1s;
+            cache_turbo_autotune on;
+            cache_turbo_autotune_interval 3600s;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # autotune insufficient-data: a fresh zone with < MISSES_FLOOR traffic in
         # the window must NOT publish a verdict (autotuned_beta stays 0).
         location /ati/ {{
@@ -1205,6 +1221,11 @@ http {{
 
         location = /_cache_at {{
             cache_turbo_admin at;
+            allow 127.0.0.1;
+            deny all;
+        }}
+        location = /_cache_atl {{
+            cache_turbo_admin atl;
             allow 127.0.0.1;
             deny all;
         }}
@@ -4353,6 +4374,70 @@ def test_autotune_raises_beta_within_band(ng: Nginx, origin: Origin) -> None:
         drain_origin(origin)   # v8: settle async bg refreshes before next test
 
 
+def test_autotune_load_factor_under_load(ng: Nginx, origin: Origin) -> None:
+    """v4-4: the same slow-miss window that raises beta also publishes a LOAD
+    FACTOR (×1000) the request path uses to widen the stale window + lock_ttl.
+    load = clamp(1000, cost_ms×100, 4000); a ~40ms regen saturates it at the 4000
+    cap. A subsequent high-hit-rate window (not under load) snaps it back to the
+    1000 baseline — proving the factor adapts down, not just up."""
+    origin.delay = 0.04          # ~40ms regen -> cost×100 >= 4000 -> capped
+    try:
+        fetch(ng.port, "/at/lseed")              # snapshot the window start
+        _fire_misses(ng, "/at/lk", 110)          # 110 distinct slow misses
+        st = _autotune_force(ng, "/_cache_at")
+        assert 25 <= st["cost_ms"] <= 500, f"cost not measured sanely: {st}"
+        load = st["autotuned_load"]
+        # cost_ms >= 40 (a real 40ms sleep) => cost×100 >= 4000 => hits the cap.
+        assert load == 4000, \
+            f"load factor should saturate at the 4000 cap for a ~40ms origin: {st}"
+    finally:
+        origin.delay = 0.0
+        drain_origin(origin)
+
+    # Snap-back: a window dominated by HITS (few misses, hit-rate >= 95%) does not
+    # qualify as under-load, so the verdict republishes the 1000 baseline. Uses a
+    # hit-heavy window (not a fast-miss one) so it is robust under ASan timing.
+    fetch(ng.port, "/at/hot")                    # prime (1 miss)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
+        list(pool.map(lambda _: fetch(ng.port, "/at/hot"), range(130)))   # 130 hits
+    st2 = _autotune_force(ng, "/_cache_at")
+    assert st2["autotuned_load"] == 1000, \
+        f"load factor did not snap back to baseline on a non-load window: {st2}"
+
+
+def test_autotune_load_widens_stale_window(ng: Nginx, origin: Origin) -> None:
+    """v4-4 behaviour: with the zone load factor pumped to the cap, an entry that
+    is hard-expired by its STATIC stale window (conservative ×2: fresh 1s + stale
+    1s = serveable 2s) is still STALE-serveable at t=3s, because the load factor
+    widened the serveable stale span (fresh window is NOT touched). Mirror of
+    test_preset_window_differs, but here the wider window comes from live load, not
+    a preset."""
+    origin.delay = 0.04
+    try:
+        fetch(ng.port, "/atl/seed")
+        _fire_misses(ng, "/atl/k", 110)          # pump the zone load factor
+        st = _autotune_force(ng, "/_cache_atl")
+        assert st["autotuned_load"] >= 2000, f"load not pumped: {st}"
+        origin.delay = 0.0
+        fetch(ng.port, "/atl/probe")             # prime the probe (fresh 1s)
+    finally:
+        origin.delay = 0.0
+
+    time.sleep(3.0)                              # past static 2s, within widened ~5s
+
+    # Burst so single-flight forces losers to serve stale (the dice winner may
+    # regenerate); at least one STALE proves the load-widened window held.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
+        res = list(pool.map(lambda _: fetch(ng.port, "/atl/probe"), range(16)))
+    assert {r[0] for r in res} == {200}, \
+        f"load-widen stale burst returned {set(r[0] for r in res)}"
+    assert any(h.get("x-cache") == "STALE" for _, _, h in res), \
+        ("load-widened stale window should still serve STALE at t=3s (a static "
+         "conservative ×2 window would hard-expire and MISS); got "
+         + repr(sorted({h.get("x-cache") for _, _, h in res})))
+    drain_origin(origin)
+
+
 def test_autotune_off_by_default(ng: Nginx) -> None:
     """A location WITHOUT cache_turbo_autotune ignores the zone's live verdict and
     always reports its static preset beta (balanced = 1000), even though /ato/
@@ -4618,6 +4703,8 @@ def run_all(ng: Nginx, origin: Origin,
     test_preset_micro_default_ttl(ng, origin)
     test_invalid_preset_name(ng)
     test_autotune_raises_beta_within_band(ng, origin)
+    test_autotune_load_factor_under_load(ng, origin)
+    test_autotune_load_widens_stale_window(ng, origin)
     test_autotune_off_by_default(ng)
     test_autotune_insufficient_data(ng, origin)
     test_autotune_churn_disqualifies(ng, origin)

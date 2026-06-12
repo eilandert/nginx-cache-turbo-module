@@ -715,6 +715,36 @@ ngx_http_cache_turbo_effective_beta(ngx_http_cache_turbo_loc_conf_t *clcf,
 
 
 /*
+ * v4-4: resolve the load factor (×1000) the request path uses to widen the
+ * serveable stale window and the single-flight lock_ttl under sustained backend
+ * load. Baseline AT_LOAD_BASE (1000 = no widening) when autotune is off, no
+ * verdict is published yet, or the last window was not under load. Unlike beta
+ * this is NOT re-clamped to the location's preset band — it is a zone-global
+ * load signal, not a per-location eagerness dial — but it is hard-capped at
+ * AT_LOAD_MAX so a pathological cost can never extend stale/lock past ≤4×.
+ */
+static ngx_int_t
+ngx_http_cache_turbo_effective_load(ngx_http_cache_turbo_loc_conf_t *clcf,
+    ngx_http_cache_turbo_zone_t *z)
+{
+    ngx_int_t  ld;
+
+    if (!clcf->autotune) {
+        return NGX_HTTP_CACHE_TURBO_AT_LOAD_BASE;
+    }
+
+    ld = (ngx_int_t) z->sh->autotuned_load;
+    if (ld <= NGX_HTTP_CACHE_TURBO_AT_LOAD_BASE) {
+        return NGX_HTTP_CACHE_TURBO_AT_LOAD_BASE;
+    }
+    if (ld > NGX_HTTP_CACHE_TURBO_AT_LOAD_MAX) {
+        ld = NGX_HTTP_CACHE_TURBO_AT_LOAD_MAX;
+    }
+    return ld;
+}
+
+
+/*
  * Fresh TTL (seconds) to cache a response with this status, or -1 if the status
  * is not cacheable here (v6). 200 always caches at clcf->valid; any other status
  * caches only if a `cache_turbo_valid <code> <time>` rule named it. A configured
@@ -1643,6 +1673,30 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
         ngx_int_t  refresh;
         ngx_int_t  fresh_ok = 1, stale_ok = 1;
 
+        /* v4-4 load-adaptive stale window. Under sustained backend load
+         * autotune publishes a load factor (>BASE); widen ONLY the serveable
+         * stale deadline by it, so a slow origin is shielded by serving stale
+         * longer before a hard miss. The FRESH deadline (fresh_until) is left
+         * untouched — the freshness contract the operator configured is never
+         * relaxed, only the best-effort stale grace is. stale_until == 0 means
+         * "no stale deadline" (e.g. cache-forever) and is left as-is. The widen
+         * applies to the local `stale_until` only; the refresh-dice window below
+         * still reads ctn->stale_until (the STORED window), so beta keeps owning
+         * refresh timing while the load factor owns serve-stale reach. */
+        if (stale_until != 0 && clcf->autotune) {
+            ngx_int_t  load = ngx_http_cache_turbo_effective_load(clcf, z);
+
+            if (load > NGX_HTTP_CACHE_TURBO_AT_LOAD_BASE) {
+                time_t  win = stale_until - fresh_until;   /* stored stale span */
+
+                if (win > 0) {
+                    stale_until += win
+                        * (load - NGX_HTTP_CACHE_TURBO_AT_LOAD_BASE)
+                        / NGX_HTTP_CACHE_TURBO_AT_LOAD_BASE;
+                }
+            }
+        }
+
         /* RFC-1 request freshness bounds (max-age / min-fresh / max-stale): an
          * existing entry may be unacceptable to THIS client even when the cache
          * would serve it. Read the blob's created stamp (offset 24) for an exact
@@ -1797,6 +1851,14 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
                 if (lock_ttl <= 0) {
                     lock_ttl = 5;
                 }
+
+                /* v4-4: a slow origin (the load case) takes longer to regen, so
+                 * widen the single-flight window by the load factor — hold the
+                 * claim long enough that a still-running slow refresh isn't
+                 * re-claimed, collapsing more requests onto the one regen. */
+                lock_ttl = lock_ttl
+                    * ngx_http_cache_turbo_effective_load(clcf, z)
+                    / NGX_HTTP_CACHE_TURBO_AT_LOAD_BASE;
 
                 /* snapshot the stale copy under the lock — used to serve stale on
                  * the single-box background-update path below. */
@@ -2056,6 +2118,13 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
         if (lock_ttl <= 0) {
             lock_ttl = 5;
         }
+
+        /* v4-4: widen the cold-miss single-flight window by the load factor too,
+         * so a stampede onto an uncached key during a slow-origin spell collapses
+         * onto one regen for longer (same rationale as the stale-refresh claim). */
+        lock_ttl = lock_ttl
+            * ngx_http_cache_turbo_effective_load(clcf, z)
+            / NGX_HTTP_CACHE_TURBO_AT_LOAD_BASE;
 
         /* Resume after the cross-node NX park (we are the per-box claim winner
          * that fired the lock): won -> we own the fleet-wide regen, go to origin;
@@ -4641,12 +4710,16 @@ ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
                 "cache_turbo_regen_cost_ms{zone=\"%V\"} %uA\n"
                 "# HELP cache_turbo_autotuned_beta Live autotuned SWR beta (x1000; 0 = none).\n"
                 "# TYPE cache_turbo_autotuned_beta gauge\n"
-                "cache_turbo_autotuned_beta{zone=\"%V\"} %uA\n",
+                "cache_turbo_autotuned_beta{zone=\"%V\"} %uA\n"
+                "# HELP cache_turbo_autotuned_load Live load factor widening stale window + lock_ttl under load (x1000; 1000 = none).\n"
+                "# TYPE cache_turbo_autotuned_load gauge\n"
+                "cache_turbo_autotuned_load{zone=\"%V\"} %uA\n",
                 &zname, st.hits, &zname, st.misses, &zname, st.stale_serves,
                 &zname, st.refreshes, &zname, st.evictions,
                 &zname, st.l2_hits, &zname, st.l2_misses, &zname, st.lock_waits,
                 &zname, st.min_uses_skips,
-                &zname, st.cost_ms, &zname, st.autotuned_beta) - p;
+                &zname, st.cost_ms, &zname, st.autotuned_beta,
+                &zname, st.autotuned_load) - p;
 
             return ngx_http_cache_turbo_send_body(r, NGX_HTTP_OK, &body,
                 "text/plain; version=0.0.4; charset=utf-8",
@@ -4655,8 +4728,9 @@ ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
 
         len = sizeof("{\"hits\":,\"misses\":,\"stale_serves\":,\"refreshes\":,"
                      "\"evictions\":,\"l2_hits\":,\"l2_misses\":,\"lock_waits\":,"
-                     "\"min_uses_skips\":,\"cost_ms\":,\"autotuned_beta\":}\n")
-              + 11 * NGX_ATOMIC_T_LEN;
+                     "\"min_uses_skips\":,\"cost_ms\":,\"autotuned_beta\":,"
+                     "\"autotuned_load\":}\n")
+              + 12 * NGX_ATOMIC_T_LEN;
         p = ngx_pnalloc(r->pool, len);
         if (p == NULL) {
             return NGX_HTTP_INTERNAL_SERVER_ERROR;
@@ -4666,11 +4740,11 @@ ngx_http_cache_turbo_admin_handler(ngx_http_request_t *r)
             "{\"hits\":%uA,\"misses\":%uA,\"stale_serves\":%uA,"
             "\"refreshes\":%uA,\"evictions\":%uA,\"l2_hits\":%uA,"
             "\"l2_misses\":%uA,\"lock_waits\":%uA,\"min_uses_skips\":%uA,"
-            "\"cost_ms\":%uA,\"autotuned_beta\":%uA}\n",
+            "\"cost_ms\":%uA,\"autotuned_beta\":%uA,\"autotuned_load\":%uA}\n",
             st.hits, st.misses, st.stale_serves,
             st.refreshes, st.evictions, st.l2_hits, st.l2_misses,
             st.lock_waits, st.min_uses_skips, st.cost_ms,
-            st.autotuned_beta) - p;
+            st.autotuned_beta, st.autotuned_load) - p;
     }
     return ngx_http_cache_turbo_send_json(r, NGX_HTTP_OK, &body);
 }

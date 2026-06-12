@@ -53,12 +53,19 @@ ngx_http_cache_turbo_autotune_record_cost(ngx_http_cache_turbo_zone_t *z,
  */
 static ngx_int_t
 ngx_http_cache_turbo_autotune_verdict(ngx_uint_t d_hits, ngx_uint_t d_misses,
-    ngx_uint_t d_refreshes, ngx_uint_t d_cost_sum, ngx_uint_t d_cost_count)
+    ngx_uint_t d_refreshes, ngx_uint_t d_cost_sum, ngx_uint_t d_cost_count,
+    ngx_int_t *load_out)
 {
     ngx_uint_t  total, cost_ms, qualifies;
-    ngx_int_t   beta;
+    ngx_int_t   beta, load;
 
     total = d_hits + d_misses;
+
+    /* v4-4: *load_out mirrors the return value's data-sufficiency contract.
+     * -1 ("too little data, keep last") on both; a real window publishes both
+     * beta and a load factor. Default to -1 so every early return keeps the
+     * last load verdict, exactly like beta. */
+    *load_out = -1;
 
     if (total < (ngx_uint_t) NGX_HTTP_CACHE_TURBO_AT_MISSES_FLOOR
         || d_cost_count == 0)
@@ -97,6 +104,9 @@ ngx_http_cache_turbo_autotune_verdict(ngx_uint_t d_hits, ngx_uint_t d_misses,
     }
 
     if (!qualifies) {
+        /* Not under load: beta clears to the preset (0) and the load factor
+         * snaps back to baseline (no stale/lock widening). */
+        *load_out = NGX_HTTP_CACHE_TURBO_AT_LOAD_BASE;
         return 0;
     }
 
@@ -109,6 +119,20 @@ ngx_http_cache_turbo_autotune_verdict(ngx_uint_t d_hits, ngx_uint_t d_misses,
         beta = NGX_HTTP_CACHE_TURBO_BETA_MAX;
     }
 
+    /* v4-4 load factor from the same avg regen cost: AT_LOAD_PER_MS per ms, so it
+     * is exactly 1× at the AT_COST_MOD_MS moderate-load gate and rises with a
+     * slower origin, hard-capped at AT_LOAD_MAX (≤4×). Never below baseline (a
+     * qualifying window is, by definition, under load). */
+    load = (ngx_int_t) (cost_ms * NGX_HTTP_CACHE_TURBO_AT_LOAD_PER_MS);
+
+    if (load < NGX_HTTP_CACHE_TURBO_AT_LOAD_BASE) {
+        load = NGX_HTTP_CACHE_TURBO_AT_LOAD_BASE;
+
+    } else if (load > NGX_HTTP_CACHE_TURBO_AT_LOAD_MAX) {
+        load = NGX_HTTP_CACHE_TURBO_AT_LOAD_MAX;
+    }
+
+    *load_out = load;
     return beta;
 }
 
@@ -124,7 +148,7 @@ static void
 ngx_http_cache_turbo_autotune_recompute_locked(ngx_http_cache_turbo_zone_t *z)
 {
     ngx_uint_t  hits, misses, refreshes, cost_sum, cost_count;
-    ngx_int_t   verdict;
+    ngx_int_t   verdict, load;
 
     hits       = (ngx_uint_t) z->sh->hits;
     misses     = (ngx_uint_t) z->sh->misses;
@@ -137,7 +161,8 @@ ngx_http_cache_turbo_autotune_recompute_locked(ngx_http_cache_turbo_zone_t *z)
                   misses     - (ngx_uint_t) z->sh->snap_misses,
                   refreshes  - (ngx_uint_t) z->sh->snap_refreshes,
                   cost_sum   - (ngx_uint_t) z->sh->snap_cost_sum,
-                  cost_count - (ngx_uint_t) z->sh->snap_cost_count);
+                  cost_count - (ngx_uint_t) z->sh->snap_cost_count,
+                  &load);
 
     z->sh->snap_hits       = hits;
     z->sh->snap_misses     = misses;
@@ -146,9 +171,12 @@ ngx_http_cache_turbo_autotune_recompute_locked(ngx_http_cache_turbo_zone_t *z)
     z->sh->snap_cost_count = cost_count;
 
     /* >=0 publishes (0 = clear / fall back to preset); -1 keeps the last good
-     * verdict (too little data this window to re-decide). */
+     * verdict (too little data this window to re-decide). beta and the v4-4 load
+     * factor share that contract and are set together by the verdict, so the one
+     * guard covers both. */
     if (verdict >= 0) {
         z->sh->autotuned_beta = (ngx_atomic_t) verdict;
+        z->sh->autotuned_load = (ngx_atomic_t) load;
     }
 }
 

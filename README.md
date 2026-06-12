@@ -387,6 +387,35 @@ location ~ \.php$ {
   (stale-if-error). Turn it off only if you need every served body strictly ≤1s
   old at the cost of one client per second waiting on the backend.
 
+## What autotune actually tunes
+
+`cache_turbo_autotune on` makes the cache **load-adaptive**: every
+`cache_turbo_autotune_interval` (default 30s) it measures the window's average
+backend regeneration cost and hit-rate, and when the origin is genuinely under
+load it dials three things — then relaxes them the first quiet window. Off by
+default; the freshness contract you configured is never relaxed.
+
+| What it tunes | Under load | Bounded by | Touches freshness? |
+|---|---|---|---|
+| **`beta`** (refresh eagerness) | raised from the measured cost (`beta = cost_ms/20`, ×1000) so refreshes fire earlier and smooth the load | re-clamped to the location's preset band (`beta_min..beta_max`) | no |
+| **Stale window** (serve-stale grace) | widened by a load factor so a stale entry stays serveable longer before becoming a hard miss — fewer origin trips | ≤4× the configured stale window | **no — the fresh TTL is untouched; only the best-effort stale grace stretches** |
+| **`lock_ttl`** (single-flight window) | widened by the same factor so a slow regen isn't re-claimed mid-flight and more requests collapse onto it | ≤4× the configured `lock_ttl` | no |
+
+The load factor is published per-zone as `cache_turbo_autotuned_load` (×1000;
+`1000` = baseline / not under load, up to `4000`). It is derived from the same
+cost signal as beta — `1×` at the moderate-load threshold, rising with a slower
+origin, hard-capped at `4×` — and **snaps back to `1000`** the first interval the
+backend is no longer under load (low cost *or* a healthy hit-rate). So a traffic
+spike that overwhelms the origin transparently buys the cache more stale-serving
+headroom and tighter dogpile control, and it all reverts automatically once the
+spike passes. What it will **never** do is extend the *fresh* TTL — a client is
+never told "fresh" about content older than your `cache_turbo_valid` contract.
+
+> ⚠️ Load-adaptation is folded into `cache_turbo_autotune on` — turning autotune
+> on enables all three. If you want *only* beta tuning with a rock-fixed stale
+> window, you currently get the adaptive stale/lock behaviour too (bounded ≤4×);
+> the fresh-TTL guarantee is unaffected either way.
+
 ## Full example (the works)
 
 ```nginx
@@ -442,7 +471,7 @@ http {
 ```console
 # stats (JSON)
 $ curl localhost/_cache
-{"hits":1240,"misses":83,"stale_serves":12,"refreshes":11,"evictions":0,"l2_hits":61,"l2_misses":22,"cost_ms":34,"autotuned_beta":1700}
+{"hits":1240,"misses":83,"stale_serves":12,"refreshes":11,"evictions":0,"l2_hits":61,"l2_misses":22,"cost_ms":34,"autotuned_beta":1700,"autotuned_load":1000}
 
 $ curl -X POST 'localhost/_cache?key=/blog/post-42'   # drop one page
 {"purged":1}
@@ -585,8 +614,8 @@ http {
 | `cache_turbo_purge on` | `server`, `location` | `off` | Allow a `PURGE <uri>` request to drop that URI's entry from L1 (+L2). Gate the location with `allow`/`deny`. E.g. `curl -X PURGE http://host/blog/post-42`. |
 | `cache_turbo_honor_cache_control on` | `server`, `location` | `off` | Take the fresh TTL from the response's own `Cache-Control: s-maxage`/`max-age` (s-maxage wins), or its `Expires`, instead of the static TTL. Falls back to `cache_turbo_valid` when the response carries no freshness info. |
 | `cache_turbo_background_update on` / `off` | `server`, `location` | `on` | The stale-while-revalidate behaviour. **On** (default): a stale page is served *immediately* while one request quietly refreshes it in the background — **nobody waits on the backend**, and if that refresh hits a 5xx/timeout the old copy is left untouched and keeps being served (**stale-if-error**). **Off**: the chosen refresher regenerates inline (it waits for the backend and serves the fresh body), the pre-SWR behaviour. |
-| `cache_turbo_autotune on` | `server`, `location` | `off` | Auto-pick `beta` from the measured backend latency, clamped to the preset's band. |
-| `cache_turbo_autotune_interval TIME` | `server`, `location` | `30s` | How often autotune recomputes. |
+| `cache_turbo_autotune on` | `server`, `location` | `off` | Adapt to live backend load. Auto-picks `beta` from the measured regen latency (clamped to the preset's band) **and**, under sustained load, widens two knobs by a load factor (≤4×): the **serveable stale window** (serve stale longer before a hard miss) and the **single-flight `lock_ttl`** (collapse more requests onto one regen). The **fresh** TTL is never touched — the freshness contract you set is unchanged; only the best-effort stale grace and dogpile window stretch, and they snap back the first quiet window. See [What autotune does](#what-autotune-actually-tunes). |
+| `cache_turbo_autotune_interval TIME` | `server`, `location` | `30s` | How often autotune recomputes (the window over which load is measured). |
 | `cache_turbo_redis DSN [opts...]` | `http`, `server`, `location` | — | Add a shared **L2 Redis** tier. `DSN` is `redis://[user:pass@]host:port/db` (or bare `host:port`); `rediss://` = TLS. Write-through on store; one sync `GET` on an L1 miss (never on an L1 hit). Opts: `prefix=` (`ct:`, must be non-empty), `timeout=` (`250ms`), `password=`, `user=`, `db=`, `tls=on\|off`, `tls_verify=on\|off` (default on), `tls_ca=<file>`, `tls_name=<host>`, `keepalive=N` (idle conns to pool per worker, `0`=off), `keepalive_timeout=` (`60s`). Pooled conns are reused only within the same db/credentials/TLS context. Native client, no hiredis. |
 | `cache_turbo_memcached HOST:PORT [opts...]` | `http`, `server`, `location` | — | Add a shared **L2 memcached** tier (alternative to `cache_turbo_redis`, mutually exclusive with it). Write-through on store; one sync `get` on an L1 miss. Opts: `prefix=` (`ct:`), `timeout=` (`250ms`). No tags / `?all` / cross-node lock (memcached lacks sorted sets, `SCAN`, atomic `SET-NX`); 1 MiB value cap. Native client, no libmemcached. |
 | `cache_turbo_tag EXPR` | `server`, `location` | — | Tag stored pages (whitespace/comma list) so they can be purged as a group. Needs `cache_turbo_redis`. |
@@ -635,6 +664,7 @@ cache_turbo_l2_hits_total{zone="ct"} 61
 cache_turbo_l2_misses_total{zone="ct"} 22
 cache_turbo_regen_cost_ms{zone="ct"} 34
 cache_turbo_autotuned_beta{zone="ct"} 1700
+cache_turbo_autotuned_load{zone="ct"} 1000
 ```
 
 Every sample is labelled by `zone`, so one job can scrape many zones. Metrics:
@@ -652,6 +682,7 @@ Every sample is labelled by `zone`, so one job can scrape many zones. Metrics:
 | `cache_turbo_min_uses_skips_total` | counter | Requests sent to origin (not stored) for being below `cache_turbo_min_uses`. |
 | `cache_turbo_regen_cost_ms` | gauge | Average backend regeneration time (ms). |
 | `cache_turbo_autotuned_beta` | gauge | Live autotuned `beta` ×1000 (0 = none). |
+| `cache_turbo_autotuned_load` | gauge | Live load factor ×1000 widening the stale window + `lock_ttl` under load (1000 = baseline / not under load, up to 4000). |
 
 `prometheus.yml`:
 

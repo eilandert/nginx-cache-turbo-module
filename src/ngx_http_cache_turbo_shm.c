@@ -98,6 +98,7 @@ ngx_http_cache_turbo_shm_init_zone(ngx_shm_zone_t *shm_zone, void *data)
     ctx->sh->cost_sum_ms = 0;
     ctx->sh->cost_count = 0;
     ctx->sh->autotuned_beta = 0;
+    ctx->sh->autotuned_load = 0;   /* v4-4: 0 = baseline (no stale/lock widen) */
     ctx->sh->autotune_next = 0;
     ctx->sh->snap_hits = 0;
     ctx->sh->snap_misses = 0;
@@ -455,6 +456,7 @@ ngx_http_cache_turbo_shm_stats(ngx_http_cache_turbo_zone_t *z,
     cnt = z->sh->cost_count;
     out->cost_ms        = cnt ? (z->sh->cost_sum_ms / cnt) : 0;
     out->autotuned_beta = z->sh->autotuned_beta;
+    out->autotuned_load = z->sh->autotuned_load;   /* v4-4 load factor ×1000 */
 }
 
 

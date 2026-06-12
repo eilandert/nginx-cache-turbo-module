@@ -121,6 +121,20 @@
 #define NGX_HTTP_CACHE_TURBO_AT_HIT_RATE_CAP   95     /* hit-rate < 95% (percent) */
 #define NGX_HTTP_CACHE_TURBO_AT_CHURN_CAP      2      /* refreshes/misses > 2 → no */
 
+/* Load-adaptive autotune (v4-4). Folded into cache_turbo_autotune on: when the
+ * same cost/hit-rate verdict that drives beta says the backend is under load,
+ * the zone also publishes a LOAD FACTOR (×1000, 1000 = baseline). The request
+ * path widens two knobs by it — the serveable STALE window (not the fresh
+ * window: the freshness contract is unchanged) and the single-flight lock_ttl —
+ * so a slow/overwhelmed origin is shielded by serving stale longer and
+ * collapsing more requests onto one regen. Snaps back to 1000 the first window
+ * load clears. The factor is mapped from avg regen cost: AT_LOAD_PER_MS per ms
+ * (so 1× at AT_COST_MOD_MS, the same moderate-load gate beta uses) and capped at
+ * AT_LOAD_MAX (= a hard ≤4× ceiling on both widenings). */
+#define NGX_HTTP_CACHE_TURBO_AT_LOAD_BASE      1000   /* 1.0 ×1000 (no widening)  */
+#define NGX_HTTP_CACHE_TURBO_AT_LOAD_MAX       4000   /* 4.0 ×1000 (widening cap) */
+#define NGX_HTTP_CACHE_TURBO_AT_LOAD_PER_MS    100    /* load = cost_ms × 100     */
+
 /* Default recompute cadence (seconds) when cache_turbo_autotune is on but no
  * cache_turbo_autotune_interval is given. */
 #define NGX_HTTP_CACHE_TURBO_AT_INTERVAL       30
@@ -264,6 +278,8 @@ typedef struct {
     ngx_atomic_t             cost_sum_ms;   /* Σ origin-regen request_time (ms) */
     ngx_atomic_t             cost_count;    /* number of origin regens measured */
     ngx_atomic_t             autotuned_beta;/* live verdict ×1000, 0 = none     */
+    ngx_atomic_t             autotuned_load;/* v4-4 load factor ×1000, 0/1000   *
+                                             * = baseline (no stale/lock widen) */
     ngx_atomic_t             autotune_next; /* next recompute (epoch seconds)   */
     ngx_atomic_uint_t        snap_hits;
     ngx_atomic_uint_t        snap_misses;
@@ -298,6 +314,7 @@ typedef struct {
      * an operator) can see the live tuning without an internal probe. */
     ngx_atomic_uint_t   cost_ms;
     ngx_atomic_uint_t   autotuned_beta;
+    ngx_atomic_uint_t   autotuned_load;   /* v4-4 load factor ×1000 (1000 = none) */
 } ngx_http_cache_turbo_stats_t;
 
 
