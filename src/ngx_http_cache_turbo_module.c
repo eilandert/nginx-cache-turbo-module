@@ -233,6 +233,13 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
       offsetof(ngx_http_cache_turbo_loc_conf_t, honor_cc),
       NULL },
 
+    { ngx_string("cache_turbo_ignore_cache_control"),
+      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_cache_turbo_loc_conf_t, ignore_cc),
+      NULL },
+
     { ngx_string("cache_turbo_auto_vary"),
       NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_FLAG,
       ngx_conf_set_flag_slot,
@@ -252,6 +259,13 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
       ngx_conf_set_flag_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_cache_turbo_loc_conf_t, vary_safe),
+      NULL },
+
+    { ngx_string("cache_turbo_x_cache"),
+      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_cache_turbo_loc_conf_t, x_cache),
       NULL },
 
     { ngx_string("cache_turbo_purge"),
@@ -2640,12 +2654,18 @@ ngx_http_cache_turbo_restore_response(ngx_http_request_t *r, u_char *copy,
     }
 
     /* X-Cache debug header. The caller chooses the value (HIT / STALE for a live
-     * serve, STALE-IF-ERROR for the RFC-2 serve-on-error replacement). */
+     * serve, STALE-IF-ERROR for the RFC-2 serve-on-error replacement). Gated by
+     * cache_turbo_x_cache (default on); Age above is always emitted (RFC 9111). */
     {
-        static u_char  xc_name[] = "X-Cache";
-        (void) ngx_http_cache_turbo_add_header(r, xc_name,
-                   sizeof("X-Cache") - 1, (u_char *) xcache,
-                   ngx_strlen(xcache));
+        ngx_http_cache_turbo_loc_conf_t  *clcf;
+
+        clcf = ngx_http_get_module_loc_conf(r, ngx_http_cache_turbo_module);
+        if (clcf->x_cache) {
+            static u_char  xc_name[] = "X-Cache";
+            (void) ngx_http_cache_turbo_add_header(r, xc_name,
+                       sizeof("X-Cache") - 1, (u_char *) xcache,
+                       ngx_strlen(xcache));
+        }
     }
 
     *bodyp = body;
@@ -2785,13 +2805,16 @@ ngx_http_cache_turbo_serve(ngx_http_request_t *r, u_char *copy, size_t len,
 static ngx_int_t
 ngx_http_cache_turbo_response_cacheable(ngx_http_request_t *r)
 {
-    ngx_list_part_t  *part;
-    ngx_table_elt_t  *h;
-    ngx_uint_t        i;
+    ngx_list_part_t                  *part;
+    ngx_table_elt_t                  *h;
+    ngx_uint_t                        i;
+    ngx_http_cache_turbo_loc_conf_t  *clcf;
 
     if (r->headers_in.authorization != NULL) {
         return 0;
     }
+
+    clcf = ngx_http_get_module_loc_conf(r, ngx_http_cache_turbo_module);
 
     part = &r->headers_out.headers.part;
     h = part->elts;
@@ -2815,7 +2838,8 @@ ngx_http_cache_turbo_response_cacheable(ngx_http_request_t *r)
             return 0;
         }
 
-        if (h[i].key.len == sizeof("Cache-Control") - 1
+        if (!clcf->ignore_cc
+            && h[i].key.len == sizeof("Cache-Control") - 1
             && ngx_strncasecmp(h[i].key.data, (u_char *) "Cache-Control",
                                sizeof("Cache-Control") - 1) == 0)
         {
@@ -3198,8 +3222,10 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
         }
 
         /* Honor upstream freshness (v7): let the response's own
-         * Cache-Control/Expires set the fresh TTL when enabled. */
-        if (clcf->honor_cc) {
+         * Cache-Control/Expires set the fresh TTL when enabled. ignore_cc wins:
+         * if the operator told us to ignore Cache-Control, the TTL is the static
+         * cache_turbo_valid, never the (ignored) upstream max-age/Expires. */
+        if (clcf->honor_cc && !clcf->ignore_cc) {
             time_t  up = ngx_http_cache_turbo_upstream_ttl(r);
             if (up >= 0) {
                 ttl = up;
@@ -5846,9 +5872,11 @@ ngx_http_cache_turbo_create_loc_conf(ngx_conf_t *cf)
     conf->autotune = NGX_CONF_UNSET;
     conf->autotune_interval = NGX_CONF_UNSET;
     conf->honor_cc = NGX_CONF_UNSET;
+    conf->ignore_cc = NGX_CONF_UNSET;
     conf->auto_vary = NGX_CONF_UNSET;
     conf->safe_key = NGX_CONF_UNSET;
     conf->vary_safe = NGX_CONF_UNSET;
+    conf->x_cache = NGX_CONF_UNSET;
     conf->purge = NGX_CONF_UNSET;
     conf->background_update = NGX_CONF_UNSET;
     conf->lock = NGX_CONF_UNSET;
@@ -5956,9 +5984,11 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
         conf->honor_cc = 1;
     }
     ngx_conf_merge_value(conf->honor_cc, prev->honor_cc, 0);
+    ngx_conf_merge_value(conf->ignore_cc, prev->ignore_cc, 0);
     ngx_conf_merge_value(conf->auto_vary, prev->auto_vary, 0);
     ngx_conf_merge_value(conf->safe_key, prev->safe_key, 0);
     ngx_conf_merge_value(conf->vary_safe, prev->vary_safe, 0);
+    ngx_conf_merge_value(conf->x_cache, prev->x_cache, 1);
 
     /* PURGE method (v14): off by default. */
     ngx_conf_merge_value(conf->purge, prev->purge, 0);

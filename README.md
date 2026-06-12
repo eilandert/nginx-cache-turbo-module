@@ -9,6 +9,11 @@
 A built-in page cache for nginx. Think of it as a tiny Varnish that lives
 **inside** nginx — no extra daemon, no second port, no Lua.
 
+> **Writeup:** [nginx-cache-turbo — a built-in page cache](https://deb.myguard.nl/2026/06/nginx-cache-turbo-built-in-page-cache/).
+> Ships in the **deb.myguard.nl nginx/angie stack** as
+> `libnginx-mod-http-cache-turbo` (nginx) / `angie-module-http-cache-turbo`
+> (Angie) — see [Building & the stack](#building--the-stack).
+
 ## The idea in 30 seconds
 
 Your backend (PHP, Node, whatever) is slow. The same pages get requested over
@@ -187,7 +192,7 @@ is never served stale and never re-fetched on its own — purge it explicitly to
 update). Internally this is a long finite TTL, so it still works across the L2
 (Redis/memcached) tier like any other entry.
 
-> ⚠️ `cache_turbo_valid` **replaces, it does not merge.** If a nested `location`
+> `cache_turbo_valid` **replaces, it does not merge.** If a nested `location`
 > sets any `cache_turbo_valid` of its own, it discards the *entire* set inherited
 > from the parent (all status-code TTLs included) — standard nginx array-merge
 > semantics. Re-state every status line you still want in the nested block; don't
@@ -244,7 +249,7 @@ other named header is also treated as uncacheable** — the module can't key on 
 and caching a single representation for every value of that header would serve the
 wrong one (RFC 9110 §12.5.5).
 
-> ⚠️ Don't double-partition the same axis. If you both turn on
+> Don't double-partition the same axis. If you both turn on
 > `cache_turbo_auto_vary` *and* add the matching `cache_turbo_normalize_vary`
 > bucket (e.g. `encoding`) for an axis the origin already lists in `Vary`, the
 > cache splits on it **twice** — once via the normalized-args key, once via the
@@ -259,7 +264,7 @@ their variant. The base slot stays empty for varied URLs, so a node that hasn't
 learned the `Vary` yet simply misses to origin — it never serves the wrong
 variant. Off by default.
 
-> ⚠️ With auto-Vary **off**, the cache keys on the **request**, not on the
+> With auto-Vary **off**, the cache keys on the **request**, not on the
 > response's `Vary`. If your page differs by gzip-vs-brotli or
 > mobile-vs-desktop, either turn on `cache_turbo_auto_vary` or split the key
 > yourself with `cache_turbo_normalize_vary` (below) — otherwise the first
@@ -411,7 +416,7 @@ headroom and tighter dogpile control, and it all reverts automatically once the
 spike passes. What it will **never** do is extend the *fresh* TTL — a client is
 never told "fresh" about content older than your `cache_turbo_valid` contract.
 
-> ⚠️ Load-adaptation is folded into `cache_turbo_autotune on` — turning autotune
+> Load-adaptation is folded into `cache_turbo_autotune on` — turning autotune
 > on enables all three. If you want *only* beta tuning with a rock-fixed stale
 > window, you currently get the adaptive stale/lock behaviour too (bounded ≤4×);
 > the fresh-TTL guarantee is unaffected either way.
@@ -486,7 +491,7 @@ $ curl -X POST 'localhost/_cache?url=/,/blog/,/about' # pre-warm cold pages
 {"warmed":3}
 ```
 
-> ⚠️ The admin location purges the cache and `?url=` fires server-side fetches
+> The admin location purges the cache and `?url=` fires server-side fetches
 > to local paths. Always gate it with `allow`/`deny` (or auth). Never public.
 
 ## Every directive in one place (full syntax)
@@ -496,7 +501,7 @@ its **default** value, so you can copy a line out and change it. The values
 shown *are* the defaults — a block with all of them deleted behaves identically
 to one with all of them present.
 
-> ⚠️ This block is a **reference, not a paste-me**. A few directives are
+> This block is a **reference, not a paste-me**. A few directives are
 > mutually exclusive or context-restricted (Redis vs memcached, the `http`-only
 > zone, the `location`-only admin endpoint) — see the comments and the
 > [interaction matrix](#mutually-exclusive--interacting-directives) below. Lift
@@ -540,6 +545,7 @@ http {
             cache_turbo_beta              1000;      # refresh eagerness ×1000
             cache_turbo_lock_ttl          5s;        # single-flight refresh window
             cache_turbo_honor_cache_control off;     # on = take TTL from response Cache-Control/Expires
+            cache_turbo_ignore_cache_control off;    # on = ignore response Cache-Control entirely (= proxy_ignore_headers Cache-Control)
             cache_turbo_background_update on;        # SWR + stale-if-error (off = inline regen)
             cache_turbo_max_size          1m;        # don't cache bodies bigger than this
 
@@ -555,6 +561,7 @@ http {
             # ── Vary handling ───────────────────────────────────────────
             cache_turbo_auto_vary         off;       # on = read response Vary, split automatically
             cache_turbo_vary_safe         off;       # on = refuse to cache an un-keyed Vary response
+            cache_turbo_x_cache           on;        # off = suppress the X-Cache response header
 
             # ── L2 grouping / tuning ────────────────────────────────────
             cache_turbo_tag               $upstream_http_x_cache_tags;  # needs cache_turbo_redis
@@ -613,6 +620,7 @@ http {
 | `cache_turbo_no_store VAR...` | `server`, `location` | — | If any variable is non-empty and not `0`, do **not** store the response. E.g. `cache_turbo_no_store $cookie_session;`. |
 | `cache_turbo_purge on` | `server`, `location` | `off` | Allow a `PURGE <uri>` request to drop that URI's entry from L1 (+L2). Gate the location with `allow`/`deny`. E.g. `curl -X PURGE http://host/blog/post-42`. |
 | `cache_turbo_honor_cache_control on` | `server`, `location` | `off` | Take the fresh TTL from the response's own `Cache-Control: s-maxage`/`max-age` (s-maxage wins), or its `Expires`, instead of the static TTL. Falls back to `cache_turbo_valid` when the response carries no freshness info. |
+| `cache_turbo_ignore_cache_control on` | `server`, `location` | `off` | Ignore the response `Cache-Control` for **both** cacheability and TTL — the mirror of nginx's `proxy_ignore_headers Cache-Control`. `no-store`/`no-cache`/`private`/`max-age=0`/`s-maxage=0` no longer forbid storage, and the TTL comes from `cache_turbo_valid` (overrides `honor_cache_control`). Use for an origin (e.g. a CMS) that emits a blanket `max-age=0`/`no-cache` on pages that are in fact shareable, instead of stripping the header at the edge with `fastcgi_hide_header`/`proxy_hide_header`. The `Set-Cookie` and request-`Authorization` safety floors are **not** affected — a per-user response is still never cached. |
 | `cache_turbo_background_update on` / `off` | `server`, `location` | `on` | The stale-while-revalidate behaviour. **On** (default): a stale page is served *immediately* while one request quietly refreshes it in the background — **nobody waits on the backend**, and if that refresh hits a 5xx/timeout the old copy is left untouched and keeps being served (**stale-if-error**). **Off**: the chosen refresher regenerates inline (it waits for the backend and serves the fresh body), the pre-SWR behaviour. |
 | `cache_turbo_autotune on` | `server`, `location` | `off` | Adapt to live backend load. Auto-picks `beta` from the measured regen latency (clamped to the preset's band) **and**, under sustained load, widens two knobs by a load factor (≤4×): the **serveable stale window** (serve stale longer before a hard miss) and the **single-flight `lock_ttl`** (collapse more requests onto one regen). The **fresh** TTL is never touched — the freshness contract you set is unchanged; only the best-effort stale grace and dogpile window stretch, and they snap back the first quiet window. See [What autotune does](#what-autotune-actually-tunes). |
 | `cache_turbo_autotune_interval TIME` | `server`, `location` | `30s` | How often autotune recomputes (the window over which load is measured). |
@@ -626,6 +634,7 @@ http {
 | `cache_turbo_auto_vary on` | `server`, `location` | `off` | Read the response's own `Vary` header and split the cache by the named request header automatically. Safe whitelist: `Accept-Encoding`, `User-Agent` (device class), `Accept-Language`, `Origin`. `Vary: *`/`Cookie`/`Authorization` — **or any other header not on the whitelist** — ⇒ uncacheable (so an un-split Vary axis can never serve the wrong representation). Two-level, node-local keying. See [Auto-Vary](#auto-vary-read-the-response-vary). |
 | `cache_turbo_safe_key on` | `server`, `location` | `off` | **Security hardening.** When no explicit `cache_turbo_key` is set, use `$scheme$host$request_uri` as the default key — the full raw query, with **no** tracking-param stripping and **no** arg sorting. The normalized default (`off`) strips `sid`/`sessionid`/`ref`/… and sorts args, which can merge two distinct private URLs (e.g. two `sessionid` values) onto one entry and serve one user's response to another if the origin forgets `private`/`Set-Cookie`. Turn **on** for any origin that does not reliably mark per-user responses private. No effect when `cache_turbo_key` is set. |
 | `cache_turbo_vary_safe on` | `server`, `location` | `off` | **Security hardening.** Refuse to cache a response carrying a `Vary` header that the key does not account for. With `cache_turbo_auto_vary off` (the default) that means **any** `Vary` response is left uncacheable instead of being stored under a key that ignores the varied axis (a cache-poisoning / cross-client surface). With `auto_vary on` the un-keyable axes are already refused, so this only tightens the auto-Vary-off case. Turn **on** whenever upstreams emit `Vary` and you are not using `auto_vary`. |
+| `cache_turbo_x_cache on` / `off` | `server`, `location` | `on` | Emit the `X-Cache: HIT/STALE` debug header on a served response. Turn **off** to suppress only that header (don't advertise cache state to clients, or treat it as debug-only). The RFC-meaningful `Age` header is always emitted, and the upstream/native cache's own `X-Cache*` headers are stripped before storing regardless. |
 
 ### Variables
 
@@ -796,7 +805,7 @@ cache_turbo_normalize_strip sid sessionid "tmp_*";
 cache_turbo_normalize_vary  encoding device;   # keep gzip≠brotli, mobile≠desktop
 ```
 
-## Building
+## Building & the stack
 
 It's a normal dynamic module:
 
@@ -806,7 +815,25 @@ $ make modules
 ```
 
 No external libraries — the Redis client is hand-rolled on nginx's own event
-loop. Builds against nginx and angie.
+loop. Builds against **nginx and Angie**.
+
+**Prebuilt, in the deb.myguard.nl nginx/angie stack.** Rather than build it
+yourself, install the packaged module from the
+[deb.myguard.nl](https://deb.myguard.nl) APT repository — it's shipped and
+kept current alongside the hardened HTTP/3 nginx / Angie builds and their full
+dynamic-module set:
+
+```console
+# nginx
+$ apt install libnginx-mod-http-cache-turbo
+# Angie
+$ apt install angie-module-http-cache-turbo
+```
+
+- **Module catalogues:** [nginx modules](https://deb.myguard.nl/nginx-modules/)
+  · [Angie modules (optimized & extended)](https://deb.myguard.nl/angie-modules-optimized-extended/)
+- **Directive synopsis:** [modules-synopsis #http-cache-turbo](https://deb.myguard.nl/nginx/modules-synopsis/#http-cache-turbo)
+- **Writeup:** [nginx-cache-turbo — a built-in page cache](https://deb.myguard.nl/2026/06/nginx-cache-turbo-built-in-page-cache/)
 
 ## License
 

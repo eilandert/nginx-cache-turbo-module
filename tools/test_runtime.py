@@ -674,6 +674,28 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # ignore_cc: with cache_turbo_ignore_cache_control on, the response
+        # Cache-Control floor (here max-age=0 via the ccmaxage0 path marker) is
+        # ignored and the entry is stored at cache_turbo_valid. Mirrors nginx
+        # proxy_ignore_headers Cache-Control. key=$uri to share a slot.
+        location /ccign/ {{
+            cache_turbo                       main;
+            cache_turbo_key                   $uri;
+            cache_turbo_valid                 30s;
+            cache_turbo_ignore_cache_control  on;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # x_cache off: a normally-cacheable location that must still serve from
+        # cache (Age present) but WITHOUT the X-Cache header.
+        location /xcoff/ {{
+            cache_turbo          main;
+            cache_turbo_key      $uri;
+            cache_turbo_valid    30s;
+            cache_turbo_x_cache  off;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # default cache key (no cache_turbo_key) = $host$request_uri, so two
         # Host headers on the same path must NOT collide.
         location /dk/ {{
@@ -2172,6 +2194,33 @@ def test_precise_maxage_token_parse(ng: Nginx) -> None:
     fetch(ng.port, "/cc/ccmaxage0")                        # prime attempt
     _, _, h2 = fetch(ng.port, "/cc/ccmaxage0")
     assert "x-cache" not in h2, "max-age=0 must not be stored in a shared cache"
+
+
+def test_ignore_cache_control_overrides_floor(ng: Nginx, origin: Origin) -> None:
+    """cache_turbo_ignore_cache_control on makes the response Cache-Control floor
+    a no-op: a max-age=0 response (the ccmaxage0 marker) that /cc/ refuses to
+    store is STORED under /ccign/ and served as a HIT at cache_turbo_valid.
+    Mirrors nginx `proxy_ignore_headers Cache-Control`. The Set-Cookie floor is
+    unaffected (covered by the /cc/ccsetcookie case)."""
+    fetch(ng.port, "/ccign/ccmaxage0")                     # prime (miss, stores)
+    _, _, h = fetch(ng.port, "/ccign/ccmaxage0")
+    assert h.get("x-cache") == "HIT", \
+        ("ignore_cache_control must store a max-age=0 response and HIT; got "
+         f"X-Cache={h.get('x-cache')}")
+
+
+def test_x_cache_off_suppresses_header(ng: Nginx, origin: Origin) -> None:
+    """cache_turbo_x_cache off suppresses the X-Cache header while still serving
+    from cache. The second read carries NO X-Cache but DOES carry Age (Age is
+    RFC-meaningful and always emitted), which only the cache serve path sets — so
+    Age present is the proof it HIT despite the missing X-Cache."""
+    _, _, h1 = fetch(ng.port, "/xcoff/page")
+    assert "x-cache" not in h1, "first should miss"
+    _, _, h2 = fetch(ng.port, "/xcoff/page")
+    assert "x-cache" not in h2, \
+        f"x_cache off must suppress X-Cache on a HIT, got [{h2.get('x-cache')}]"
+    assert "age" in h2, \
+        "Age must still be emitted (served from cache) when x_cache is off"
 
 
 def test_valid_zero_is_forever(ng: Nginx, origin: Origin) -> None:
@@ -4628,6 +4677,8 @@ def run_all(ng: Nginx, origin: Origin,
     test_request_no_cache(ng, origin)
     test_must_revalidate(ng)
     test_precise_maxage_token_parse(ng)
+    test_ignore_cache_control_overrides_floor(ng, origin)
+    test_x_cache_off_suppresses_header(ng, origin)
     test_valid_zero_is_forever(ng, origin)
     test_vary_encoding_qvalue(ng, origin)
     test_auto_vary_unknown_axis_uncacheable(ng, origin)

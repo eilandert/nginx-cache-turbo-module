@@ -404,6 +404,17 @@ typedef struct {
      * the configured TTL when the response carries no freshness info. Off by
      * default so existing fixed-TTL configs are unchanged. */
     ngx_flag_t               honor_cc;
+
+    /* Ignore the response Cache-Control for cacheability AND TTL (mirrors nginx
+     * `proxy_ignore_headers Cache-Control`). Off by default. When on, the
+     * no-store / no-cache / private / max-age=0 / s-maxage=0 directives no longer
+     * forbid storage, and the TTL comes from cache_turbo_valid (honor_cc is
+     * overridden). The Set-Cookie and request-Authorization safety floors are
+     * NOT affected (a per-user response is still never cached). Use for an origin
+     * that emits a blanket `max-age=0` / `no-cache` on pages that are in fact
+     * shareable (a common CMS default) instead of stripping the header at the
+     * edge with fastcgi_hide_header. */
+    ngx_flag_t               ignore_cc;
     size_t                   max_size;    /* max single response to cache   */
 
     /* Suppress native cache when stacked (Q1). When on, the $cache_turbo_active
@@ -553,6 +564,14 @@ typedef struct {
      * with auto_vary on the un-keyable axes are already refused, so this only
      * tightens the auto_vary-off case. Recommended whenever upstreams emit Vary. */
     ngx_flag_t               vary_safe;
+
+    /* Emit the `X-Cache: HIT|STALE|STALE-IF-ERROR` debug header on a served
+     * response. On by default (observability). Off suppresses ONLY this header
+     * (the RFC-meaningful Age header is always emitted) for operators who don't
+     * want to advertise cache state to clients, or who treat X-Cache as
+     * debug-only. The upstream/native cache's own X-Cache* headers are stripped
+     * before storing regardless of this flag. */
+    ngx_flag_t               x_cache;
 
     /* Backend vtables (v4-1). l1 = the local store (shm); it is a stateless
      * dispatch table (the zone is passed as an argument), so it is set
