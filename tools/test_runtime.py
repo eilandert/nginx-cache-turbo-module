@@ -1124,6 +1124,15 @@ http {{
             cache_turbo_valid    1s;     # stale_mult=8 -> expires at 8s
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
+        # micro preset: NO explicit cache_turbo_valid, so the band's own 1s fresh
+        # TTL (stale_mult=2 -> serveable 2s) is what drives expiry. Distinguishes
+        # micro (default valid 1s) from every other preset (default valid >= 30s).
+        location /pm/ {{
+            cache_turbo          main;
+            cache_turbo_key      $uri;
+            cache_turbo_preset   micro;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
 
         # live autotune (v4-3). /at/ + /atc/ share zone "at": a window of slow
         # misses drives the zone's beta verdict up; /at/ is balanced (band
@@ -4245,6 +4254,31 @@ def test_preset_window_differs(ng: Nginx, origin: Origin) -> None:
     drain_origin(origin)       # v8: settle async bg refreshes before the next test
 
 
+def test_preset_micro_default_ttl(ng: Nginx, origin: Origin) -> None:
+    """micro preset: with NO explicit cache_turbo_valid the band's own 1s fresh
+    TTL takes effect (stale_mult=2 -> entry hard-expires at ~2s). An immediate
+    re-read is a fresh HIT; by t=3s the entry is gone and the next read MISSes.
+    A >=30s default (any other preset's band) would still HIT at t=3s, so this
+    proves micro's 1s default-valid band reaches the runtime freshness math
+    without an explicit knob."""
+    sc, _, hc = fetch(ng.port, "/pm/win")              # prime (MISS, no X-Cache)
+    assert sc == 200 and "x-cache" not in hc, \
+        f"micro prime should be a MISS, got {sc} X-Cache={hc.get('x-cache')}"
+
+    sc, _, hc = fetch(ng.port, "/pm/win")              # immediate -> fresh HIT
+    assert sc == 200 and hc.get("x-cache") == "HIT", \
+        ("micro within its 1s fresh window should HIT, got "
+         f"{sc} X-Cache={hc.get('x-cache')}")
+
+    time.sleep(3.0)                                     # past fresh+stale (~2s)
+    sc, _, hc = fetch(ng.port, "/pm/win")
+    assert sc == 200, f"micro re-read status {sc}"
+    assert "x-cache" not in hc, \
+        ("micro (default valid 1s, stale_mult=2) should hard-expire by t=3s and "
+         f"MISS; a >=30s default would still HIT. Got X-Cache={hc.get('x-cache')}")
+    drain_origin(origin)       # settle any async bg refresh before the next test
+
+
 def test_invalid_preset_name(ng: Nginx) -> None:
     """v3-2: an unknown cache_turbo_preset value is rejected at config time
     (nginx -t fails) with a clear message, not silently ignored."""
@@ -4581,6 +4615,7 @@ def run_all(ng: Nginx, origin: Origin,
     test_auto_vary_mixed_refused_wins(ng, origin)
     test_auto_vary_off_ignores_vary(ng, origin)
     test_preset_window_differs(ng, origin)
+    test_preset_micro_default_ttl(ng, origin)
     test_invalid_preset_name(ng)
     test_autotune_raises_beta_within_band(ng, origin)
     test_autotune_off_by_default(ng)

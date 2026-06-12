@@ -65,14 +65,15 @@
 
 /*
  * Autotune presets (#10, v3-2). One directive `cache_turbo_preset
- * conservative|balanced|aggressive` sets the default tuning bundle; an explicit
- * knob directive still wins. Vocab matches wp-redis (BALANCED, not "normal").
- * Values are 1-based so they index ngx_http_cache_turbo_bands[] directly; 0 is
- * unused so a zeroed/UNSET field is never a valid preset.
+ * micro|conservative|balanced|aggressive` sets the default tuning bundle; an
+ * explicit knob directive still wins. Vocab matches wp-redis (BALANCED, not
+ * "normal"). Values are 1-based so they index ngx_http_cache_turbo_bands[]
+ * directly; 0 is unused so a zeroed/UNSET field is never a valid preset.
  */
 #define NGX_HTTP_CACHE_TURBO_PRESET_CONSERVATIVE  1
 #define NGX_HTTP_CACHE_TURBO_PRESET_BALANCED      2
 #define NGX_HTTP_CACHE_TURBO_PRESET_AGGRESSIVE    3
+#define NGX_HTTP_CACHE_TURBO_PRESET_MICRO         4
 
 /* Default-of-defaults: an unconfigured location resolves to BALANCED, whose band
  * values equal the historical hardcoded merge fallbacks (valid 60s, beta 1000,

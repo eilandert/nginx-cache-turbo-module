@@ -287,17 +287,24 @@ cache_turbo        ct;
 cache_turbo_preset aggressive;   # long TTLs, wide stale window, eager refresh
 ```
 
-| Knob | `conservative` | `balanced` (default) | `aggressive` |
-|---|---|---|---|
-| fresh TTL (`valid`) | 30s | 60s | 300s |
-| `beta` (refresh eagerness ×1000) | 500 | 1000 | 3000 |
-| `lock_ttl` | 10s | 5s | 3s |
-| stale-window multiplier | ×2 | ×4 | ×8 |
+| Knob | `micro` | `conservative` | `balanced` (default) | `aggressive` |
+|---|---|---|---|---|
+| fresh TTL (`valid`) | 1s | 30s | 60s | 300s |
+| `beta` (refresh eagerness ×1000) | 1000 | 500 | 1000 | 3000 |
+| `lock_ttl` | 1s | 10s | 5s | 3s |
+| stale-window multiplier | ×2 | ×2 | ×4 | ×8 |
 
 Any explicit knob (`cache_turbo_valid 120s;`) still beats the preset.
 
 The **stale window** is `valid × (multiplier − 1)`. So balanced + `valid 60s`
 = fresh for 60s, then served stale for another 180s, then expired.
+
+`micro` is the **microcaching** preset: a 1-second fresh TTL with a tight ×2
+stale window and a 1s single-flight lock, so a hammered dynamic endpoint is
+served from RAM for a second while the backend is hit ~once. It's exactly the
+[microcaching recipe below](#microcaching-1-second-ttl-for-apis-and-php-fpm) in
+one word — `cache_turbo_preset micro;` instead of spelling out `valid 1s` +
+`lock_ttl 1s`. Override the TTL per-location with `cache_turbo_valid` as usual.
 
 ## Microcaching (1-second TTL for APIs and PHP-FPM)
 
@@ -318,8 +325,7 @@ mutations (`POST`/`PUT`/`DELETE`) always pass straight through.
 # A) JSON API behind proxy_pass — 1s microcache
 location /api/ {
     cache_turbo               ct;
-    cache_turbo_preset        conservative;   # ×2 stale mult = tight window
-    cache_turbo_valid         1s;             # fresh 1s (then ≤1s stale while one bg refresh runs)
+    cache_turbo_preset        micro;          # valid 1s + lock_ttl 1s + ×2 stale, in one word
     cache_turbo_lock          on;             # collapse a per-second burst to ONE origin hit
     cache_turbo_lock_timeout  1s;
     cache_turbo_min_uses      2;              # don't cache one-shot endpoints (optional)
@@ -337,8 +343,7 @@ location /api/ {
 # B) PHP-FPM (WordPress/Laravel/…) — 1s microcache
 location ~ \.php$ {
     cache_turbo               ct;
-    cache_turbo_valid         1s;
-    cache_turbo_preset        conservative;
+    cache_turbo_preset        micro;          # valid 1s + lock_ttl 1s + ×2 stale
     cache_turbo_lock          on;
 
     # WP/Woo: auto-skip wp-admin, login + logged-in cookies. (Implies
@@ -359,9 +364,12 @@ location ~ \.php$ {
 
 **Microcaching gotchas:**
 
-- **`conservative` keeps the stale window tight.** With `valid 1s` it is ×2 →
-  served stale for ≤1s more (so ≤2s old). `balanced`/`aggressive` widen that
-  (×4/×8 = up to 4s/8s stale) — usually *not* what you want for "near-real-time".
+- **The `micro` preset keeps the window tight.** It is `valid 1s` + `lock_ttl
+  1s` + a ×2 stale multiplier, so a copy is served stale for ≤1s more (≤2s old).
+  Using `balanced`/`aggressive` instead widens that (×4/×8 = up to 4s/8s stale) —
+  usually *not* what you want for "near-real-time". To microcache at a different
+  TTL, keep `cache_turbo_preset micro` and add an explicit `cache_turbo_valid 2s;`
+  (the explicit knob wins; the ×2 stale window scales with it).
 - **`honor_cache_control` vs a fixed TTL.** A CMS preset (`cache_turbo_backend`)
   or `cache_turbo … auto` turns `honor_cache_control` **on**, so an app that
   emits `Cache-Control: max-age=600` would override your `1s`. Set
@@ -496,7 +504,7 @@ http {
             cache_turbo_normalize_vary    encoding device;        # add variant buckets to the key
 
             # ── freshness / staleness ───────────────────────────────────
-            cache_turbo_preset            balanced;  # conservative|balanced|aggressive — sets the 4 knobs below
+            cache_turbo_preset            balanced;  # micro|conservative|balanced|aggressive — sets the 4 knobs below
             cache_turbo_valid             60s;       # 200 TTL; 0 = cache forever
             cache_turbo_valid             301 302 308 1h;   # repeatable: cache redirects
             cache_turbo_valid             404 410 1m;       #            negative caching
@@ -564,7 +572,7 @@ http {
 | `cache_turbo_backend NAME...` | `server`, `location` | — | Auto-classify dynamic (uncacheable) request surfaces for one or more CMS presets: `generic` (a.k.a. `auto`, the union), `wordpress`, `woocommerce`, `joomla`. A matching request (login/session cookie, admin URI, dynamic arg) skips the cache and goes straight to origin. Implies `cache_turbo_honor_cache_control on`. |
 | `cache_turbo_suppress_native on` | `server`, `location` | `off` | Make `$cache_turbo_active` read `1` while cache-turbo owns a request, so a stacked native `proxy_cache` can defer via `proxy_no_cache $cache_turbo_active; proxy_cache_bypass $cache_turbo_active;`. Off (default) keeps the variable always `0` (the wiring stays inert). |
 | `cache_turbo_key STRING` | `server`, `location` | normalized | What makes two requests "the same page". The default is `$host$uri$cache_turbo_normalized_args` — Host + **normalized args** (tracking params stripped, args sorted). |
-| `cache_turbo_preset NAME` | `server`, `location` | `balanced` | `conservative` / `balanced` / `aggressive` — sets the four knobs below at once. |
+| `cache_turbo_preset NAME` | `server`, `location` | `balanced` | `micro` / `conservative` / `balanced` / `aggressive` — sets the four knobs below at once. `micro` = 1s microcaching (valid 1s, lock_ttl 1s, ×2 stale). |
 | `cache_turbo_valid [CODE...] TIME` | `server`, `location` | preset (`60s`) | How long a copy stays *fresh* (then *stale*, still served). Bare `TIME` = the default/200 TTL. `TIME` of `0` = cache forever (stays fresh, never expires). With leading status codes (`cache_turbo_valid 301 404 1m;`) it makes those statuses cacheable too — redirects + negative caching. Repeatable. |
 | `cache_turbo_beta N` | `server`, `location` | preset (`1000`) | Refresh eagerness, ×1000 (1000 = 1.0). Higher = refresh sooner/more often. |
 | `cache_turbo_lock_ttl TIME` | `server`, `location` | preset (`5s`) | Single-flight window: once one refresh is claimed, others serve stale until it finishes. Caps backend regens to ~one per cycle. |

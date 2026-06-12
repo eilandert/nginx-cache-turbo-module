@@ -136,6 +136,7 @@ static const ngx_http_cache_turbo_band_t  ngx_http_cache_turbo_bands[] = {
     /* [1] CONSERVATIVE: correctness */ {  30,  500, 10, 2,  500, 1000 },
     /* [2] BALANCED: current defaults*/ {  60, 1000,  5, 4,  500, 2000 },
     /* [3] AGGRESSIVE: max hit-rate  */ { 300, 3000,  3, 8, 1000, 3000 },
+    /* [4] MICRO: 1s microcaching    */ {   1, 1000,  1, 2,  500, 2000 },
 };
 
 
@@ -3776,7 +3777,7 @@ ngx_http_cache_turbo_tag(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 }
 
 
-/* "cache_turbo_preset conservative|balanced|aggressive;" stores the preset enum
+/* "cache_turbo_preset micro|conservative|balanced|aggressive;" stores the enum
  * (and validates the name here, at config time). The enum only selects the band
  * of default knob values used in merge_loc_conf; an explicit knob directive
  * (cache_turbo_valid/_beta/_lock_ttl) still wins because those write the *_raw
@@ -3797,10 +3798,13 @@ ngx_http_cache_turbo_preset(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     } else if (ngx_strcmp(value[1].data, "aggressive") == 0) {
         clcf->preset = NGX_HTTP_CACHE_TURBO_PRESET_AGGRESSIVE;
 
+    } else if (ngx_strcmp(value[1].data, "micro") == 0) {
+        clcf->preset = NGX_HTTP_CACHE_TURBO_PRESET_MICRO;
+
     } else {
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
             "invalid cache_turbo_preset \"%V\": "
-            "expected conservative, balanced, or aggressive",
+            "expected micro, conservative, balanced, or aggressive",
             &value[1]);
         return NGX_CONF_ERROR;
     }
