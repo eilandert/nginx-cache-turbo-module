@@ -1,9 +1,14 @@
 name: Security Scanners
 
 # flawfinder + clang-tidy + semgrep over the C sources, SARIF uploaded to the
-# Security tab. Heavy job: monthly on a schedule + manual only, matching
-# valgrind.yml / codeql.yml — NOT on every push/PR (build-test.yml carries the
-# per-change static checks: cppcheck, -Wall -Wextra -Wshadow -Werror).
+# Security tab. Heavy job: monthly on a schedule + manual, PLUS an ADVISORY run
+# on every PR (CI-2). The per-PR run is non-blocking: every scan step ends in
+# `|| true` and the job is `continue-on-error`, so it can never gate a merge —
+# it only surfaces findings to the Security tab early instead of up to a month
+# later. The slow-cadence concern that kept this monthly is respected: the run
+# costs runner time but cannot stall a PR. build-test.yml still carries the fast
+# per-change static checks (cppcheck, clang --analyze, -Wall -Wextra -Wshadow
+# -Werror); this adds the deep scanners as advisory-only signal.
 #
 # Third-party actions pinned to commit SHAs (same pins as the other workflows):
 # actions/checkout@v5             -> 93cb6efe18208431cddfb8368fd83d5badbf9bfd
@@ -14,6 +19,8 @@ name: Security Scanners
 on:
   schedule:
     - cron: "23 5 1 * *"   # 05:23 on the 1st of each month
+  pull_request:
+    branches: [main]       # CI-2: advisory per-PR run (continue-on-error below)
   workflow_dispatch: {}
 
 concurrency:
@@ -28,6 +35,9 @@ jobs:
     name: Secure
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # CI-2: advisory only. Findings go to the Security tab / artifacts; a scanner
+    # hit or an infra hiccup on a PR must never block the merge.
+    continue-on-error: true
     permissions:
       contents: read
       security-events: write

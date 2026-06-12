@@ -52,6 +52,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--module")
     parser.add_argument("--runner", default="")
     parser.add_argument("--single-process", action="store_true")
+    # CI-3: set when the binary is ASan/UBSan-instrumented. Lets a test opt out of
+    # the run when it stresses nginx CORE code (not our module) that trips a known
+    # core sanitizer false positive — e.g. the stacked proxy_cache file-write path.
+    parser.add_argument("--sanitizer", action="store_true")
     parser.add_argument("--port", type=int, default=18880)
     parser.add_argument("--redis-server")  # accepted; used by v2 L2 tests
     parser.add_argument("--memcached-server")  # v13: memcached L2 backend tests
@@ -1241,6 +1245,7 @@ class Nginx:
         self.runner_raw = runner
         self.runner = shlex.split(runner)
         self.single_process = single_process
+        self.sanitizer = False          # set in main() from --sanitizer (CI-3)
         self.redis_port = redis_port
         self.redis_auth_port = redis_auth_port
         self.redis_password = redis_password
@@ -1735,7 +1740,15 @@ def test_suppress_native_e2e_proxy_cache(ng: Nginx) -> None:
     # proxy_cache writes go through nginx's cache-manager process, which is not
     # spawned under `master_process off`; the multi-process Runtime job covers
     # this end-to-end. Skip in single-process mode (the ASan run uses it).
-    if ng.single_process:
+    #
+    # Also skip under sanitizers (CI-3 multi-worker ASan/UBSan smoke): this is the
+    # only test that drives nginx's CORE proxy_cache file-WRITE path, and that path
+    # trips a known nginx-core UBSan false positive
+    # (src/http/ngx_http_file_cache.c: "null pointer passed as argument 2" — a
+    # zero-length ngx_memcpy with a NULL src, harmless, same class as the OpenSSL
+    # ASan baseline noise). It is nginx-core code, not cache-turbo; the plain
+    # multi-worker Runtime job still exercises it fully without sanitizers.
+    if ng.single_process or ng.sanitizer:
         return
 
     def file_count(d: pathlib.Path) -> int:
@@ -4629,6 +4642,7 @@ def main() -> int:
                    redis_tls_port=redis_tls_port if redis_tls else None,
                    redis_tls_ca=(tls_certs or {}).get("ca"),
                    memcached_port=memcached_port if mc else None)
+        ng.sanitizer = args.sanitizer
 
         try:
             origin.start()

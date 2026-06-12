@@ -301,3 +301,22 @@ jobs:
             --redis-server /usr/bin/redis-server \
             --memcached-server /usr/bin/memcached \
             --nginx-binary "$GITHUB_WORKSPACE/.build/nginx-${NGINX_VERSION}/objs/nginx"
+
+      - name: Run runtime suite multi-worker under ASan and UBSan (CI-3)
+        # CI-3: the single-process run above covers our allocations; this run
+        # exercises the SAME sanitized binary under nginx's real master + 4-worker
+        # model (no --single-process), so a cross-worker shm-zone UAF / race / use
+        # of a slab freed by another worker surfaces here that the 1-worker run
+        # cannot. detect_leaks=0 deliberately keeps LSan OFF: nginx frees its
+        # pools at exit, not per-request, so LSan over the worker pool is
+        # false-positive-prone with no real signal — ASan's UAF/overflow checks
+        # are the high-value part and run fully multi-worker here.
+        env:
+          ASAN_OPTIONS: detect_leaks=0:halt_on_error=1:abort_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          python3 tools/test_runtime.py \
+            --sanitizer \
+            --redis-server /usr/bin/redis-server \
+            --memcached-server /usr/bin/memcached \
+            --nginx-binary "$GITHUB_WORKSPACE/.build/nginx-${NGINX_VERSION}/objs/nginx"
