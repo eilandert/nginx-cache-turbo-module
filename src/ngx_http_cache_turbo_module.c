@@ -936,25 +936,34 @@ ngx_http_cache_turbo_response_must_revalidate(ngx_http_request_t *r)
 
 
 /*
- * RFC 9111 §5.2.1.4: a request Cache-Control: no-cache (or the legacy
- * Pragma: no-cache) means "do not reuse a stored response without successful
- * validation". We have no upstream validation channel for a cache hit, so the
- * conservative-correct behaviour is to skip the cache lookup and go to the
- * origin (the fresh response is still stored, refreshing the entry). Walks the
- * request header list once; both headers are rare so first-match is fine.
+ * RFC 9111 §5.2.1.4 / §5.2.1.1: a request Cache-Control: no-cache (or the
+ * legacy Pragma: no-cache), or a request max-age=0, means "do not reuse a
+ * stored response without successful validation". max-age=0 is what browsers
+ * send on a force-refresh (Ctrl-Shift-R), so honouring it is the dominant case.
+ * We have no upstream validation channel for a cache hit, so the conservative-
+ * correct behaviour is to skip the cache lookup and go to the origin (the fresh
+ * response is still stored, refreshing the entry). max-age=N>0 / min-fresh /
+ * max-stale are NOT honoured here — they need an entry-serve restructure that
+ * collides with the cold-miss claim race (see audit RFC-1). Walks the request
+ * header list once; the headers are rare so first-match is fine.
  */
 static ngx_int_t
-ngx_http_cache_turbo_request_no_cache(ngx_http_request_t *r)
+ngx_http_cache_turbo_request_revalidate(ngx_http_request_t *r)
 {
     ngx_str_t  cc, pragma;
 
     cc = ngx_http_cache_turbo_header_find(&r->headers_in.headers,
              "Cache-Control", sizeof("Cache-Control") - 1);
-    if (cc.data != NULL
-        && ngx_http_cache_turbo_cc_has(cc.data, cc.data + cc.len,
-               "no-cache", sizeof("no-cache") - 1))
-    {
-        return 1;
+    if (cc.data != NULL) {
+        u_char  *v = cc.data, *e = cc.data + cc.len;
+
+        if (ngx_http_cache_turbo_cc_has(v, e, "no-cache",
+                sizeof("no-cache") - 1)
+            || ngx_http_cache_turbo_cc_delta(v, e, "max-age",
+                sizeof("max-age") - 1) == 0)
+        {
+            return 1;
+        }
     }
 
     pragma = ngx_http_cache_turbo_header_find(&r->headers_in.headers,
@@ -967,6 +976,38 @@ ngx_http_cache_turbo_request_no_cache(ngx_http_request_t *r)
     }
 
     return 0;
+}
+
+
+/* RFC 9111 §5.2.1.7: request Cache-Control: only-if-cached — the client refuses
+ * any origin contact. We may answer from L1/L2 (both are caches), but if neither
+ * holds a serveable response the request gets 504 Gateway Timeout instead of
+ * reaching the origin. */
+static ngx_int_t
+ngx_http_cache_turbo_request_only_if_cached(ngx_http_request_t *r)
+{
+    ngx_str_t  cc;
+
+    cc = ngx_http_cache_turbo_header_find(&r->headers_in.headers,
+             "Cache-Control", sizeof("Cache-Control") - 1);
+    return (cc.data != NULL
+            && ngx_http_cache_turbo_cc_has(cc.data, cc.data + cc.len,
+                   "only-if-cached", sizeof("only-if-cached") - 1)) ? 1 : 0;
+}
+
+
+/* RFC 9111 §5.2.1.5: request Cache-Control: no-store — do not store this
+ * request's response (the header-filter capture gate checks the flag). */
+static ngx_int_t
+ngx_http_cache_turbo_request_no_store(ngx_http_request_t *r)
+{
+    ngx_str_t  cc;
+
+    cc = ngx_http_cache_turbo_header_find(&r->headers_in.headers,
+             "Cache-Control", sizeof("Cache-Control") - 1);
+    return (cc.data != NULL
+            && ngx_http_cache_turbo_cc_has(cc.data, cc.data + cc.len,
+                   "no-store", sizeof("no-store") - 1)) ? 1 : 0;
 }
 
 
@@ -1356,12 +1397,26 @@ ngx_http_cache_turbo_access_prologue(ngx_http_request_t *r,
         return NGX_DECLINED;
     }
 
-    /* Request Cache-Control: no-cache / Pragma: no-cache (RFC 9111 §5.2.1.4):
-     * do not reuse a stored response without validation. With no validation
-     * channel for a hit, skip the lookup and go to the origin — the fresh
-     * response still stores (refreshing the entry), like a bypass. */
-    if (ngx_http_cache_turbo_request_no_cache(r)) {
+    /* RFC-1 request Cache-Control, parsed once here for the whole request:
+     * only-if-cached gates the origin-bound miss paths below (-> 504), no-store
+     * vetoes capture in the header filter. */
+    ctx->req_only_if_cached = ngx_http_cache_turbo_request_only_if_cached(r);
+    ctx->req_no_store = ngx_http_cache_turbo_request_no_store(r);
+
+    /* Request Cache-Control: no-cache / Pragma: no-cache / max-age=0 (RFC 9111
+     * §5.2.1.1/§5.2.1.4): do not reuse a stored response without validation.
+     * With no validation channel for a hit, skip the lookup and go to the
+     * origin — the fresh response still stores (refreshing the entry), like a
+     * bypass. With only-if-cached the client refuses origin contact and we
+     * cannot validate, so the answer is 504 (RFC 9111 §5.2.1.7). */
+    if (ngx_http_cache_turbo_request_revalidate(r)) {
         (void) ngx_atomic_fetch_add(&z->sh->misses, 1);
+        if (ctx->req_only_if_cached) {
+            ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                           "cache_turbo: request revalidate + only-if-cached "
+                           "\"%V\" -> 504", &r->uri);
+            return NGX_HTTP_GATEWAY_TIME_OUT;
+        }
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                        "cache_turbo: request no-cache \"%V\" -> origin (revalidate)",
                        &r->uri);
@@ -1705,6 +1760,18 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
     if (clcf->backend && ctx->l2_done && !ctx->l2_miss_counted) {
         ctx->l2_miss_counted = 1;
         (void) ngx_atomic_fetch_add(&z->sh->l2_misses, 1);
+    }
+
+    /* only-if-cached (RFC 9111 §5.2.1.7): L1 missed/expired and L2 (if any) did
+     * not satisfy it either — both caches are exhausted. The client refuses
+     * origin contact, so answer 504 rather than engaging the cold-miss
+     * single-flight / origin path below. A fresh or stale HIT above already
+     * returned (only-if-cached is satisfied by any cache serve). */
+    if (ctx->req_only_if_cached) {
+        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "cache_turbo: only-if-cached miss \"%V\" key=%ui -> 504",
+                       &r->uri, (ngx_uint_t) hash);
+        return NGX_HTTP_GATEWAY_TIME_OUT;
     }
 
     /* min_uses (v15): defer caching until the key has cold-missed min_uses times,
@@ -2168,13 +2235,23 @@ ngx_http_cache_turbo_serve(ngx_http_request_t *r, u_char *copy, size_t len,
         (void) ngx_http_cache_turbo_add_header(r, nm, nl, vv, vl);
     }
 
-    /* Conditional request (v11): a fresh OR stale 200 HIT whose stored ETag /
-     * Last-Modified satisfy the client's If-None-Match / If-Modified-Since is
-     * answered 304 with no body. Only 200 is validated this way (redirects and
-     * other cached statuses serve normally); GET/HEAD only. Pre-converting the
-     * status keeps core's not-modified header filter a no-op (it bails unless
-     * status == 200), so there is no double handling. */
-    if (bh->status == NGX_HTTP_OK
+    /* Conditional request (v11): a 200 HIT whose stored ETag / Last-Modified
+     * satisfy the client's If-None-Match / If-Modified-Since is answered 304
+     * with no body. Only 200 is validated this way (redirects and other cached
+     * statuses serve normally); GET/HEAD only. Pre-converting the status keeps
+     * core's not-modified header filter a no-op (it bails unless status == 200),
+     * so there is no double handling. (Core's own ngx_http_test_if_match /
+     * ngx_http_test_if_modified are static in the not-modified filter module and
+     * cannot be linked; ngx_http_cache_turbo_not_modified mirrors them with the
+     * weak comparator.)
+     *
+     * RFC-6: gate the 304 behind freshness — a 304 means "your cached copy is
+     * still good", which we may only assert for a response we know is fresh.
+     * A STALE entry has not been revalidated against the origin, so answering
+     * 304 from it would tell the client its copy is current when it is not;
+     * serve the full (stale) body instead and let the next request revalidate. */
+    if (!stale
+        && bh->status == NGX_HTTP_OK
         && (r->method & (NGX_HTTP_GET | NGX_HTTP_HEAD))
         && ngx_http_cache_turbo_not_modified(r, etag, etag_len,
                                              lastmod, lastmod_len))
@@ -2189,6 +2266,38 @@ ngx_http_cache_turbo_serve(ngx_http_request_t *r, u_char *copy, size_t len,
         r->headers_out.content_type.data = NULL;
         r->header_only = 1;        /* serve() short-circuits the body below */
         body_len = 0;
+    }
+
+    /* Date header (RFC 9111 §5.6.7, §4.2.3 — RFC-3): emit a STABLE Date for the
+     * cached representation instead of letting core stamp the current time on
+     * every hit. Core's header filter generates its own Date line only when
+     * r->headers_out.date == NULL, so pushing a Date into the list AND pointing
+     * headers_out.date at it makes ours authoritative (exactly one Date line).
+     * Without this a cached response looks freshly generated each hit and its
+     * Date drifts ahead of the Age we report. We replay the blob's creation
+     * timestamp; Age = now - created below is then exactly consistent with it.
+     * NOTE: created is our store time, not the upstream's original Date (which
+     * is stripped at store and has no blob field yet); true origin-Date
+     * preservation rides the deferred RFC-2 blob-format bump. */
+    {
+        u_char  *db = ngx_pnalloc(r->pool,
+                          sizeof("Mon, 28 Sep 1970 06:00:00 GMT") - 1);
+        if (db != NULL) {
+            ngx_table_elt_t  *dh = ngx_list_push(&r->headers_out.headers);
+            if (dh != NULL) {
+                static u_char  date_name[] = "Date";
+                dh->hash = 1;
+                dh->key.len = sizeof("Date") - 1;
+                dh->key.data = date_name;
+                dh->value.len = (size_t) (ngx_http_time(db,
+                                    (time_t) bh->created) - db);
+                dh->value.data = db;
+#if (nginx_version >= 1023000)
+                dh->next = NULL;
+#endif
+                r->headers_out.date = dh;
+            }
+        }
     }
 
     /* Age header (RFC 9111 §5.1): seconds since this representation was stored
@@ -2418,6 +2527,7 @@ ngx_http_cache_turbo_header_filter(ngx_http_request_t *r)
         && !ctx->vary_nocache
         && !ctx->min_uses_skip
         && !ctx->auto_skip
+        && !ctx->req_no_store
         && ngx_http_cache_turbo_status_ttl(clcf, r->headers_out.status) >= 0
         && ngx_http_cache_turbo_response_cacheable(r)
         && (clcf->no_store == NULL

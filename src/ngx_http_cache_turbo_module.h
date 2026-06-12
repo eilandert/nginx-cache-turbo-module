@@ -597,6 +597,14 @@ typedef struct {
      * re-entry of the access handler (L2/NX-lock/cold-wait wake). */
     unsigned                 min_uses_skip:1;
     unsigned                 min_uses_passed:1;
+    /* RFC-1 request Cache-Control (parsed once in the prologue). only_if_cached
+     * (RFC 9111 §5.2.1.7): the client refuses origin contact, so a request that
+     * cannot be served from L1/L2 returns 504 instead of going to the origin.
+     * no_store (§5.2.1.5): do not store this request's response (the header
+     * filter skips capture). Request no-cache / max-age=0 are folded into
+     * ngx_http_cache_turbo_request_revalidate() and handled inline. */
+    unsigned                 req_only_if_cached:1;
+    unsigned                 req_no_store:1;
 } ngx_http_cache_turbo_ctx_t;
 
 

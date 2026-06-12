@@ -206,8 +206,16 @@ accidentally serve Alice's logged-in page to Bob:
 
 Hop-by-hop / framing headers (`Connection`, `Transfer-Encoding`,
 `Content-Length`, `Set-Cookie`, `Date`, `Server`, …) are stripped before
-storing; nginx rebuilds them on the way out, so a cached response is still
-well-formed.
+storing and rebuilt on the way out, so a cached response is still well-formed.
+The `Date` is re-emitted as a **stable** timestamp for the cached
+representation (it does not advance on every hit), and an `Age` header reports
+how long the copy has been cached — the two stay mutually consistent (RFC 9111).
+
+It also honours a few **request** `Cache-Control` directives: `no-cache` /
+`max-age=0` (and `Pragma: no-cache`) force a revalidation against the origin
+(a force-refresh); `no-store` runs the request to the origin and does **not**
+store the response; and `only-if-cached` answers `504 Gateway Timeout` when the
+page is in neither L1 nor L2, instead of contacting the origin.
 
 ### Conditional requests (`304 Not Modified`)
 
@@ -218,6 +226,10 @@ trip. A `GET`/`HEAD` carrying `If-None-Match` (matched with the weak comparator,
 when the client's copy is still current; `If-None-Match` wins when both are
 present (RFC 7232). Anything else serves the full cached body. This is automatic
 — there is no directive to set.
+
+A `304` is only answered from a **fresh** entry. A stale entry (being served
+while a refresh runs) has not been revalidated against the origin, so it serves
+the full body rather than asserting "still current" with a `304` (RFC 9111).
 
 ### Auto-Vary (read the response `Vary`)
 

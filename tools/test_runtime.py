@@ -650,6 +650,18 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # RFC-6: short fresh TTL + ETag (the origin emits validators for any
+        # path containing "cond") so a conditional request can be made against a
+        # STALE entry. beta 1 ~ never rolls a refresh, so the read is a
+        # deterministic STALE serve - and a 304 must NOT be answered from it.
+        location /condst/ {{
+            cache_turbo       main;
+            cache_turbo_key   $uri;
+            cache_turbo_valid 1s;
+            cache_turbo_beta  1;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # per-status caching (v6): cache redirects + negative responses too
         location /st/ {{
             cache_turbo       main;
@@ -2236,6 +2248,94 @@ def test_conditional_inm_beats_ims(ng: Nginx) -> None:
                                  "Tue, 20 Oct 2015 07:28:00 GMT"})
     assert s == 304 and b == "", \
         f"INM match must win over older IMS (304 expected): {s} {b!r}"
+
+
+def test_rfc6_stale_conditional_full(ng: Nginx, origin: Origin) -> None:
+    """RFC-6: a 304 may only be answered from a FRESH entry. Once the entry is
+    stale (served while a refresh is pending) a conditional request gets the
+    full 200 body, never a 304 from an unvalidated stale copy."""
+    s0, _, h0 = fetch_raw(ng.port, "/condst/cond-x")                    # prime, fresh 1s
+    assert s0 == 200 and h0.get("etag") == '"v11etag"', f"prime: {s0} {h0}"
+    # while still fresh, a matching INM is a 304 (the existing fresh behaviour)
+    sf, bf, hf = fetch_raw(ng.port, "/condst/cond-x",
+                           headers={"If-None-Match": '"v11etag"'})
+    assert sf == 304 and bf == "" and hf.get("x-cache") == "HIT", \
+        f"fresh conditional should 304: {sf} {bf!r} {hf}"
+    time.sleep(1.4)                                                # now stale
+    s1, b1, h1 = fetch_raw(ng.port, "/condst/cond-x",
+                           headers={"If-None-Match": '"v11etag"'})
+    assert s1 == 200, f"stale conditional must serve full body, not 304: {s1}"
+    assert b1, "stale conditional must carry the full body"
+    assert h1.get("x-cache") == "STALE", \
+        f"stale serve expected (beta 1, no refresh): {h1.get('x-cache')}"
+
+
+def test_rfc3_date_stable_across_hits(ng: Nginx) -> None:
+    """RFC-3: the Date emitted for a cached representation is stable across hits
+    (it does not advance to "now" on every request) and Age tracks elapsed time
+    consistently with it."""
+    fetch_raw(ng.port, "/cond/date")                               # prime (miss)
+    _, _, ha = fetch_raw(ng.port, "/cond/date")                    # HIT A
+    assert ha.get("x-cache") == "HIT", f"second read should be a HIT: {ha}"
+    assert ha.get("date"), "a cached HIT must carry a Date"
+    age_a = int(ha.get("age", "0"))
+    time.sleep(1.4)
+    _, _, hb = fetch_raw(ng.port, "/cond/date")                    # HIT B (later)
+    assert hb.get("x-cache") == "HIT", f"third read should be a HIT: {hb}"
+    assert hb.get("date") == ha.get("date"), \
+        f"Date must be stable across hits: {ha.get('date')} -> {hb.get('date')}"
+    assert int(hb.get("age", "0")) > age_a, \
+        f"Age must advance while Date holds: {age_a} -> {hb.get('age')}"
+
+
+def test_rfc1_only_if_cached_miss_504(ng: Nginx, origin: Origin) -> None:
+    """RFC-1 (§5.2.1.7): only-if-cached on a key in neither L1 nor L2 returns
+    504 Gateway Timeout and never contacts the origin."""
+    before = origin.hits
+    s, _, _ = fetch_raw(ng.port, "/cond/oic-miss",
+                        headers={"Cache-Control": "only-if-cached"})
+    assert s == 504, f"only-if-cached miss must be 504, got {s}"
+    assert origin.hits == before, "only-if-cached must not reach the origin"
+
+
+def test_rfc1_only_if_cached_hit(ng: Nginx, origin: Origin) -> None:
+    """RFC-1: only-if-cached is satisfied by a cache HIT (no origin contact)."""
+    fetch_raw(ng.port, "/cond/oic-hit")                            # prime
+    before = origin.hits
+    s, b, h = fetch_raw(ng.port, "/cond/oic-hit",
+                        headers={"Cache-Control": "only-if-cached"})
+    assert s == 200 and b, f"only-if-cached HIT should serve the body: {s} {b!r}"
+    assert h.get("x-cache") == "HIT" and origin.hits == before, \
+        "only-if-cached HIT must be served from cache"
+
+
+def test_rfc1_request_no_store(ng: Nginx, origin: Origin) -> None:
+    """RFC-1 (§5.2.1.5): a request Cache-Control: no-store runs to the origin and
+    its response is NOT stored — a following plain GET still misses."""
+    before = origin.hits
+    s, _, h = fetch_raw(ng.port, "/cond/rns",
+                        headers={"Cache-Control": "no-store"})
+    assert s == 200, f"no-store request should still serve 200: {s}"
+    assert "x-cache" not in h, "a no-store request is an origin miss, not a HIT"
+    assert origin.hits == before + 1, "no-store must reach the origin"
+    # nothing was stored: the next plain GET is itself a miss (origin hit again)
+    s2, _, h2 = fetch_raw(ng.port, "/cond/rns")
+    assert "x-cache" not in h2 and origin.hits == before + 2, \
+        f"no-store response must not have been cached: {h2}"
+
+
+def test_rfc1_request_max_age_zero_revalidates(ng: Nginx, origin: Origin) -> None:
+    """RFC-1 (§5.2.1.1): a request max-age=0 (browser force-refresh) forces a
+    revalidation — the cached entry is bypassed to the origin and refreshed."""
+    fetch_raw(ng.port, "/cond/ma0")                                # prime
+    _, _, hhit = fetch_raw(ng.port, "/cond/ma0")
+    assert hhit.get("x-cache") == "HIT", "entry should be cached before refresh"
+    before = origin.hits
+    s, _, h = fetch_raw(ng.port, "/cond/ma0",
+                        headers={"Cache-Control": "max-age=0"})
+    assert s == 200, f"max-age=0 should still serve 200: {s}"
+    assert "x-cache" not in h, "max-age=0 must revalidate at origin, not HIT"
+    assert origin.hits == before + 1, "max-age=0 must reach the origin"
 
 
 def test_purge_method(ng: Nginx) -> None:
@@ -4119,6 +4219,12 @@ def run_all(ng: Nginx, origin: Origin,
     test_conditional_ims_304(ng)
     test_conditional_ims_old_full(ng)
     test_conditional_inm_beats_ims(ng)
+    test_rfc6_stale_conditional_full(ng, origin)
+    test_rfc3_date_stable_across_hits(ng)
+    test_rfc1_only_if_cached_miss_504(ng, origin)
+    test_rfc1_only_if_cached_hit(ng, origin)
+    test_rfc1_request_no_store(ng, origin)
+    test_rfc1_request_max_age_zero_revalidates(ng, origin)
     test_purge_method(ng)
     test_cor5_l1only_variant_purge(ng, origin)
     test_cache_and_purge_respect_access_control(ng)
