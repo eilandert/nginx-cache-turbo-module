@@ -268,8 +268,9 @@ variant. Off by default.
 ## The cache key
 
 A "key" is just the string that decides whether two requests are *the same
-page*. Default key is `$host$request_uri` (the Host + the full path+query), so
-two vhosts sharing a zone never collide.
+page*. Default key is `$host$uri$cache_turbo_normalized_args` (the Host + path +
+normalized args — tracking params stripped, args sorted), so two vhosts sharing
+a zone never collide and `?utm_*`/arg-reordering hit one slot.
 
 Set your own with `cache_turbo_key` using any nginx variables:
 
@@ -482,7 +483,7 @@ http {
 | `cache_turbo NAME [auto]` / `off` | `server`, `location` | `off` | Turn caching on (bind a zone) or off. The optional `auto` is shorthand for `cache_turbo_backend generic` (auto-classify dynamic CMS surfaces — see below). |
 | `cache_turbo_backend NAME...` | `server`, `location` | — | Auto-classify dynamic (uncacheable) request surfaces for one or more CMS presets: `generic` (a.k.a. `auto`, the union), `wordpress`, `woocommerce`, `joomla`. A matching request (login/session cookie, admin URI, dynamic arg) skips the cache and goes straight to origin. Implies `cache_turbo_honor_cache_control on`. |
 | `cache_turbo_suppress_native on` | `server`, `location` | `off` | Make `$cache_turbo_active` read `1` while cache-turbo owns a request, so a stacked native `proxy_cache` can defer via `proxy_no_cache $cache_turbo_active; proxy_cache_bypass $cache_turbo_active;`. Off (default) keeps the variable always `0` (the wiring stays inert). |
-| `cache_turbo_key STRING` | `server`, `location` | `$host$uri$cache_turbo_normalized_args` | What makes two requests "the same page". The default already includes the Host and the **normalized args** (tracking params stripped, args sorted). |
+| `cache_turbo_key STRING` | `server`, `location` | normalized | What makes two requests "the same page". The default is `$host$uri$cache_turbo_normalized_args` — Host + **normalized args** (tracking params stripped, args sorted). |
 | `cache_turbo_preset NAME` | `server`, `location` | `balanced` | `conservative` / `balanced` / `aggressive` — sets the four knobs below at once. |
 | `cache_turbo_valid [CODE...] TIME` | `server`, `location` | preset (`60s`) | How long a copy stays *fresh* (then *stale*, still served). Bare `TIME` = the default/200 TTL. `TIME` of `0` = cache forever (stays fresh, never expires). With leading status codes (`cache_turbo_valid 301 404 1m;`) it makes those statuses cacheable too — redirects + negative caching. Repeatable. |
 | `cache_turbo_beta N` | `server`, `location` | preset (`1000`) | Refresh eagerness, ×1000 (1000 = 1.0). Higher = refresh sooner/more often. |
