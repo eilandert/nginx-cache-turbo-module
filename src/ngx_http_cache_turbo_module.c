@@ -827,24 +827,21 @@ ngx_http_cache_turbo_cc_delta(u_char *p, u_char *last, const char *name,
 
 
 /*
- * Fresh TTL derived from the response's own freshness headers (v7), or -1 if it
- * carries none. Cache-Control s-maxage wins over max-age; otherwise Expires
- * (absolute) minus now. A past Expires / a parse miss clamps to 0 (store but
- * immediately stale). no-store/private/max-age=0 are already refused upstream by
- * response_cacheable, so they never reach here.
+ * CQ-3: find the first header named `name` (case-insensitive) in an ngx_list_t
+ * (works for both r->headers_in.headers and r->headers_out.headers), returning
+ * its value or a NULL ngx_str_t when absent. Replaces the open-coded
+ * ngx_list_part walk that was copy-pasted across the header-policy helpers. The
+ * header lists are short, so a separate walk per looked-up name is cheap.
  */
-static time_t
-ngx_http_cache_turbo_upstream_ttl(ngx_http_request_t *r)
+static ngx_str_t
+ngx_http_cache_turbo_header_find(ngx_list_t *headers, const char *name,
+    size_t name_len)
 {
-    ngx_list_part_t  *part;
-    ngx_table_elt_t  *h;
+    ngx_list_part_t  *part = &headers->part;
+    ngx_table_elt_t  *h = part->elts;
     ngx_uint_t        i;
-    u_char           *cc = NULL, *cc_last = NULL;
-    ngx_str_t         expires = ngx_null_string;
-    time_t            t;
+    ngx_str_t         v = ngx_null_string;
 
-    part = &r->headers_out.headers.part;
-    h = part->elts;
     for (i = 0; /* void */ ; i++) {
         if (i >= part->nelts) {
             if (part->next == NULL) {
@@ -854,28 +851,43 @@ ngx_http_cache_turbo_upstream_ttl(ngx_http_request_t *r)
             h = part->elts;
             i = 0;
         }
-        if (h[i].hash == 0 || h[i].key.len == 0) {
+        if (h[i].hash == 0 || h[i].key.len != name_len) {
             continue;
         }
-        if (h[i].key.len == sizeof("Cache-Control") - 1
-            && ngx_strncasecmp(h[i].key.data, (u_char *) "Cache-Control",
-                               sizeof("Cache-Control") - 1) == 0)
-        {
-            cc = h[i].value.data;
-            cc_last = cc + h[i].value.len;
-        } else if (h[i].key.len == sizeof("Expires") - 1
-                   && ngx_strncasecmp(h[i].key.data, (u_char *) "Expires",
-                                      sizeof("Expires") - 1) == 0)
-        {
-            expires = h[i].value;
+        if (ngx_strncasecmp(h[i].key.data, (u_char *) name, name_len) == 0) {
+            return h[i].value;
         }
     }
 
-    if (cc != NULL) {
-        t = ngx_http_cache_turbo_cc_delta(cc, cc_last, "s-maxage",
+    return v;
+}
+
+
+/*
+ * Fresh TTL derived from the response's own freshness headers (v7), or -1 if it
+ * carries none. Cache-Control s-maxage wins over max-age; otherwise Expires
+ * (absolute) minus now. A past Expires / a parse miss clamps to 0 (store but
+ * immediately stale). no-store/private/max-age=0 are already refused upstream by
+ * response_cacheable, so they never reach here.
+ */
+static time_t
+ngx_http_cache_turbo_upstream_ttl(ngx_http_request_t *r)
+{
+    ngx_str_t  cc, expires;
+    time_t     t;
+
+    cc = ngx_http_cache_turbo_header_find(&r->headers_out.headers,
+             "Cache-Control", sizeof("Cache-Control") - 1);
+    expires = ngx_http_cache_turbo_header_find(&r->headers_out.headers,
+             "Expires", sizeof("Expires") - 1);
+
+    if (cc.data != NULL) {
+        u_char  *cc_last = cc.data + cc.len;
+
+        t = ngx_http_cache_turbo_cc_delta(cc.data, cc_last, "s-maxage",
                                           sizeof("s-maxage") - 1);
         if (t < 0) {
-            t = ngx_http_cache_turbo_cc_delta(cc, cc_last, "max-age",
+            t = ngx_http_cache_turbo_cc_delta(cc.data, cc_last, "max-age",
                                               sizeof("max-age") - 1);
         }
         if (t >= 0) {
@@ -905,42 +917,21 @@ ngx_http_cache_turbo_upstream_ttl(ngx_http_request_t *r)
 static ngx_int_t
 ngx_http_cache_turbo_response_must_revalidate(ngx_http_request_t *r)
 {
-    ngx_list_part_t  *part = &r->headers_out.headers.part;
-    ngx_table_elt_t  *h = part->elts;
-    ngx_uint_t        i;
+    ngx_str_t  cc;
+    u_char    *v, *e;
 
-    for (i = 0; /* void */ ; i++) {
-        if (i >= part->nelts) {
-            if (part->next == NULL) {
-                break;
-            }
-            part = part->next;
-            h = part->elts;
-            i = 0;
-        }
-        if (h[i].hash == 0
-            || h[i].key.len != sizeof("Cache-Control") - 1
-            || ngx_strncasecmp(h[i].key.data, (u_char *) "Cache-Control",
-                               sizeof("Cache-Control") - 1) != 0)
-        {
-            continue;
-        }
-
-        {
-            u_char  *v = h[i].value.data;
-            u_char  *e = v + h[i].value.len;
-
-            if (ngx_http_cache_turbo_cc_has(v, e, "must-revalidate",
-                    sizeof("must-revalidate") - 1)
-                || ngx_http_cache_turbo_cc_has(v, e, "proxy-revalidate",
-                    sizeof("proxy-revalidate") - 1))
-            {
-                return 1;
-            }
-        }
+    cc = ngx_http_cache_turbo_header_find(&r->headers_out.headers,
+             "Cache-Control", sizeof("Cache-Control") - 1);
+    if (cc.data == NULL) {
+        return 0;
     }
 
-    return 0;
+    v = cc.data;
+    e = cc.data + cc.len;
+    return (ngx_http_cache_turbo_cc_has(v, e, "must-revalidate",
+                sizeof("must-revalidate") - 1)
+            || ngx_http_cache_turbo_cc_has(v, e, "proxy-revalidate",
+                sizeof("proxy-revalidate") - 1)) ? 1 : 0;
 }
 
 
@@ -955,45 +946,24 @@ ngx_http_cache_turbo_response_must_revalidate(ngx_http_request_t *r)
 static ngx_int_t
 ngx_http_cache_turbo_request_no_cache(ngx_http_request_t *r)
 {
-    ngx_list_part_t  *part = &r->headers_in.headers.part;
-    ngx_table_elt_t  *h = part->elts;
-    ngx_uint_t        i;
+    ngx_str_t  cc, pragma;
 
-    for (i = 0; /* void */ ; i++) {
-        if (i >= part->nelts) {
-            if (part->next == NULL) {
-                break;
-            }
-            part = part->next;
-            h = part->elts;
-            i = 0;
-        }
-        if (h[i].hash == 0) {
-            continue;
-        }
+    cc = ngx_http_cache_turbo_header_find(&r->headers_in.headers,
+             "Cache-Control", sizeof("Cache-Control") - 1);
+    if (cc.data != NULL
+        && ngx_http_cache_turbo_cc_has(cc.data, cc.data + cc.len,
+               "no-cache", sizeof("no-cache") - 1))
+    {
+        return 1;
+    }
 
-        if (h[i].key.len == sizeof("Cache-Control") - 1
-            && ngx_strncasecmp(h[i].key.data, (u_char *) "Cache-Control",
-                               sizeof("Cache-Control") - 1) == 0)
-        {
-            if (ngx_http_cache_turbo_cc_has(h[i].value.data,
-                    h[i].value.data + h[i].value.len, "no-cache",
-                    sizeof("no-cache") - 1))
-            {
-                return 1;
-            }
-
-        } else if (h[i].key.len == sizeof("Pragma") - 1
-                   && ngx_strncasecmp(h[i].key.data, (u_char *) "Pragma",
-                                      sizeof("Pragma") - 1) == 0)
-        {
-            if (ngx_http_cache_turbo_cc_has(h[i].value.data,
-                    h[i].value.data + h[i].value.len, "no-cache",
-                    sizeof("no-cache") - 1))
-            {
-                return 1;
-            }
-        }
+    pragma = ngx_http_cache_turbo_header_find(&r->headers_in.headers,
+             "Pragma", sizeof("Pragma") - 1);
+    if (pragma.data != NULL
+        && ngx_http_cache_turbo_cc_has(pragma.data, pragma.data + pragma.len,
+               "no-cache", sizeof("no-cache") - 1))
+    {
+        return 1;
     }
 
     return 0;
@@ -1298,16 +1268,24 @@ ngx_http_cache_turbo_precontent_handler(ngx_http_request_t *r)
 }
 
 
+/*
+ * CQ-2: prologue gates + per-request setup shared by every (re)entry of the
+ * access handler (a parked L2/lock resume re-enters the handler, so this runs
+ * again — build_key/auto-classify/no-cache/vary/bypass all re-evaluate, exactly
+ * as before the extraction). Returns NGX_OK with ctxp/zp/hashp populated when
+ * the caller should proceed to the L1 lookup; any other value is what the
+ * handler must return (NGX_DECLINED for the not-cacheable/skip/bypass gates,
+ * NGX_ERROR on ctx alloc / key build failure).
+ */
 static ngx_int_t
-ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
+ngx_http_cache_turbo_access_prologue(ngx_http_request_t *r,
+    ngx_http_cache_turbo_loc_conf_t *clcf,
+    ngx_http_cache_turbo_ctx_t **ctxp, ngx_http_cache_turbo_zone_t **zp,
+    uint32_t *hashp)
 {
-    uint32_t                          hash;
-    ngx_http_cache_turbo_ctx_t       *ctx;
-    ngx_http_cache_turbo_node_t      *ctn;
-    ngx_http_cache_turbo_zone_t      *z;
-    ngx_http_cache_turbo_loc_conf_t  *clcf;
-
-    clcf = ngx_http_get_module_loc_conf(r, ngx_http_cache_turbo_module);
+    uint32_t                      hash;
+    ngx_http_cache_turbo_ctx_t   *ctx;
+    ngx_http_cache_turbo_zone_t  *z;
 
     if (!clcf->enable || clcf->shm_zone == NULL) {
         return NGX_DECLINED;
@@ -1420,6 +1398,33 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
      * Takes the zone mutex itself, so call it before we lock below. */
     if (clcf->autotune) {
         ngx_http_cache_turbo_autotune_maybe(z, clcf->autotune_interval);
+    }
+
+    *ctxp = ctx;
+    *zp = z;
+    *hashp = hash;
+    return NGX_OK;
+}
+
+
+static ngx_int_t
+ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
+{
+    uint32_t                          hash;
+    ngx_int_t                         prc;
+    ngx_http_cache_turbo_ctx_t       *ctx;
+    ngx_http_cache_turbo_node_t      *ctn;
+    ngx_http_cache_turbo_zone_t      *z;
+    ngx_http_cache_turbo_loc_conf_t  *clcf;
+
+    clcf = ngx_http_get_module_loc_conf(r, ngx_http_cache_turbo_module);
+
+    /* Prologue: enablement, method/subrequest/auth vetoes, ctx + key, auto-
+     * classify, request no-cache, auto-Vary, bypass, autotune. NGX_OK => proceed
+     * with ctx/z/hash set; otherwise that is our return value. */
+    prc = ngx_http_cache_turbo_access_prologue(r, clcf, &ctx, &z, &hash);
+    if (prc != NGX_OK) {
+        return prc;
     }
 
     ngx_shmtx_lock(&z->shpool->mutex);
