@@ -579,7 +579,7 @@ ngx_http_cache_turbo_blob_validate(const u_char *blob, size_t len,
     const u_char  *p, *end;
     uint32_t       i;
 
-    if (len < NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE) {
+    if (blob == NULL || len < NGX_HTTP_CACHE_TURBO_BLOB_HDR_WIRE) {
         return NGX_ERROR;
     }
     if (ngx_http_cache_turbo_get_u32(blob) != NGX_HTTP_CACHE_TURBO_BLOB_MAGIC
@@ -2410,6 +2410,13 @@ ngx_http_cache_turbo_restore_response(ngx_http_request_t *r, u_char *copy,
     uint32_t                          i;
     u_char                           *etag = NULL, *lastmod = NULL;
     size_t                            etag_len = 0, lastmod_len = 0;
+
+    /* A NULL blob is never produced by a live caller (every HIT/L2 path holds a
+     * real buffer), but guard at the deref site so the static analyzer can prove
+     * the header walk below never reads through a null `p`. */
+    if (copy == NULL) {
+        return NGX_ERROR;
+    }
 
     /* STAB-4: one validated parse. blob_validate checks magic+version, that the
      * header block and body fit, AND walks every TLV header entry — so the
