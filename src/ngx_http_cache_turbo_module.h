@@ -51,6 +51,13 @@
  * idle L2 conns/worker is already absurd; reject anything larger at parse. */
 #define NGX_HTTP_CACHE_TURBO_KEEPALIVE_MAX  65535
 
+/* PERF-2: bounds on the upstream-controlled cache_turbo_tag value, so one
+ * response cannot fan out into an unbounded number of SADD connections. At most
+ * MAX_TAGS distinct tags are indexed per store; a token longer than MAX_TAG_LEN
+ * is ignored (a real tag name is short). */
+#define NGX_HTTP_CACHE_TURBO_MAX_TAGS     16
+#define NGX_HTTP_CACHE_TURBO_MAX_TAG_LEN  128
+
 /* Default SWR aggressiveness (beta). 1.0 = refresh probability tracks the
  * elapsed fraction of the stale window directly. */
 #define NGX_HTTP_CACHE_TURBO_DEFAULT_BETA      1000   /* fixed-point /1000 */
@@ -755,6 +762,15 @@ void ngx_http_cache_turbo_redis_del(ngx_http_cache_turbo_loc_conf_t *clcf,
  * call. No-op when L2 is disabled. */
 void ngx_http_cache_turbo_redis_del_raw(ngx_http_cache_turbo_loc_conf_t *clcf,
     u_char *key, size_t key_len);
+
+/* PERF-1/2: drop many L2 keys in ONE connection. Pipelines chunked variadic
+ * UNLINK commands (each UNLINK deletes up to a fixed cap of keys and returns a
+ * single integer reply) instead of one fire-and-forget connection per key, so a
+ * large tag/all purge can no longer open thousands of sockets at once. Key
+ * bytes are copied into the op pool, so the caller's array need not outlive the
+ * call. No-op when L2 is disabled or nkeys == 0. */
+void ngx_http_cache_turbo_redis_del_many(ngx_http_cache_turbo_loc_conf_t *clcf,
+    ngx_str_t *keys, ngx_uint_t nkeys);
 
 /* Build the tag-set key "<prefix>tag:<name>" into buf (must hold
  * prefix.len + sizeof("tag:")-1 + name_len). Returns bytes written. */

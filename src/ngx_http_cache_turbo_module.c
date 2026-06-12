@@ -2820,15 +2820,24 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
                 if (ngx_http_complex_value(r, clcf->tag, &tagval) == NGX_OK
                     && tagval.len)
                 {
-                    time_t   stale_ttl;
-                    u_char  *s, *e, *tok;
+                    time_t     stale_ttl;
+                    u_char    *s, *e, *tok;
+                    size_t     toklen;
+                    ngx_uint_t ntags = 0, k;
+                    /* PERF-2: the tag value is upstream-controlled (e.g. an
+                     * X-Cache-Tags header), so without bounds a hostile/buggy
+                     * origin could name thousands of tags and make ONE response
+                     * fire thousands of SADD connections. Cap the count, cap
+                     * each tag's length, and dedup so the same tag in one value
+                     * is SADD'd once. */
+                    ngx_str_t  seen[NGX_HTTP_CACHE_TURBO_MAX_TAGS];
 
                     stale_ttl = ngx_http_cache_turbo_stale_ttl(ttl,
                                     clcf->stale_mult);
                     s = tagval.data;
                     e = tagval.data + tagval.len;
 
-                    while (s < e) {
+                    while (s < e && ntags < NGX_HTTP_CACHE_TURBO_MAX_TAGS) {
                         while (s < e && (*s == ' ' || *s == '\t' || *s == ','
                                          || *s == '\r' || *s == '\n'))
                         {
@@ -2840,11 +2849,30 @@ ngx_http_cache_turbo_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
                         {
                             s++;
                         }
-                        if (s > tok) {
-                            clcf->backend->tag_add(clcf,
-                                store_key, tok, (size_t) (s - tok),
-                                stale_ttl);
+                        toklen = (size_t) (s - tok);
+                        if (toklen == 0
+                            || toklen > NGX_HTTP_CACHE_TURBO_MAX_TAG_LEN)
+                        {
+                            continue;          /* empty or over-long: skip */
                         }
+
+                        for (k = 0; k < ntags; k++) {   /* dedup within value */
+                            if (seen[k].len == toklen
+                                && ngx_memcmp(seen[k].data, tok, toklen) == 0)
+                            {
+                                break;
+                            }
+                        }
+                        if (k < ntags) {
+                            continue;          /* already added this tag */
+                        }
+
+                        seen[ntags].data = tok;
+                        seen[ntags].len = toklen;
+                        ntags++;
+
+                        clcf->backend->tag_add(clcf, store_key, tok, toklen,
+                                               stale_ttl);
                     }
                 }
             }
@@ -3681,21 +3709,31 @@ ngx_http_cache_turbo_tag_purge_complete(ngx_http_request_t *r, void *data,
     ngx_str_t *members, ngx_uint_t nmembers)
 {
     ngx_http_cache_turbo_tagpurge_t  *tp = data;
-    ngx_uint_t                        i, purged = 0;
+    ngx_uint_t                        i, purged = 0, ndel = 0;
     size_t                            plen, n;
     u_char                           *tagkey, *p;
-    ngx_str_t                         body;
+    ngx_str_t                        *delkeys, body;
 
     plen = tp->clcf->redis_prefix.len;
+
+    /* PERF-2: collect every L2 key to drop (each member's object key + its
+     * cross-node lock key + the tag set itself) and issue ONE pipelined UNLINK
+     * connection, instead of two fire-and-forget connections per member plus
+     * one for the set. A tag with thousands of members previously opened
+     * thousands of sockets at once (worker_connections exhaustion); now it is a
+     * single bounded connection. L1 eviction stays inline (no socket). */
+    delkeys = ngx_palloc(r->pool, (nmembers * 2 + 1) * sizeof(ngx_str_t));
+    if (delkeys == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
 
     for (i = 0; i < nmembers; i++) {
         if (members[i].len == 0) {
             continue;
         }
 
-        /* The member IS the object's L2 key: drop it from Redis. */
-        tp->clcf->backend->del_raw(tp->clcf, members[i].data,
-                                   members[i].len);
+        /* The member IS the object's L2 key. */
+        delkeys[ndel++] = members[i];
 
         /* member = <prefix><64 hex of the 32-byte key hash>: drop from L1, and
          * also drop the object's cross-node single-flight lock (v4-2 SET NX PX)
@@ -3716,10 +3754,10 @@ ngx_http_cache_turbo_tag_purge_complete(ngx_http_request_t *r, void *data,
                 lockbuf = ngx_pnalloc(r->pool,
                               plen + sizeof("lock:") - 1 + 64);
                 if (lockbuf != NULL) {
-                    size_t  locklen;
-                    locklen = ngx_http_cache_turbo_redis_lockkey(
+                    delkeys[ndel].data = lockbuf;
+                    delkeys[ndel].len = ngx_http_cache_turbo_redis_lockkey(
                                   &tp->clcf->redis_prefix, key_hash, lockbuf);
-                    tp->clcf->backend->del_raw(tp->clcf, lockbuf, locklen);
+                    ndel++;
                 }
             }
         }
@@ -3727,13 +3765,17 @@ ngx_http_cache_turbo_tag_purge_complete(ngx_http_request_t *r, void *data,
         purged++;
     }
 
-    /* Remove the (now-emptied) tag set itself. */
+    /* Remove the (now-emptied) tag set itself in the same pipeline. */
     tagkey = ngx_pnalloc(r->pool, plen + sizeof("tag:") - 1 + tp->tag.len);
     if (tagkey != NULL) {
         n = tp->clcf->backend->tagkey(&tp->clcf->redis_prefix,
                  tp->tag.data, tp->tag.len, tagkey);
-        tp->clcf->backend->del_raw(tp->clcf, tagkey, n);
+        delkeys[ndel].data = tagkey;
+        delkeys[ndel].len = n;
+        ndel++;
     }
+
+    ngx_http_cache_turbo_redis_del_many(tp->clcf, delkeys, ndel);
 
     p = ngx_pnalloc(r->pool, sizeof("{\"purged\":4294967295}\n"));
     if (p == NULL) {

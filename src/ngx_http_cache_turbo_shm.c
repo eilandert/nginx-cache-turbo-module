@@ -229,21 +229,44 @@ ngx_http_cache_turbo_shm_purge_key(ngx_http_cache_turbo_zone_t *z,
 }
 
 
+/* PERF-3: how many nodes to drop per lock acquisition during a purge-all walk.
+ * Holding the zone mutex for the ENTIRE LRU (which can be millions of entries)
+ * blocks every other worker's cache lookups/stores for the whole walk. Dropping
+ * in bounded batches and releasing the mutex between them keeps each critical
+ * section short, so a concurrent request waits at most one batch, not the whole
+ * purge. The total is still reported. */
+#define NGX_HTTP_CACHE_TURBO_PURGE_BATCH  512
+
 ngx_uint_t
 ngx_http_cache_turbo_shm_purge_all(ngx_http_cache_turbo_zone_t *z)
 {
-    ngx_uint_t                    n = 0;
+    ngx_uint_t                    n = 0, batch;
     ngx_queue_t                  *q;
     ngx_http_cache_turbo_node_t  *ctn;
 
-    ngx_shmtx_lock(&z->shpool->mutex);
-    while (!ngx_queue_empty(&z->sh->lru)) {
-        q = ngx_queue_head(&z->sh->lru);
-        ctn = ngx_queue_data(q, ngx_http_cache_turbo_node_t, lru);
-        ngx_http_cache_turbo_shm_drop_locked(z, ctn);
-        n++;
+    for ( ;; ) {
+        ngx_shmtx_lock(&z->shpool->mutex);
+
+        batch = 0;
+        while (batch < NGX_HTTP_CACHE_TURBO_PURGE_BATCH
+               && !ngx_queue_empty(&z->sh->lru))
+        {
+            q = ngx_queue_head(&z->sh->lru);
+            ctn = ngx_queue_data(q, ngx_http_cache_turbo_node_t, lru);
+            ngx_http_cache_turbo_shm_drop_locked(z, ctn);
+            batch++;
+        }
+
+        n += batch;
+        ngx_shmtx_unlock(&z->shpool->mutex);
+
+        /* Drained, or this batch hit the cap with more to go: loop and let any
+         * waiter take the mutex before we grab the next batch. */
+        if (batch < NGX_HTTP_CACHE_TURBO_PURGE_BATCH) {
+            break;
+        }
     }
-    ngx_shmtx_unlock(&z->shpool->mutex);
+
     return n;
 }
 

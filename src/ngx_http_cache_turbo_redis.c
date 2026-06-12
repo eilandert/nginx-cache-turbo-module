@@ -1033,6 +1033,93 @@ ngx_http_cache_turbo_redis_del(ngx_http_cache_turbo_loc_conf_t *clcf,
 }
 
 
+/* Keys per pipelined UNLINK. UNLINK is variadic and returns a SINGLE integer
+ * reply regardless of how many keys it names, so one chunk costs one reply —
+ * read_drain frames `nchunks` of them (STAB-1 expected_replies). */
+#define NGX_HTTP_CACHE_TURBO_REDIS_DEL_CHUNK  256
+
+
+void
+ngx_http_cache_turbo_redis_del_many(ngx_http_cache_turbo_loc_conf_t *clcf,
+    ngx_str_t *keys, ngx_uint_t nkeys)
+{
+    ngx_uint_t                        i, m, nchunks, emitted;
+    size_t                            total;
+    ngx_str_t                        *argv;
+    ngx_buf_t                       **bufs, *cmd;
+    ngx_http_cache_turbo_redis_op_t  *op;
+
+    if (!clcf->redis_enable || nkeys == 0) {
+        return;
+    }
+
+    op = ngx_http_cache_turbo_redis_op_create(clcf);
+    if (op == NULL) {
+        return;
+    }
+
+    /* "UNLINK" + up to CHUNK keys per command. */
+    argv = ngx_palloc(op->pool,
+               (1 + NGX_HTTP_CACHE_TURBO_REDIS_DEL_CHUNK) * sizeof(ngx_str_t));
+    nchunks = (nkeys + NGX_HTTP_CACHE_TURBO_REDIS_DEL_CHUNK - 1)
+              / NGX_HTTP_CACHE_TURBO_REDIS_DEL_CHUNK;
+    bufs = ngx_palloc(op->pool, nchunks * sizeof(ngx_buf_t *));
+    if (argv == NULL || bufs == NULL) {
+        ngx_destroy_pool(op->pool);
+        return;
+    }
+    argv[0].data = (u_char *) "UNLINK";
+    argv[0].len = sizeof("UNLINK") - 1;
+
+    total = 0;
+    emitted = 0;
+    i = 0;
+    while (i < nkeys) {
+        m = 0;
+        while (m < NGX_HTTP_CACHE_TURBO_REDIS_DEL_CHUNK && i < nkeys) {
+            if (keys[i].len) {            /* skip empty keys defensively */
+                argv[1 + m] = keys[i];    /* shallow; encode copies the bytes */
+                m++;
+            }
+            i++;
+        }
+        if (m == 0) {
+            continue;                     /* chunk held only empty keys */
+        }
+        cmd = ngx_http_cache_turbo_redis_encode(op->pool, argv, 1 + m);
+        if (cmd == NULL) {
+            ngx_destroy_pool(op->pool);
+            return;
+        }
+        bufs[emitted++] = cmd;
+        total += (size_t) (cmd->last - cmd->pos);
+    }
+
+    if (emitted == 0) {                   /* nothing to delete */
+        ngx_destroy_pool(op->pool);
+        return;
+    }
+
+    op->send = ngx_create_temp_buf(op->pool, total);
+    if (op->send == NULL) {
+        ngx_destroy_pool(op->pool);
+        return;
+    }
+    for (i = 0; i < emitted; i++) {
+        op->send->last = ngx_cpymem(op->send->last, bufs[i]->pos,
+                                    (size_t) (bufs[i]->last - bufs[i]->pos));
+    }
+
+    op->expected_replies = emitted;       /* one integer reply per UNLINK */
+
+    if (ngx_http_cache_turbo_redis_launch(op, clcf,
+            ngx_http_cache_turbo_redis_read_drain) != NGX_OK)
+    {
+        ngx_destroy_pool(op->pool);
+    }
+}
+
+
 size_t
 ngx_http_cache_turbo_redis_tagkey(ngx_str_t *prefix, u_char *name,
     size_t name_len, u_char *buf)
@@ -2227,7 +2314,7 @@ static void
 ngx_http_cache_turbo_redis_read_scan(ngx_event_t *rev)
 {
     ngx_str_t                         cursor, *keys;
-    ngx_uint_t                        i, nkeys;
+    ngx_uint_t                        nkeys;
     ngx_int_t                         rc;
     ngx_connection_t                 *c;
     ngx_http_cache_turbo_redis_op_t  *op;
@@ -2270,13 +2357,11 @@ ngx_http_cache_turbo_redis_read_scan(ngx_event_t *rev)
             return;
         }
 
-        /* DEL each matched key (keys point into rbuf; del_raw copies them). */
-        for (i = 0; i < nkeys; i++) {
-            if (keys[i].len) {
-                ngx_http_cache_turbo_redis_del_raw(op->clcf, keys[i].data,
-                                                   keys[i].len);
-            }
-        }
+        /* PERF-1: drop the whole page in one pipelined UNLINK connection rather
+         * than a fresh fire-and-forget connection per key (an FD/timer storm on
+         * a large keyspace). Keys point into rbuf; del_many copies them before
+         * the next SCAN resets rbuf. */
+        ngx_http_cache_turbo_redis_del_many(op->clcf, keys, nkeys);
 
         if (cursor.len == 1 && cursor.data[0] == '0') {
             /* whole keyspace walked: emit the response via the callback */

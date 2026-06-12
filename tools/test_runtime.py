@@ -430,6 +430,17 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # PERF-2: tag value taken from a query arg (upstream-controlled stand-in)
+        # so the cap/dedup on cache_turbo_tag can be exercised.
+        location /l2tcap/ {{
+            cache_turbo          main;
+            cache_turbo_key      $uri;
+            cache_turbo_valid    30s;
+            cache_turbo_redis    127.0.0.1:{redis_port} prefix=ct: timeout=250ms;
+            cache_turbo_tag      $arg_t;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
         # COR-5 (Redis-backed): auto-Vary + PURGE with an L2 backend. Each variant
         # store SADDs its L2 key into a per-base variant-index set; a PURGE of the
         # base URI SMEMBERS that set and drops every variant from L1 + L2 + the
@@ -3222,6 +3233,65 @@ def test_l2_tag_purge(ng: Nginx, origin: Origin, redis: RedisServer) -> None:
         "post-purge bodies should be fresh generations"
 
 
+def test_l2_tag_purge_large(ng: Nginx, origin: Origin,
+                            redis: RedisServer) -> None:
+    """STAB-3 + PERF-1/2: a tag set with enough members that the SMEMBERS reply
+    spans multiple recv()s (>16 KiB), and whose purge drops every member across
+    both tiers. Pre-PERF this fired ~2N fire-and-forget DEL connections at once
+    and exhausted worker_connections; now the purge collects all keys into ONE
+    pipelined UNLINK connection, so the whole set is deleted cleanly. Asserts
+    both the framed member count (STAB-3) and full cross-tier deletion (PERF)."""
+    redis.cli("DEL", tag_key("blog"), tag_key("news"))
+    n = 350                                        # ~25 KiB SMEMBERS reply
+    for i in range(n):
+        s, _, _ = fetch(ng.port, f"/l2t/big-{i}")  # miss -> store + tag
+        assert s == 200, f"prime /l2t/big-{i} status {s}"
+    assert wait_for(lambda: redis.cli("SCARD", tag_key("news")) == str(n),
+                    timeout=10.0), \
+        f"expected {n} members in 'news', got {redis.cli('SCARD', tag_key('news'))}"
+
+    s, b, _ = fetch(ng.port, "/_cache_l2?tag=news", method="POST")
+    assert s == 200, f"large tag purge status {s}"
+    # STAB-3: the whole multi-recv SMEMBERS array was framed + parsed once.
+    assert json.loads(b)["purged"] == n, f"expected {n} purged, got {b}"
+    # PERF-1/2: the pipelined UNLINK dropped every member + the tag set itself.
+    assert wait_for(lambda: redis.cli("EXISTS", tag_key("news")) == "0",
+                    timeout=10.0), "emptied tag set survived the large purge"
+    assert wait_for(lambda: redis.cli("EXISTS", l2_key("/l2t/big-0")) == "0"
+                    and redis.cli("EXISTS", l2_key(f"/l2t/big-{n-1}")) == "0",
+                    timeout=10.0), "purged members survived in L2"
+
+
+def test_l2_tag_cap_and_dedup(ng: Nginx, origin: Origin,
+                              redis: RedisServer) -> None:
+    """PERF-2: the upstream-controlled cache_turbo_tag value is bounded. A
+    request naming more than MAX_TAGS (16) distinct tags indexes only the first
+    16; duplicate tags in one value are SADD'd once (idempotent + no extra
+    connection). Guards against a hostile origin fanning out unbounded SADDs."""
+    obj = l2_key("/l2tcap/x")
+    # 30 distinct tags -> only the first 16 should index the object.
+    tags = ",".join(f"cap{i}" for i in range(30))
+    for i in range(30):
+        redis.cli("DEL", tag_key(f"cap{i}"))
+    s, _, _ = fetch(ng.port, f"/l2tcap/x?t={tags}")
+    assert s == 200, f"cap prime status {s}"
+    assert wait_for(lambda: redis.cli("SISMEMBER", tag_key("cap0"), obj) == "1"), \
+        "first tag was not indexed"
+    indexed = sum(1 for i in range(30)
+                  if redis.cli("SISMEMBER", tag_key(f"cap{i}"), obj) == "1")
+    assert indexed == 16, f"expected exactly 16 tags indexed (cap), got {indexed}"
+
+    # dedup: the same tag repeated still yields one membership.
+    obj2 = l2_key("/l2tcap/y")
+    redis.cli("DEL", tag_key("dup"))
+    s, _, _ = fetch(ng.port, "/l2tcap/y?t=dup,dup,dup,dup")
+    assert s == 200
+    assert wait_for(lambda: redis.cli("SISMEMBER", tag_key("dup"), obj2) == "1"), \
+        "deduped tag was not indexed"
+    assert redis.cli("SCARD", tag_key("dup")) == "1", \
+        "duplicate tag produced more than one membership"
+
+
 def _spawn_node(ng: Nginx, name: str, port_offset: int) -> Nginx:
     """Start a second, independent nginx (own root, same Redis + origin) so a
     cross-node test can observe two cache instances sharing one L2."""
@@ -4111,6 +4181,8 @@ def run_all(ng: Nginx, origin: Origin,
         test_l2_malformed_blob_rejected(ng, origin, redis)  # STAB-4 validate
         test_l2_tag_add_on_store(ng, origin, redis)
         test_l2_tag_purge(ng, origin, redis)
+        test_l2_tag_purge_large(ng, origin, redis)  # STAB-3 + PERF-1/2 pipeline
+        test_l2_tag_cap_and_dedup(ng, origin, redis)  # PERF-2 tag cap/dedup
         test_cor5_redis_variant_purge(ng, origin, redis)  # COR-5 variant index
         test_multinode_lock(ng, origin, redis)
         test_lock_self_heal(ng, origin, redis)
