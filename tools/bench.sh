@@ -174,11 +174,10 @@ prime() {
         B) hdr="X-Cache-Status";;
         *) hdr="X-Cache";;
     esac
-    local i
     # 30 tries with a small gap: priming runs right after the previous
     # mode's wrk pass, so the box is still draining TIME_WAIT sockets and a
     # cold-miss fill to the shared origin can flake for a moment.
-    for i in $(seq 1 30); do
+    for _ in $(seq 1 30); do
         curl -fsS -D - -o /dev/null "$url" 2>/dev/null > "$WORK/logs/hdr" || true
         xc=$(grep -i "^$hdr:" "$WORK/logs/hdr" | tr -d '\r' | awk '{print toupper($2)}' || true)
         if [ "$xc" = "HIT" ]; then return 0; fi
@@ -202,9 +201,9 @@ runwrk() {
 }
 
 modes=(A B C)
-ports=(A:$A B:$B C:$C)
-admin=(A: B: C:/_cache_c)
-[ -n "$REDIS" ] && { modes+=(D); ports+=(D:$D); admin+=(D:/_cache_d); }
+ports=("A:$A" "B:$B" "C:$C")
+admin=("A:" "B:" "C:/_cache_c")
+[ -n "$REDIS" ] && { modes+=(D); ports+=("D:$D"); admin+=("D:/_cache_d"); }
 
 declare -A PORT ADMIN
 for kv in "${ports[@]}"; do PORT[${kv%%:*}]=${kv#*:}; done
