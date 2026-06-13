@@ -174,9 +174,19 @@ location / {
 [BENCHMARK.md](BENCHMARK.md), +23–37 % over `proxy_cache` on small/medium
 bodies); SWR + stale-if-error on by default (vs wrestling
 `proxy_cache_use_stale`); dogpile protection that spans a fleet via the Redis
-lock (not just per-box `proxy_cache_lock`); a **shared L2** so one box's fill
-warms the whole fleet; and tag purge, auto-Vary, CMS auto-classify + a
-JSON/Prometheus admin endpoint.
+lock (not just per-box `proxy_cache_lock`); a **distributed L2** (Redis or
+memcached) shared by the whole fleet, so one box's fill warms every node and a
+rebooted box refills from the cluster instead of stampeding the origin —
+`proxy_cache` is per-box disk, every node cold on its own; and tag purge,
+auto-Vary, CMS auto-classify + a JSON/Prometheus admin endpoint. It is also **upstream-agnostic** — the *same*
+directives microcache a `fastcgi_pass` PHP-FPM app and a `proxy_pass` API, where
+stock nginx makes you run `fastcgi_cache` and `proxy_cache` as two separate
+systems — and SWR + single-flight make a 1-second TTL genuinely safe (the
+backend sees ~one request per second per key, not a stampede).
+
+(Caching dynamic/PHP-FPM/API responses is **not** itself a differentiator —
+`fastcgi_cache`/`proxy_cache` do that too. The edge is the unified config + the
+single-flight/SWR that make aggressive microcaching safe.)
 
 **`proxy_cache` wins on:** being built into nginx (nothing to build/install);
 an **on-disk** store that survives a reload and holds far more than RAM
