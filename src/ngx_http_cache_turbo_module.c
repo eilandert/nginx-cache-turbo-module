@@ -2882,6 +2882,18 @@ ngx_http_cache_turbo_response_cacheable(ngx_http_request_t *r)
  * headers are dropped so that when a NATIVE nginx cache (proxy_cache / fastcgi_
  * cache) sits behind us, we don't freeze and replay its per-response age/status
  * on every L1 hit (see "Mixing with nginx's native cache" in the README).
+ *
+ * Content-Encoding is dropped because we are the TOP-most output filter: our
+ * body filter captures the IDENTITY body, BEFORE gzip/zstd/brotli compress it,
+ * but the compression filter's header filter runs downstream of ours and has
+ * already stamped Content-Encoding on r->headers_out by the time we serialise
+ * the headers at store. Storing that coding against an uncompressed body would
+ * replay e.g. "Content-Encoding: gzip" with a plain body (browser "Content
+ * Encoding Error"). Dropping it lets the downstream compression filter re-add
+ * the correct coding per client on every MISS and HIT (the proxy_cache model).
+ * A genuinely origin-pre-compressed response is refused earlier by the
+ * response_encoded() guard (its Content-Encoding is set BEFORE our header
+ * filter runs), so it never reaches this serialiser.
  */
 static ngx_int_t
 ngx_http_cache_turbo_header_skip(u_char *name, size_t nlen)
@@ -2889,8 +2901,8 @@ ngx_http_cache_turbo_header_skip(u_char *name, size_t nlen)
     static const char  *skip[] = {
         "Connection", "Keep-Alive", "Proxy-Authenticate",
         "Proxy-Authorization", "TE", "Trailer", "Transfer-Encoding",
-        "Upgrade", "Content-Length", "Set-Cookie", "Date", "Server",
-        "Age", "X-Cache", "X-Cache-Status", NULL
+        "Upgrade", "Content-Length", "Content-Encoding", "Set-Cookie",
+        "Date", "Server", "Age", "X-Cache", "X-Cache-Status", NULL
     };
     ngx_uint_t  i;
     size_t      sl;
