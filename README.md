@@ -747,6 +747,32 @@ rate(cache_turbo_misses_total[5m]))`, **backend regen rate**
 `rate(cache_turbo_refreshes_total[5m])`, plus `cache_turbo_regen_cost_ms` and
 `cache_turbo_autotuned_beta` as plain gauges.
 
+### Benchmarking
+
+[`tools/bench.sh`](tools/bench.sh) measures throughput/latency and compares
+cache-turbo against the alternatives. It stands up an origin plus four edges on
+separate ports — **A** origin direct (the floor), **B** nginx `proxy_cache`,
+**C** cache_turbo L1 shm, **D** cache_turbo + L2 Redis — primes each so the run
+hits the cache (not the origin), then drives `wrk --latency` and prints an
+rps / p50 / p99 / hit-ratio table. The hit-ratio column comes from the module's
+own Prometheus counters, so a "fast" run that secretly missed shows up as
+<100 % instead of as a bogus number.
+
+```console
+$ tools/bench.sh /path/to/nginx 15 8           # 15s/run, 8 conns
+$ SIZES="tiny medium large" tools/bench.sh nginx 15 8
+$ REDIS="redis://127.0.0.1:6379/0" tools/bench.sh nginx 15 8   # adds run D
+```
+
+> Build the nginx binary as a **release** build (stock `-O`, **no** `-fsanitize`,
+> no valgrind) — sanitizers slow serving 10–50× and measure nothing real. That is
+> [`tools/soak.sh`](tools/soak.sh)'s job: it proves the module *survives* heavy
+> churn under ASAN/valgrind; bench.sh proves how *fast* it serves.
+
+Full method, a reference result set (cache-turbo **+23–37 %** over nginx's own
+`proxy_cache` on small/medium bodies), and caveats are in
+**[BENCHMARK.md](BENCHMARK.md)**.
+
 ### Variables
 
 | Variable | Meaning |

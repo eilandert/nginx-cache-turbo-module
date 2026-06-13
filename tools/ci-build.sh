@@ -49,18 +49,31 @@ fi
 CC_OPT="-DNGX_DEBUG_PALLOC=1 -g3 -O0 -fno-omit-frame-pointer -funwind-tables"
 LD_OPT=""
 ADD_MODULE="--add-dynamic-module=$MODULE_DIR"
-if [ "$MODE" = "asan" ]; then
-    SAN="-fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g3 -O1"
-    CC_OPT="$SAN"
-    LD_OPT="$SAN"
-    # ASan needs the module linked into the binary (static), not dlopen'd.
-    ADD_MODULE="--add-module=$MODULE_DIR"
-fi
+WITH_DEBUG="--with-debug"
+case "$MODE" in
+    asan)
+        SAN="-fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g3 -O1"
+        CC_OPT="$SAN"
+        LD_OPT="$SAN"
+        # ASan needs the module linked into the binary (static), not dlopen'd.
+        ADD_MODULE="--add-module=$MODULE_DIR"
+        ;;
+    nginx)
+        # Stock nginx defaults for benchmarking (tools/bench.sh): empty
+        # --with-cc-opt => nginx's own default flags (-O, i.e. -O1), no
+        # NGX_DEBUG_PALLOC poisoning, no --with-debug logging. Not the
+        # distro's hardened -O2 set — a neutral upstream baseline. Module
+        # stays a dynamic .so (the shipped artifact); bench it with
+        # MODULE=<.so> tools/bench.sh.
+        CC_OPT=""
+        WITH_DEBUG=""
+        ;;
+esac
 
 cd "$ROOT/$DIR"
 ./configure \
     --with-compat \
-    --with-debug \
+    $WITH_DEBUG \
     --with-http_realip_module \
     --with-http_ssl_module \
     --without-http_rewrite_module \
