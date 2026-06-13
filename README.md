@@ -168,35 +168,31 @@ location / {
 
 ### When to pick which
 
-`proxy_cache` is a fine, battle-tested cache. The honest split:
+`proxy_cache` is a fine, battle-tested cache. An honest side-by-side:
 
-**cache-turbo wins on:** raw speed (RAM, access-phase — see
-[BENCHMARK.md](BENCHMARK.md), +23–37 % over `proxy_cache` on small/medium
-bodies); SWR + stale-if-error on by default (vs wrestling
-`proxy_cache_use_stale`); dogpile protection that spans a fleet via the Redis
-lock (not just per-box `proxy_cache_lock`); a **distributed L2** (Redis or
-memcached) shared by the whole fleet, so one box's fill warms every node and a
-rebooted box refills from the cluster instead of stampeding the origin —
-`proxy_cache` is per-box disk, every node cold on its own; and tag purge,
-auto-Vary, CMS auto-classify + a JSON/Prometheus admin endpoint. It is also **upstream-agnostic** — the *same*
-directives microcache a `fastcgi_pass` PHP-FPM app and a `proxy_pass` API, where
-stock nginx makes you run `fastcgi_cache` and `proxy_cache` as two separate
-systems — and SWR + single-flight make a 1-second TTL genuinely safe (the
-backend sees ~one request per second per key, not a stampede).
+| | **cache-turbo** | **nginx `proxy_cache`** |
+|---|:---:|:---:|
+| **Store / phase** | shared memory, ACCESS phase | disk, content phase |
+| **Throughput** | ✅ **+23–37 %** small/medium ([bench](BENCHMARK.md)) | baseline |
+| **Stale-while-revalidate + stale-if-error** | ✅ on by default | ⚠️ manual (`proxy_cache_use_stale`) |
+| **Dogpile / single-flight** | ✅ per-box **and** cross-fleet (Redis lock) | per-box (`proxy_cache_lock`) |
+| **Shared / distributed cache** | ✅ Redis/memcached L2 across the fleet | ➖ per-box disk, every node cold alone |
+| **One config for php-fpm *and* APIs** | ✅ same directives (`fastcgi_pass` + `proxy_pass`) | ➖ separate `fastcgi_cache` / `proxy_cache` |
+| **Tag purge · auto-Vary · CMS auto-classify · Prometheus** | ✅ built in | ➖ — |
+| **Survives reload / restart** | ➖ shm cleared (Redis L2 softens) | ✅ persists on disk |
+| **Capacity** | bounded by RAM | ✅ huge on-disk corpus |
+| **Built into nginx** | ➖ dynamic module | ✅ yes, nothing to install |
+| **Maturity** | newer | ✅ a decade of edge cases |
 
-(Caching dynamic/PHP-FPM/API responses is **not** itself a differentiator —
-`fastcgi_cache`/`proxy_cache` do that too. The edge is the unified config + the
-single-flight/SWR that make aggressive microcaching safe.)
-
-**`proxy_cache` wins on:** being built into nginx (nothing to build/install);
-an **on-disk** store that survives a reload and holds far more than RAM
-(cache-turbo's L1 is shm, cleared on reload — the Redis L2 softens this);
-soaking a huge cold/long-tail corpus that shouldn't live in memory; and a
-decade more battle-testing.
-
-Short version: hot HTML + dynamic apps → cache-turbo; giant on-disk archive →
-`proxy_cache`; in doubt, **stack them** (cache-turbo L0 in RAM over a
-`proxy_cache` disk tier, as above).
+> **Pick:** hot HTML and dynamic apps → **cache-turbo**. A giant cold / long-tail
+> on-disk archive → **`proxy_cache`**. In doubt, **stack them** — cache-turbo as
+> the RAM L0 over a `proxy_cache` disk tier ([above](#mixing-with-nginxs-native-cache-proxy_cache)).
+>
+> **Not** a differentiator: *caching* dynamic / php-fpm / API responses —
+> `fastcgi_cache` / `proxy_cache` do that too. cache-turbo's edge is the unified
+> config plus the single-flight + SWR that make aggressive 1-second microcaching
+> genuinely safe (the backend sees ~one request per second per key, not a
+> stampede).
 
 ## Quick start
 
