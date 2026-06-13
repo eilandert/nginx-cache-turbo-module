@@ -55,6 +55,8 @@ static char *ngx_http_cache_turbo(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 static char *ngx_http_cache_turbo_backend(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
+static char *ngx_http_cache_turbo_cache_control(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
 static ngx_int_t ngx_http_cache_turbo_auto_skip(ngx_http_request_t *r,
     ngx_http_cache_turbo_loc_conf_t *clcf);
 static char *ngx_http_cache_turbo_key(ngx_conf_t *cf, ngx_command_t *cmd,
@@ -111,7 +113,6 @@ static size_t ngx_http_cache_turbo_variant_index_name(ngx_str_t *base,
     u_char *buf);
 static void ngx_http_cache_turbo_classify_vary(ngx_http_request_t *r,
     ngx_int_t *bits_out, ngx_uint_t *nocache_out);
-static ngx_uint_t ngx_http_cache_turbo_response_has_vary(ngx_http_request_t *r);
 static ngx_uint_t ngx_http_cache_turbo_response_encoded(ngx_http_request_t *r);
 static ngx_int_t ngx_http_cache_turbo_init(ngx_conf_t *cf);
 
@@ -220,25 +221,11 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
       offsetof(ngx_http_cache_turbo_loc_conf_t, autotune),
       NULL },
 
-    { ngx_string("cache_turbo_autotune_interval"),
+    { ngx_string("cache_turbo_cache_control"),
       NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
-      ngx_conf_set_sec_slot,
+      ngx_http_cache_turbo_cache_control,
       NGX_HTTP_LOC_CONF_OFFSET,
-      offsetof(ngx_http_cache_turbo_loc_conf_t, autotune_interval),
-      NULL },
-
-    { ngx_string("cache_turbo_honor_cache_control"),
-      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_FLAG,
-      ngx_conf_set_flag_slot,
-      NGX_HTTP_LOC_CONF_OFFSET,
-      offsetof(ngx_http_cache_turbo_loc_conf_t, honor_cc),
-      NULL },
-
-    { ngx_string("cache_turbo_ignore_cache_control"),
-      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_FLAG,
-      ngx_conf_set_flag_slot,
-      NGX_HTTP_LOC_CONF_OFFSET,
-      offsetof(ngx_http_cache_turbo_loc_conf_t, ignore_cc),
+      0,
       NULL },
 
     { ngx_string("cache_turbo_auto_vary"),
@@ -246,27 +233,6 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
       ngx_conf_set_flag_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_cache_turbo_loc_conf_t, auto_vary),
-      NULL },
-
-    { ngx_string("cache_turbo_safe_key"),
-      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_FLAG,
-      ngx_conf_set_flag_slot,
-      NGX_HTTP_LOC_CONF_OFFSET,
-      offsetof(ngx_http_cache_turbo_loc_conf_t, safe_key),
-      NULL },
-
-    { ngx_string("cache_turbo_vary_safe"),
-      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_FLAG,
-      ngx_conf_set_flag_slot,
-      NGX_HTTP_LOC_CONF_OFFSET,
-      offsetof(ngx_http_cache_turbo_loc_conf_t, vary_safe),
-      NULL },
-
-    { ngx_string("cache_turbo_x_cache"),
-      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_FLAG,
-      ngx_conf_set_flag_slot,
-      NGX_HTTP_LOC_CONF_OFFSET,
-      offsetof(ngx_http_cache_turbo_loc_conf_t, x_cache),
       NULL },
 
     { ngx_string("cache_turbo_purge"),
@@ -351,13 +317,6 @@ static ngx_command_t  ngx_http_cache_turbo_commands[] = {
       ngx_http_cache_turbo_normalize_strip,
       NGX_HTTP_LOC_CONF_OFFSET,
       0,
-      NULL },
-
-    { ngx_string("cache_turbo_normalize_strip_all"),
-      NGX_HTTP_LOC_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_FLAG,
-      ngx_conf_set_flag_slot,
-      NGX_HTTP_LOC_CONF_OFFSET,
-      offsetof(ngx_http_cache_turbo_loc_conf_t, normalize_strip_all),
       NULL },
 
     { ngx_string("cache_turbo_normalize_vary"),
@@ -1646,7 +1605,8 @@ ngx_http_cache_turbo_access_prologue(ngx_http_request_t *r,
      * fast path); the heavy recompute runs at most once per interval per worker.
      * Takes the zone mutex itself, so call it before we lock below. */
     if (clcf->autotune) {
-        ngx_http_cache_turbo_autotune_maybe(z, clcf->autotune_interval);
+        ngx_http_cache_turbo_autotune_maybe(z,
+            NGX_HTTP_CACHE_TURBO_AT_INTERVAL);
     }
 
     *ctxp = ctx;
@@ -2665,18 +2625,14 @@ ngx_http_cache_turbo_restore_response(ngx_http_request_t *r, u_char *copy,
     }
 
     /* X-Cache debug header. The caller chooses the value (HIT / STALE for a live
-     * serve, STALE-IF-ERROR for the RFC-2 serve-on-error replacement). Gated by
-     * cache_turbo_x_cache (default on); Age above is always emitted (RFC 9111). */
+     * serve, STALE-IF-ERROR for the RFC-2 serve-on-error replacement). Always
+     * emitted; the Age above is too (RFC 9111). To suppress it on the wire,
+     * clear it downstream with the standard nginx header tooling. */
     {
-        ngx_http_cache_turbo_loc_conf_t  *clcf;
-
-        clcf = ngx_http_get_module_loc_conf(r, ngx_http_cache_turbo_module);
-        if (clcf->x_cache) {
-            static u_char  xc_name[] = "X-Cache";
-            (void) ngx_http_cache_turbo_add_header(r, xc_name,
-                       sizeof("X-Cache") - 1, (u_char *) xcache,
-                       ngx_strlen(xcache));
-        }
+        static u_char  xc_name[] = "X-Cache";
+        (void) ngx_http_cache_turbo_add_header(r, xc_name,
+                   sizeof("X-Cache") - 1, (u_char *) xcache,
+                   ngx_strlen(xcache));
     }
 
     *bodyp = body;
@@ -3029,16 +2985,6 @@ ngx_http_cache_turbo_header_filter(ngx_http_request_t *r)
         ngx_uint_t  nocache = 0;
         ngx_http_cache_turbo_classify_vary(r, &ctx->vary_bits, &nocache);
         ctx->vary_nocache = nocache ? 1 : 0;
-
-    } else if (clcf->vary_safe
-               && ngx_http_cache_turbo_response_has_vary(r))
-    {
-        /* Vary safety (SEC-4): auto_vary is off, so the key does NOT account for
-         * any Vary field. Caching such a response would serve one representation
-         * for every value of the varied axis (cache poisoning / cross-tenant
-         * leak). Refuse to store it. (With auto_vary on, the classify step above
-         * already refuses the un-keyable axes, so vary_safe is a no-op there.) */
-        ctx->vary_nocache = 1;
     }
 
     /* Only capture cacheable responses. 200 always, plus any status named by a
@@ -3745,6 +3691,38 @@ ngx_http_cache_turbo_backend(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
                 "generic|wordpress|woocommerce|joomla)", &value[i]);
             return NGX_CONF_ERROR;
         }
+    }
+
+    return NGX_CONF_OK;
+}
+
+
+/* "cache_turbo_cache_control respect|honor|ignore;" — how the response
+ * Cache-Control is treated. Sets the tri-state cc_mode; honor_cc/ignore_cc are
+ * derived from it at merge (see merge_loc_conf). Replaces the former
+ * cache_turbo_honor_cache_control / cache_turbo_ignore_cache_control flags. */
+static char *
+ngx_http_cache_turbo_cache_control(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf)
+{
+    ngx_http_cache_turbo_loc_conf_t  *clcf = conf;
+    ngx_str_t                        *value = cf->args->elts;
+
+    if (clcf->cc_mode != NGX_CONF_UNSET_UINT) {
+        return "is duplicate";
+    }
+
+    if (ngx_strcmp(value[1].data, "respect") == 0) {
+        clcf->cc_mode = NGX_HTTP_CACHE_TURBO_CC_RESPECT;
+    } else if (ngx_strcmp(value[1].data, "honor") == 0) {
+        clcf->cc_mode = NGX_HTTP_CACHE_TURBO_CC_HONOR;
+    } else if (ngx_strcmp(value[1].data, "ignore") == 0) {
+        clcf->cc_mode = NGX_HTTP_CACHE_TURBO_CC_IGNORE;
+    } else {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            "invalid cache_turbo_cache_control \"%V\" "
+            "(want respect|honor|ignore)", &value[1]);
+        return NGX_CONF_ERROR;
     }
 
     return NGX_CONF_OK;
@@ -5467,43 +5445,6 @@ ngx_http_cache_turbo_vary_resolve(ngx_http_request_t *r,
 }
 
 
-/* True if the response carries at least one non-empty Vary header. Used by the
- * vary_safe gate (SEC-4) to refuse caching a varied response when auto_vary is
- * off and the key therefore ignores every Vary field. Walks the header list
- * (not the typed r->headers_out.vary field, which only exists on nginx >= 1.23)
- * so the legacy header path is covered too. */
-static ngx_uint_t
-ngx_http_cache_turbo_response_has_vary(ngx_http_request_t *r)
-{
-    ngx_list_part_t  *part = &r->headers_out.headers.part;
-    ngx_table_elt_t  *h = part->elts;
-    ngx_uint_t        i;
-
-    for (i = 0; /* void */ ; i++) {
-        if (i >= part->nelts) {
-            if (part->next == NULL) {
-                break;
-            }
-            part = part->next;
-            h = part->elts;
-            i = 0;
-        }
-        if (h[i].hash == 0) {
-            continue;
-        }
-        if (h[i].key.len == sizeof("Vary") - 1
-            && ngx_strncasecmp(h[i].key.data, (u_char *) "Vary",
-                               sizeof("Vary") - 1) == 0
-            && h[i].value.len != 0)
-        {
-            return 1;
-        }
-    }
-
-    return 0;
-}
-
-
 /* True if the response already carries a non-identity Content-Encoding.
  *
  * SEC: a coding-specific body must never be cached under our encoding-blind
@@ -5667,8 +5608,10 @@ ngx_http_cache_turbo_normalized_args_variable(ngx_http_request_t *r,
 
     vlen = ngx_http_cache_turbo_vary_suffix(r, clcf->normalize_vary, vbuf);
 
-    /* strip_all, or no args at all: output is the Vary suffix alone (no '?'). */
-    if (clcf->normalize_strip_all || r->args.len == 0) {
+    /* No args at all (or all stripped below): output is the Vary suffix alone
+     * (no '?'). To drop every arg explicitly, use `cache_turbo_normalize_strip *`
+     * — a bare '*' is a zero-length prefix that matches every name. */
+    if (r->args.len == 0) {
         return ngx_http_cache_turbo_var_set(r, v, vbuf, vlen);
     }
 
@@ -5942,17 +5885,12 @@ ngx_http_cache_turbo_create_loc_conf(ngx_conf_t *cf)
 
     conf->enable = NGX_CONF_UNSET;
     conf->preset = NGX_CONF_UNSET;
-    conf->valid_raw = NGX_CONF_UNSET;
     conf->beta_raw = NGX_CONF_UNSET;
+    conf->valid_raw = NGX_CONF_UNSET;
     conf->lock_ttl_raw = NGX_CONF_UNSET;
     conf->autotune = NGX_CONF_UNSET;
-    conf->autotune_interval = NGX_CONF_UNSET;
-    conf->honor_cc = NGX_CONF_UNSET;
-    conf->ignore_cc = NGX_CONF_UNSET;
+    conf->cc_mode = NGX_CONF_UNSET_UINT;
     conf->auto_vary = NGX_CONF_UNSET;
-    conf->safe_key = NGX_CONF_UNSET;
-    conf->vary_safe = NGX_CONF_UNSET;
-    conf->x_cache = NGX_CONF_UNSET;
     conf->purge = NGX_CONF_UNSET;
     conf->background_update = NGX_CONF_UNSET;
     conf->lock = NGX_CONF_UNSET;
@@ -5968,7 +5906,6 @@ ngx_http_cache_turbo_create_loc_conf(ngx_conf_t *cf)
     conf->redis_db = NGX_CONF_UNSET;
     conf->redis_tls = NGX_CONF_UNSET;
     conf->redis_tls_verify = NGX_CONF_UNSET;
-    conf->normalize_strip_all = NGX_CONF_UNSET;
     conf->normalize_strip = NGX_CONF_UNSET_PTR;
     conf->normalize_vary = NGX_CONF_UNSET;
     conf->bypass = NGX_CONF_UNSET_PTR;
@@ -6051,20 +5988,20 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_ptr_value(conf->bypass, prev->bypass, NULL);
     ngx_conf_merge_ptr_value(conf->no_store, prev->no_store, NULL);
 
-    /* Honor upstream Cache-Control/Expires (v7): off by default. */
-    /* Auto-classify auto-enables honor_cc (unless explicitly set), so a
-     * backend plugin's own Cache-Control: no-cache on an anon page
+    /* Response Cache-Control mode (cache_turbo_cache_control). Default respect.
+     * Auto-classify defaults it to "honor" (unless explicitly set in this block)
+     * so a backend plugin's own Cache-Control: no-cache on an anon page
      * self-excludes at store time. Done before the merge so an explicit
-     * `cache_turbo_honor_cache_control off;` still wins. */
-    if (conf->backend_presets != 0 && conf->honor_cc == NGX_CONF_UNSET) {
-        conf->honor_cc = 1;
+     * `cache_turbo_cache_control respect;` still wins. honor_cc/ignore_cc are
+     * derived from the resolved mode and are what the request path reads. */
+    if (conf->backend_presets != 0 && conf->cc_mode == NGX_CONF_UNSET_UINT) {
+        conf->cc_mode = NGX_HTTP_CACHE_TURBO_CC_HONOR;
     }
-    ngx_conf_merge_value(conf->honor_cc, prev->honor_cc, 0);
-    ngx_conf_merge_value(conf->ignore_cc, prev->ignore_cc, 0);
+    ngx_conf_merge_uint_value(conf->cc_mode, prev->cc_mode,
+                              NGX_HTTP_CACHE_TURBO_CC_RESPECT);
+    conf->honor_cc  = (conf->cc_mode == NGX_HTTP_CACHE_TURBO_CC_HONOR);
+    conf->ignore_cc = (conf->cc_mode == NGX_HTTP_CACHE_TURBO_CC_IGNORE);
     ngx_conf_merge_value(conf->auto_vary, prev->auto_vary, 0);
-    ngx_conf_merge_value(conf->safe_key, prev->safe_key, 0);
-    ngx_conf_merge_value(conf->vary_safe, prev->vary_safe, 0);
-    ngx_conf_merge_value(conf->x_cache, prev->x_cache, 1);
 
     /* PURGE method (v14): off by default. */
     ngx_conf_merge_value(conf->purge, prev->purge, 0);
@@ -6089,9 +6026,6 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 
     /* Live autotune (v4-3): off by default; default recompute cadence when on. */
     ngx_conf_merge_value(conf->autotune, prev->autotune, 0);
-    ngx_conf_merge_sec_value(conf->autotune_interval, prev->autotune_interval,
-                             NGX_HTTP_CACHE_TURBO_AT_INTERVAL);
-
     if (conf->shm_zone == NULL) {
         conf->shm_zone = prev->shm_zone;
     }
@@ -6099,17 +6033,15 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
         conf->key = prev->key;
     }
 
-    /* Default cache key (no explicit cache_turbo_key) for an enabled location.
-     * Normalized default: $host$uri$cache_turbo_normalized_args — tracking params
-     * stripped + args sorted out of the box. With cache_turbo_safe_key on (COR-1)
-     * the default instead becomes $scheme$host$request_uri — the full raw query,
-     * no stripping/sorting — so distinct private URLs (e.g. two sessionid values)
-     * can never alias onto one entry. Compiled lazily here; the normalized_args
-     * variable was registered in preconfiguration. */
+    /* Default cache key (no explicit cache_turbo_key) for an enabled location:
+     * $host$uri$cache_turbo_normalized_args — tracking params stripped + args
+     * sorted out of the box. Compiled lazily here; the normalized_args variable
+     * was registered in preconfiguration. For a raw, no-strip/sort key (e.g. an
+     * origin that does not reliably mark per-user responses private), set it
+     * explicitly: cache_turbo_key $scheme$host$request_uri; */
     if (conf->key == NULL && conf->enable) {
-        ngx_str_t                         defkey = conf->safe_key
-            ? (ngx_str_t) ngx_string("$scheme$host$request_uri")
-            : (ngx_str_t) ngx_string("$host$uri$cache_turbo_normalized_args");
+        ngx_str_t                         defkey =
+            ngx_string("$host$uri$cache_turbo_normalized_args");
         ngx_http_compile_complex_value_t  ccv;
 
         conf->key = ngx_palloc(cf->pool, sizeof(ngx_http_complex_value_t));
@@ -6231,9 +6163,7 @@ ngx_http_cache_turbo_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
             conf->backend == NULL ? "no L2 backend" : "the memcached backend");
     }
 
-    /* Key normalize: inherit strip_all + the extra-pattern list. */
-    ngx_conf_merge_value(conf->normalize_strip_all, prev->normalize_strip_all,
-                         0);
+    /* Key normalize: inherit the extra-pattern list. */
     if (conf->normalize_strip == NGX_CONF_UNSET_PTR) {
         conf->normalize_strip = prev->normalize_strip;
     }

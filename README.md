@@ -362,11 +362,11 @@ the cache automatically — no hand-written `cache_turbo_bypass`/`no_store` rule
 
 ### Interactions and safety
 
-- **Implies `cache_turbo_honor_cache_control on`** (unless you set it
-  explicitly). So if your CMS plugin already emits `Cache-Control: no-cache` on a
-  page it knows is dynamic, that page self-excludes at store time too — belt and
-  braces. Pin a fixed TTL instead with an explicit
-  `cache_turbo_honor_cache_control off;` (e.g. for microcaching — see below).
+- **Implies `cache_turbo_cache_control honor`** (unless you set it explicitly).
+  So if your CMS plugin already emits `Cache-Control: no-cache` on a page it
+  knows is dynamic, that page self-excludes at store time too — belt and braces.
+  Pin a fixed TTL instead with an explicit `cache_turbo_cache_control respect;`
+  (e.g. for microcaching — see below).
 - **It is a floor, not the only one.** Auto-skip sits *under* the manual
   `cache_turbo_bypass` / `cache_turbo_no_store` overrides, and the universal
   safety rules still apply on top of it regardless of preset: a response with
@@ -375,8 +375,9 @@ the cache automatically — no hand-written `cache_turbo_bypass`/`no_store` rule
   admin URL with no cookie yet, a search query), it doesn't replace them.
 - **Not a security boundary for your own private routes.** The presets cover the
   well-known CMS surfaces above; a custom `/members/`-style area still needs its
-  own `cache_turbo_bypass $cookie_yoursession;` (or `cache_turbo_safe_key on` for
-  origins that don't reliably mark per-user responses `private`).
+  own `cache_turbo_bypass $cookie_yoursession;` (or a raw default key,
+  `cache_turbo_key $scheme$host$request_uri;`, for origins that don't reliably
+  mark per-user responses `private`).
 
 ## The cache key
 
@@ -397,8 +398,9 @@ cache_turbo_key $scheme$host$uri$is_args$args;
 share one slot: it sorts args (`?b=2&a=1` == `?a=1&b=2`) and drops tracking
 params (built-in denylist: `utm_*`, `fbclid`, `gclid`, `msclkid`, `mc_eid`,
 `_ga`, `ref`, `sid`, `sessionid`, `tmp_*`). Add more with
-`cache_turbo_normalize_strip`, or nuke them all
-with `cache_turbo_normalize_strip_all on`.
+`cache_turbo_normalize_strip`, or nuke them all with
+`cache_turbo_normalize_strip *` (a bare `*` is a zero-length prefix that matches
+every arg name).
 
 ```nginx
 cache_turbo_key             $host$uri$cache_turbo_normalized_args;
@@ -475,11 +477,11 @@ location ~ \.php$ {
     cache_turbo_lock          on;
 
     # WP/Woo: auto-skip wp-admin, login + logged-in cookies. (Implies
-    # honor_cache_control on — see the gotcha below.)
+    # cache_turbo_cache_control honor — see the gotcha below.)
     cache_turbo_backend       wordpress;
 
     # force the fixed 1s TTL instead of letting the app's Cache-Control win
-    cache_turbo_honor_cache_control off;
+    cache_turbo_cache_control respect;
 
     # belt-and-braces: never store a session response
     cache_turbo_no_store      $cookie_PHPSESSID;
@@ -498,12 +500,12 @@ location ~ \.php$ {
   usually *not* what you want for "near-real-time". To microcache at a different
   TTL, keep `cache_turbo_preset micro` and add an explicit `cache_turbo_valid 2s;`
   (the explicit knob wins; the ×2 stale window scales with it).
-- **`honor_cache_control` vs a fixed TTL.** A CMS preset (`cache_turbo_backend`)
-  or `cache_turbo … auto` turns `honor_cache_control` **on**, so an app that
-  emits `Cache-Control: max-age=600` would override your `1s`. Set
-  `cache_turbo_honor_cache_control off;` to pin the microcache TTL regardless of
+- **`cache_control` mode vs a fixed TTL.** A CMS preset (`cache_turbo_backend`)
+  or `cache_turbo … auto` defaults `cache_turbo_cache_control` to **honor**, so
+  an app that emits `Cache-Control: max-age=600` would override your `1s`. Set
+  `cache_turbo_cache_control respect;` to pin the microcache TTL regardless of
   app headers (example B). For an API that you *want* to honour its own
-  `Cache-Control`, leave it on and drop the static `valid`.
+  `Cache-Control`, leave it on `honor` and drop the static `valid`.
 - **Per-user safety.** Anything with an `Authorization` request header, or a
   response with `Set-Cookie` / `Cache-Control: private`, is never cached or
   served from cache. For cookie-session apps add an explicit
@@ -517,11 +519,11 @@ location ~ \.php$ {
 
 ## What autotune actually tunes
 
-`cache_turbo_autotune on` makes the cache **load-adaptive**: every
-`cache_turbo_autotune_interval` (default 30s) it measures the window's average
-backend regeneration cost and hit-rate, and when the origin is genuinely under
-load it dials three things — then relaxes them the first quiet window. Off by
-default; the freshness contract you configured is never relaxed.
+`cache_turbo_autotune on` makes the cache **load-adaptive**: every 30s it
+measures the window's average backend regeneration cost and hit-rate, and when
+the origin is genuinely under load it dials three things — then relaxes them the
+first quiet window. Off by default; the freshness contract you configured is
+never relaxed.
 
 | What it tunes | Under load | Bounded by | Touches freshness? |
 |---|---|---|---|
@@ -651,13 +653,11 @@ http {
             # ── turn it on ──────────────────────────────────────────────
             cache_turbo                   ct;        # bind zone "ct" (or: off)
           # cache_turbo                   ct auto;   # = also cache_turbo_backend generic
-            cache_turbo_backend           generic;   # generic|wordpress|woocommerce|joomla (stackable); implies honor_cache_control on
+            cache_turbo_backend           generic;   # generic|wordpress|woocommerce|joomla (stackable); implies cache_control honor
 
             # ── what is "the same page" ─────────────────────────────────
             cache_turbo_key               $host$uri$cache_turbo_normalized_args;  # the default
-            cache_turbo_safe_key          off;       # on = raw $scheme$host$request_uri default key (no strip/sort); no effect once key is set
-            cache_turbo_normalize_strip   sid sessionid "tmp_*";   # extra args to drop (trailing * = prefix)
-            cache_turbo_normalize_strip_all off;     # on = drop ALL args (overrides the strip list)
+            cache_turbo_normalize_strip   sid sessionid "tmp_*";   # extra args to drop (trailing * = prefix; bare * = all)
             cache_turbo_normalize_vary    encoding device;        # add variant buckets to the key
 
             # ── freshness / staleness ───────────────────────────────────
@@ -667,8 +667,7 @@ http {
             cache_turbo_valid             404 410 1m;       #            negative caching
             cache_turbo_beta              1000;      # refresh eagerness ×1000
             cache_turbo_lock_ttl          5s;        # single-flight refresh window
-            cache_turbo_honor_cache_control off;     # on = take TTL from response Cache-Control/Expires
-            cache_turbo_ignore_cache_control off;    # on = ignore response Cache-Control entirely incl. must-revalidate/swr/sie (= proxy_ignore_headers Cache-Control)
+            cache_turbo_cache_control     respect;   # respect | honor (take TTL from response CC/Expires) | ignore (discard response CC)
             cache_turbo_background_update on;        # SWR + stale-if-error (off = inline regen)
             cache_turbo_max_size          1m;        # don't cache bodies bigger than this
 
@@ -683,13 +682,10 @@ http {
 
             # ── Vary handling ───────────────────────────────────────────
             cache_turbo_auto_vary         off;       # on = read response Vary, split automatically
-            cache_turbo_vary_safe         off;       # on = refuse to cache an un-keyed Vary response
-            cache_turbo_x_cache           on;        # off = suppress the X-Cache response header
 
             # ── L2 grouping / tuning ────────────────────────────────────
             cache_turbo_tag               $upstream_http_x_cache_tags;  # needs cache_turbo_redis
-            cache_turbo_autotune          off;       # on = derive beta from measured backend latency
-            cache_turbo_autotune_interval 30s;       # how often autotune recomputes
+            cache_turbo_autotune          off;       # on = derive beta from measured backend latency (fixed 30s cadence)
 
             # ── stacking with native proxy_cache ────────────────────────
             cache_turbo_suppress_native   off;       # on = drive $cache_turbo_active for proxy_no_cache
@@ -714,12 +710,9 @@ http {
 |---|---|---|
 | `cache_turbo_redis` ↔ `cache_turbo_memcached` | **hard error** | One L2 per block. Declaring both in the same block fails the config at start ("the two are mutually exclusive"). |
 | `cache_turbo_tag` → `cache_turbo_redis` | **requires** | Tags need Redis sorted-sets. With memcached or no L2 the tag is rejected at config time (memcached has no tag/`?all`/cross-node lock). |
-| `cache_turbo_normalize_strip_all` ↔ `cache_turbo_normalize_strip` | **overrides** | `strip_all on` drops every arg, so the explicit strip list becomes a no-op. Use one or the other. |
-| `cache_turbo_safe_key` ↔ `cache_turbo_key` | **inert when set** | `safe_key` only chooses the *default* key. An explicit `cache_turbo_key` wins and `safe_key` has no effect. |
 | `cache_turbo_auto_vary` ↔ `cache_turbo_normalize_vary` | **don't double-cover an axis** | Not an error, but keying the same axis (e.g. `encoding`) via both multiplies the slot count for no benefit. Pick one per axis. |
-| `cache_turbo_vary_safe` ↔ `cache_turbo_auto_vary` | **mostly redundant together** | With `auto_vary on` the un-keyable axes are already refused; `vary_safe` only tightens the `auto_vary off` case. |
 | `cache_turbo_preset` ↔ `cache_turbo_valid`/`_beta`/`_lock_ttl` | **explicit wins** | The preset sets a band of defaults; any explicit knob overrides just that knob (the rest stay at the preset). Not exclusive. |
-| `cache_turbo_backend` / `cache_turbo … auto` → `cache_turbo_honor_cache_control` | **implies** | Enabling any CMS auto-classify preset flips `honor_cache_control` on unless you set it explicitly. |
+| `cache_turbo_backend` / `cache_turbo … auto` → `cache_turbo_cache_control` | **implies** | Enabling any CMS auto-classify preset defaults `cache_turbo_cache_control` to `honor` unless you set it explicitly. |
 | `cache_turbo_background_update off` → stale-if-error / SWR | **disables** | Inline regeneration replaces serve-stale-while-revalidate; a stale entry is no longer served during refresh, and stale-if-error no longer applies. |
 
 ## Directive synopsis
@@ -728,7 +721,7 @@ http {
 |---|---|---|---|
 | `cache_turbo_zone name=NAME SIZE` | `http` | — | Declare a shared-memory cache zone (min 8 pages). |
 | `cache_turbo NAME [auto]` / `off` | `server`, `location` | `off` | Turn caching on (bind a zone) or off. The optional `auto` is shorthand for `cache_turbo_backend generic` (auto-classify dynamic CMS surfaces — see below). |
-| `cache_turbo_backend NAME...` | `server`, `location` | — | Auto-classify dynamic (uncacheable) request surfaces for one or more CMS presets: `generic` (a.k.a. `auto`, the union), `wordpress`, `woocommerce`, `joomla`. A matching request (login/session cookie, admin URI, dynamic arg) skips the cache and goes straight to origin. Implies `cache_turbo_honor_cache_control on`. |
+| `cache_turbo_backend NAME...` | `server`, `location` | — | Auto-classify dynamic (uncacheable) request surfaces for one or more CMS presets: `generic` (a.k.a. `auto`, the union), `wordpress`, `woocommerce`, `joomla`. A matching request (login/session cookie, admin URI, dynamic arg) skips the cache and goes straight to origin. Implies `cache_turbo_cache_control honor`. |
 | `cache_turbo_suppress_native on` | `server`, `location` | `off` | Make `$cache_turbo_active` read `1` while cache-turbo owns a request, so a stacked native `proxy_cache` can defer via `proxy_no_cache $cache_turbo_active; proxy_cache_bypass $cache_turbo_active;`. Off (default) keeps the variable always `0` (the wiring stays inert). |
 | `cache_turbo_key STRING` | `server`, `location` | normalized | What makes two requests "the same page". The default is `$host$uri$cache_turbo_normalized_args` — Host + **normalized args** (tracking params stripped, args sorted). |
 | `cache_turbo_preset NAME` | `server`, `location` | `balanced` | `micro` / `conservative` / `balanced` / `aggressive` — sets the four knobs below at once. `micro` = 1s microcaching (valid 1s, lock_ttl 1s, ×2 stale). |
@@ -742,22 +735,16 @@ http {
 | `cache_turbo_bypass VAR...` | `server`, `location` | — | If any variable is non-empty and not `0`, skip the cache lookup (go to origin) — but still store the fresh response. E.g. `cache_turbo_bypass $cookie_session $arg_nocache;` to always revalidate logged-in users. |
 | `cache_turbo_no_store VAR...` | `server`, `location` | — | If any variable is non-empty and not `0`, do **not** store the response. E.g. `cache_turbo_no_store $cookie_session;`. |
 | `cache_turbo_purge on` | `server`, `location` | `off` | Allow a `PURGE <uri>` request to drop that URI's entry from L1 (+L2). Gate the location with `allow`/`deny`. E.g. `curl -X PURGE http://host/blog/post-42`. |
-| `cache_turbo_honor_cache_control on` | `server`, `location` | `off` | Take the fresh TTL from the response's own `Cache-Control: s-maxage`/`max-age` (s-maxage wins), or its `Expires`, instead of the static TTL. Falls back to `cache_turbo_valid` when the response carries no freshness info. |
-| `cache_turbo_ignore_cache_control on` | `server`, `location` | `off` | Ignore the response `Cache-Control` **entirely** — the mirror of nginx's `proxy_ignore_headers Cache-Control`. The whole header is inert: `no-store`/`no-cache`/`private`/`max-age=0`/`s-maxage=0` no longer forbid storage; the TTL comes from `cache_turbo_valid` (overrides `honor_cache_control`); and `must-revalidate`/`proxy-revalidate`, `stale-while-revalidate=N`, `stale-if-error=N` no longer reshape the stale window (it stays `cache_turbo_valid` × `cache_turbo_stale_mult`). Use for an origin (e.g. a CMS) that emits a blanket `max-age=0, must-revalidate` on pages that are in fact shareable, instead of stripping the header at the edge with `fastcgi_hide_header`/`proxy_hide_header`. The `Set-Cookie` and request-`Authorization` safety floors are **not** affected — a per-user response is still never cached. |
+| `cache_turbo_cache_control respect\|honor\|ignore` | `server`, `location` | `respect` | How the response `Cache-Control` is treated. **respect** (default): it gates storage and reshapes the stale window as written; the fresh TTL comes from `cache_turbo_valid`. **honor**: also take the fresh TTL from the response's own `s-maxage`/`max-age` (s-maxage wins) or `Expires`, falling back to `cache_turbo_valid` when absent. **ignore**: discard the response `Cache-Control` **entirely** (mirror of nginx's `proxy_ignore_headers Cache-Control`) — `no-store`/`no-cache`/`private`/`max-age=0`/`s-maxage=0` no longer forbid storage, `must-revalidate`/`proxy-revalidate`/`stale-while-revalidate=N`/`stale-if-error=N` no longer reshape the window (it stays `cache_turbo_valid` × `cache_turbo_stale_mult`), and the TTL comes from `cache_turbo_valid`; use it for an origin that blankets shareable pages with `max-age=0, must-revalidate`. The `Set-Cookie` and request-`Authorization` safety floors are **not** affected by any mode — a per-user response is still never cached. A CMS preset (`cache_turbo_backend`) defaults this to `honor`. |
 | `cache_turbo_background_update on` / `off` | `server`, `location` | `on` | The stale-while-revalidate behaviour. **On** (default): a stale page is served *immediately* while one request quietly refreshes it in the background — **nobody waits on the backend**, and if that refresh hits a 5xx/timeout the old copy is left untouched and keeps being served (**stale-if-error**). **Off**: the chosen refresher regenerates inline (it waits for the backend and serves the fresh body), the pre-SWR behaviour. |
-| `cache_turbo_autotune on` | `server`, `location` | `off` | Adapt to live backend load. Auto-picks `beta` from the measured regen latency (clamped to the preset's band) **and**, under sustained load, widens two knobs by a load factor (≤4×): the **serveable stale window** (serve stale longer before a hard miss) and the **single-flight `lock_ttl`** (collapse more requests onto one regen). The **fresh** TTL is never touched — the freshness contract you set is unchanged; only the best-effort stale grace and dogpile window stretch, and they snap back the first quiet window. See [What autotune does](#what-autotune-actually-tunes). |
-| `cache_turbo_autotune_interval TIME` | `server`, `location` | `30s` | How often autotune recomputes (the window over which load is measured). |
+| `cache_turbo_autotune on` | `server`, `location` | `off` | Adapt to live backend load. Auto-picks `beta` from the measured regen latency (clamped to the preset's band) **and**, under sustained load, widens two knobs by a load factor (≤4×): the **serveable stale window** (serve stale longer before a hard miss) and the **single-flight `lock_ttl`** (collapse more requests onto one regen). The **fresh** TTL is never touched — the freshness contract you set is unchanged; only the best-effort stale grace and dogpile window stretch, and they snap back the first quiet window. Recomputes on a fixed 30s cadence. See [What autotune does](#what-autotune-actually-tunes). |
 | `cache_turbo_redis DSN [opts...]` | `http`, `server`, `location` | — | Add a shared **L2 Redis** tier. `DSN` is `redis://[user:pass@]host:port/db` (or bare `host:port`); `rediss://` = TLS. Write-through on store; one sync `GET` on an L1 miss (never on an L1 hit). Opts: `prefix=` (`ct:`, must be non-empty), `timeout=` (`250ms`), `password=`, `user=`, `db=`, `tls=on\|off`, `tls_verify=on\|off` (default on), `tls_ca=<file>`, `tls_name=<host>`, `keepalive=N` (idle conns to pool per worker, `0`=off), `keepalive_timeout=` (`60s`). Pooled conns are reused only within the same db/credentials/TLS context. Native client, no hiredis. |
 | `cache_turbo_memcached HOST:PORT [opts...]` | `http`, `server`, `location` | — | Add a shared **L2 memcached** tier (alternative to `cache_turbo_redis`, mutually exclusive with it). Write-through on store; one sync `get` on an L1 miss. Opts: `prefix=` (`ct:`), `timeout=` (`250ms`). No tags / `?all` / cross-node lock (memcached lacks sorted sets, `SCAN`, atomic `SET-NX`); 1 MiB value cap. Native client, no libmemcached. |
 | `cache_turbo_tag EXPR` | `server`, `location` | — | Tag stored pages (whitespace/comma list) so they can be purged as a group. Needs `cache_turbo_redis`. |
 | `cache_turbo_admin NAME` | `location` | — | Make this location a control endpoint for zone `NAME` (stats/purge/warm). Gate with `allow`/`deny`. |
-| `cache_turbo_normalize_strip NAME...` | `server`, `location` | — | Extra query args to drop from `$cache_turbo_normalized_args` (trailing `*` = prefix), on top of the built-ins. |
-| `cache_turbo_normalize_strip_all on` | `server`, `location` | `off` | Drop **every** query arg from `$cache_turbo_normalized_args`. |
+| `cache_turbo_normalize_strip NAME...` | `server`, `location` | — | Extra query args to drop from `$cache_turbo_normalized_args` (trailing `*` = prefix; a bare `*` matches every name = drop all), on top of the built-ins. |
 | `cache_turbo_normalize_vary TOKEN...` | `server`, `location` | off | Append a variant bucket to `$cache_turbo_normalized_args`: `encoding` (br/gzip/identity) and/or `device` (mobile/desktop). |
 | `cache_turbo_auto_vary on` | `server`, `location` | `off` | Read the response's own `Vary` header and split the cache by the named request header automatically. Safe whitelist: `Accept-Encoding`, `User-Agent` (device class), `Accept-Language`, `Origin`. `Vary: *`/`Cookie`/`Authorization` — **or any other header not on the whitelist** — ⇒ uncacheable (so an un-split Vary axis can never serve the wrong representation). Two-level, node-local keying. See [Auto-Vary](#auto-vary-read-the-response-vary). |
-| `cache_turbo_safe_key on` | `server`, `location` | `off` | **Security hardening.** When no explicit `cache_turbo_key` is set, use `$scheme$host$request_uri` as the default key — the full raw query, with **no** tracking-param stripping and **no** arg sorting. The normalized default (`off`) strips `sid`/`sessionid`/`ref`/… and sorts args, which can merge two distinct private URLs (e.g. two `sessionid` values) onto one entry and serve one user's response to another if the origin forgets `private`/`Set-Cookie`. Turn **on** for any origin that does not reliably mark per-user responses private. No effect when `cache_turbo_key` is set. |
-| `cache_turbo_vary_safe on` | `server`, `location` | `off` | **Security hardening.** Refuse to cache a response carrying a `Vary` header that the key does not account for. With `cache_turbo_auto_vary off` (the default) that means **any** `Vary` response is left uncacheable instead of being stored under a key that ignores the varied axis (a cache-poisoning / cross-client surface). With `auto_vary on` the un-keyable axes are already refused, so this only tightens the auto-Vary-off case. Turn **on** whenever upstreams emit `Vary` and you are not using `auto_vary`. |
-| `cache_turbo_x_cache on` / `off` | `server`, `location` | `on` | Emit the `X-Cache: HIT/STALE` debug header on a served response. Turn **off** to suppress only that header (don't advertise cache state to clients, or treat it as debug-only). The RFC-meaningful `Age` header is always emitted, and the upstream/native cache's own `X-Cache*` headers are stripped before storing regardless. |
 
 ### Variables
 

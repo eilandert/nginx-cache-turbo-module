@@ -95,6 +95,11 @@
      | NGX_HTTP_CACHE_TURBO_BACKEND_WOOCOMMERCE                                \
      | NGX_HTTP_CACHE_TURBO_BACKEND_JOOMLA)
 
+/* cache_turbo_cache_control modes (loc_conf.cc_mode). */
+#define NGX_HTTP_CACHE_TURBO_CC_RESPECT  0
+#define NGX_HTTP_CACHE_TURBO_CC_HONOR    1
+#define NGX_HTTP_CACHE_TURBO_CC_IGNORE   2
+
 
 /*
  * Live autotune within preset bands (#10, v4-3). Ported from the wp-redis PHP
@@ -135,8 +140,7 @@
 #define NGX_HTTP_CACHE_TURBO_AT_LOAD_MAX       4000   /* 4.0 ×1000 (widening cap) */
 #define NGX_HTTP_CACHE_TURBO_AT_LOAD_PER_MS    100    /* load = cost_ms × 100     */
 
-/* Default recompute cadence (seconds) when cache_turbo_autotune is on but no
- * cache_turbo_autotune_interval is given. */
+/* Fixed autotune recompute cadence (seconds) when cache_turbo_autotune is on. */
 #define NGX_HTTP_CACHE_TURBO_AT_INTERVAL       30
 
 
@@ -392,29 +396,31 @@ typedef struct {
 
     /* Live autotune (v4-3). When on, the request path uses the zone's live
      * autotuned beta (clamped to this location's preset band) in place of the
-     * static effective beta above; autotune_interval throttles the per-zone
-     * recompute. Off by default — beta then resolves purely from preset/explicit
-     * as before. The clamp band is ngx_http_cache_turbo_bands[preset]. */
+     * static effective beta above; the per-zone recompute is throttled to a
+     * fixed NGX_HTTP_CACHE_TURBO_AT_INTERVAL (30s) cadence. Off by default —
+     * beta then resolves purely from preset as before. The clamp band is
+     * ngx_http_cache_turbo_bands[preset]. */
     ngx_flag_t               autotune;       /* cache_turbo_autotune on|off    */
-    time_t                   autotune_interval; /* recompute cadence (seconds) */
 
-    /* Honor upstream freshness (v7). When on, the fresh TTL for a stored response
-     * is taken from its own Cache-Control s-maxage / max-age (s-maxage wins), or
-     * else its Expires header, instead of the static per-status TTL. Falls back to
-     * the configured TTL when the response carries no freshness info. Off by
-     * default so existing fixed-TTL configs are unchanged. */
-    ngx_flag_t               honor_cc;
-
-    /* Ignore the response Cache-Control for cacheability AND TTL (mirrors nginx
-     * `proxy_ignore_headers Cache-Control`). Off by default. When on, the
-     * no-store / no-cache / private / max-age=0 / s-maxage=0 directives no longer
-     * forbid storage, and the TTL comes from cache_turbo_valid (honor_cc is
-     * overridden). The Set-Cookie and request-Authorization safety floors are
-     * NOT affected (a per-user response is still never cached). Use for an origin
-     * that emits a blanket `max-age=0` / `no-cache` on pages that are in fact
-     * shareable (a common CMS default) instead of stripping the header at the
-     * edge with fastcgi_hide_header. */
-    ngx_flag_t               ignore_cc;
+    /* Response Cache-Control handling, set by `cache_turbo_cache_control
+     * respect|honor|ignore`. cc_mode is the raw tri-state (UNSET until set, so
+     * a CMS preset can default it to "honor"); honor_cc/ignore_cc are derived
+     * from it at merge and are what the request path reads — the runtime logic
+     * is unchanged from when these were two separate directives.
+     *
+     *   respect (default): the response Cache-Control gates storage + reshapes
+     *     the stale window as written; the fresh TTL comes from cache_turbo_valid.
+     *   honor: also take the fresh TTL from the response's own s-maxage / max-age
+     *     (s-maxage wins) or Expires; fall back to cache_turbo_valid when absent.
+     *   ignore: discard the response Cache-Control entirely (mirrors nginx
+     *     `proxy_ignore_headers Cache-Control`) — no-store / no-cache / private /
+     *     max-age=0 / s-maxage=0 no longer forbid storage, must-revalidate / swr /
+     *     sie no longer reshape the window, and the TTL is cache_turbo_valid.
+     *     The Set-Cookie and request-Authorization safety floors are NOT affected
+     *     (a per-user response is still never cached). */
+    ngx_uint_t               cc_mode;     /* CT_CC_* ; UNSET until configured */
+    ngx_flag_t               honor_cc;    /* derived: cc_mode == CT_CC_HONOR  */
+    ngx_flag_t               ignore_cc;   /* derived: cc_mode == CT_CC_IGNORE */
     size_t                   max_size;    /* max single response to cache   */
 
     /* Suppress native cache when stacked (Q1). When on, the $cache_turbo_active
@@ -520,7 +526,6 @@ typedef struct {
      * differ only in arg order or carry junk (utm_*, fbclid, ...) hash to one
      * cache slot. Orthogonal to keying: the user composes the key from the
      * variable, e.g. cache_turbo_key $uri$cache_turbo_normalized_args. */
-    ngx_flag_t               normalize_strip_all; /* drop EVERY arg            */
     ngx_array_t             *normalize_strip;     /* extra ngx_str_t patterns to
                                                    * deny, added to the built-in
                                                    * defaults; trailing '*' is a
@@ -546,32 +551,6 @@ typedef struct {
      * Authorization make the response uncacheable. Off by default. */
     ngx_flag_t               auto_vary;
 
-    /* Safe default key (COR-1). Off by default = the back-compatible normalized
-     * default key ($host$uri$cache_turbo_normalized_args): tracking params are
-     * stripped and args are sorted, which can merge distinct private URLs (e.g.
-     * two sessionid values) onto one entry. When on, the default key (only when
-     * no explicit cache_turbo_key is set) becomes $scheme$host$request_uri — the
-     * full raw query, no stripping, no sorting — so distinct queries never alias.
-     * Recommended for any origin that does not reliably mark per-user responses
-     * private/Set-Cookie. No effect when cache_turbo_key is set explicitly. */
-    ngx_flag_t               safe_key;
-
-    /* Vary safety (SEC-4). Off by default = a response carrying a `Vary` header
-     * the module is not keying on is still cached under the base key (the classic
-     * proxy-cache behaviour), which lets an attacker prime one representation for
-     * every client. When on, a response whose Vary is NOT fully represented in
-     * the key is refused (not stored): with auto_vary off that means ANY Vary;
-     * with auto_vary on the un-keyable axes are already refused, so this only
-     * tightens the auto_vary-off case. Recommended whenever upstreams emit Vary. */
-    ngx_flag_t               vary_safe;
-
-    /* Emit the `X-Cache: HIT|STALE|STALE-IF-ERROR` debug header on a served
-     * response. On by default (observability). Off suppresses ONLY this header
-     * (the RFC-meaningful Age header is always emitted) for operators who don't
-     * want to advertise cache state to clients, or who treat X-Cache as
-     * debug-only. The upstream/native cache's own X-Cache* headers are stripped
-     * before storing regardless of this flag. */
-    ngx_flag_t               x_cache;
 
     /* Backend vtables (v4-1). l1 = the local store (shm); it is a stateless
      * dispatch table (the zone is passed as an argument), so it is set

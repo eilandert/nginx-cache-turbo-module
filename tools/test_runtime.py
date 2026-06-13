@@ -691,25 +691,15 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
-        # ignore_cc: with cache_turbo_ignore_cache_control on, the response
+        # ignore_cc: with cache_turbo_cache_control ignore, the response
         # Cache-Control floor (here max-age=0 via the ccmaxage0 path marker) is
         # ignored and the entry is stored at cache_turbo_valid. Mirrors nginx
         # proxy_ignore_headers Cache-Control. key=$uri to share a slot.
         location /ccign/ {{
-            cache_turbo                       main;
-            cache_turbo_key                   $uri;
-            cache_turbo_valid                 30s;
-            cache_turbo_ignore_cache_control  on;
-            proxy_pass http://127.0.0.1:{origin_port}/;
-        }}
-
-        # x_cache off: a normally-cacheable location that must still serve from
-        # cache (Age present) but WITHOUT the X-Cache header.
-        location /xcoff/ {{
-            cache_turbo          main;
-            cache_turbo_key      $uri;
-            cache_turbo_valid    30s;
-            cache_turbo_x_cache  off;
+            cache_turbo               main;
+            cache_turbo_key           $uri;
+            cache_turbo_valid         30s;
+            cache_turbo_cache_control ignore;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
@@ -772,7 +762,7 @@ http {{
             cache_turbo_key                $uri;
             cache_turbo_valid              60s;
             cache_turbo_beta               1;
-            cache_turbo_honor_cache_control on;
+            cache_turbo_cache_control       honor;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
@@ -785,24 +775,24 @@ http {{
             cache_turbo_key                $uri;
             cache_turbo_valid              60s;
             cache_turbo_beta               1;
-            cache_turbo_honor_cache_control on;
+            cache_turbo_cache_control       honor;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
-        # ignore_cc vs must-revalidate: cache_turbo_ignore_cache_control on must
+        # ignore_cc vs must-revalidate: cache_turbo_cache_control ignore must
         # make the ENTIRE response Cache-Control inert, not just the cacheability
-        # floor. The origin emits "max-age=1, must-revalidate"; without ignore_cc
+        # floor. The origin emits "max-age=1, must-revalidate"; without ignore
         # the must-revalidate token collapses the stale window (like /mrev/), but
-        # with ignore_cc on the window stays valid*stale_mult (1s*4), so at ~2s
+        # with ignore the window stays valid*stale_mult (1s*4), so at ~2s
         # the entry is still STALE-served, not a hard miss. fresh = valid 1s
-        # (ignore_cc forces honor_cc off). beta 1 ~never rolls a refresh, so the
+        # (ignore forces honor off). beta 1 ~never rolls a refresh, so the
         # stale read is a clean STALE serve (no dice regen polluting origin).
         location /ccignmr/ {{
-            cache_turbo                       main;
-            cache_turbo_key                   $uri;
-            cache_turbo_valid                 1s;
-            cache_turbo_beta                  1;
-            cache_turbo_ignore_cache_control  on;
+            cache_turbo               main;
+            cache_turbo_key           $uri;
+            cache_turbo_valid         1s;
+            cache_turbo_beta          1;
+            cache_turbo_cache_control ignore;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
@@ -1041,12 +1031,12 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
-        # strip_all: every arg dropped, so all query strings share one slot
+        # strip "*": every arg dropped, so all query strings share one slot
         location /na/ {{
             cache_turbo          main;
             cache_turbo_key      $uri$cache_turbo_normalized_args;
             cache_turbo_valid    30s;
-            cache_turbo_normalize_strip_all on;
+            cache_turbo_normalize_strip "*";
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
@@ -1112,24 +1102,14 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
-        # cache_turbo_safe_key on (COR-1): no explicit cache_turbo_key, so the
-        # default key applies, but in safe mode it is $scheme$host$request_uri
-        # (full raw query, no strip/sort), so two distinct sessionid values get
-        # distinct entries instead of aliasing onto one stripped key.
+        # Raw-key migration (was cache_turbo_safe_key): an explicit
+        # $scheme$host$request_uri key keeps the full raw query (no strip/sort),
+        # so two distinct sessionid values get distinct entries instead of
+        # aliasing onto one normalized key.
         location /safekey/ {{
             cache_turbo          main;
+            cache_turbo_key      $scheme$host$request_uri;
             cache_turbo_valid    30s;
-            cache_turbo_safe_key on;
-            proxy_pass http://127.0.0.1:{origin_port}/;
-        }}
-
-        # cache_turbo_vary_safe on (SEC-4) with auto_vary OFF: a response carrying
-        # a Vary header is refused (not stored), since the key ignores it.
-        location /varysafe/ {{
-            cache_turbo          main;
-            cache_turbo_key      $request_uri;
-            cache_turbo_valid    30s;
-            cache_turbo_vary_safe on;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
@@ -1197,12 +1177,12 @@ http {{
         # [500,1000]) so it shows the SAME verdict re-clamped -- proving the
         # per-location band clamp. X-CT-Beta exposes the effective beta. /ato/ has
         # autotune OFF so it always shows the static preset beta regardless of the
-        # zone verdict (off-by-default). short interval so a window resolves fast.
+        # zone verdict (off-by-default). The recompute cadence is a fixed 30s;
+        # the tests force a recompute via the admin ?autotune=1 endpoint.
         location /at/ {{
             cache_turbo          at;
             cache_turbo_key      $uri;
             cache_turbo_autotune on;
-            cache_turbo_autotune_interval 3600s;
             cache_turbo_background_update off;   # autotune test: inline regen (see /atch/)
             add_header           X-CT-Beta $cache_turbo_beta always;
             proxy_pass http://127.0.0.1:{origin_port}/;
@@ -1212,7 +1192,6 @@ http {{
             cache_turbo_key      $uri;
             cache_turbo_preset   conservative;
             cache_turbo_autotune on;
-            cache_turbo_autotune_interval 3600s;
             cache_turbo_background_update off;   # autotune test: inline regen (see /atch/)
             add_header           X-CT-Beta $cache_turbo_beta always;
             proxy_pass http://127.0.0.1:{origin_port}/;
@@ -1236,7 +1215,6 @@ http {{
             cache_turbo_preset   conservative;
             cache_turbo_valid    1s;
             cache_turbo_autotune on;
-            cache_turbo_autotune_interval 3600s;
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
@@ -1246,7 +1224,6 @@ http {{
             cache_turbo          ati;
             cache_turbo_key      $uri;
             cache_turbo_autotune on;
-            cache_turbo_autotune_interval 3600s;
             cache_turbo_background_update off;   # autotune test: inline regen (see /atch/)
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
@@ -1264,7 +1241,6 @@ http {{
             cache_turbo_beta     5000;        # static dice beta: refresh is certain
             cache_turbo_lock_ttl 1s;
             cache_turbo_autotune on;
-            cache_turbo_autotune_interval 3600s;
             # bg-update OFF: this test drives a *flood* of stale re-reads (110 keys
             # x 4 cycles) purely to exercise the autotune churn gate; with SWR on
             # each would fire an async background-refresh subrequest, swamping a
@@ -2218,8 +2194,8 @@ def test_head_not_stored(ng: Nginx) -> None:
 
 
 def test_honor_cache_control(ng: Nginx) -> None:
-    """v7: with honor_cache_control on, the origin's max-age=1 shortens the fresh
-    TTL below the configured 60s — so the entry is stale at ~2s."""
+    """v7: with cache_turbo_cache_control honor, the origin's max-age=1 shortens
+    the fresh TTL below the configured 60s — so the entry is stale at ~2s."""
     _, _, h0 = fetch(ng.port, "/cc7/ttl1")
     assert "x-cache" not in h0, "first should miss"
     _, _, h1 = fetch(ng.port, "/cc7/ttl1")
@@ -2295,7 +2271,7 @@ def test_precise_maxage_token_parse(ng: Nginx) -> None:
 
 
 def test_ignore_cache_control_overrides_floor(ng: Nginx, origin: Origin) -> None:
-    """cache_turbo_ignore_cache_control on makes the response Cache-Control floor
+    """cache_turbo_cache_control ignore makes the response Cache-Control floor
     a no-op: a max-age=0 response (the ccmaxage0 marker) that /cc/ refuses to
     store is STORED under /ccign/ and served as a HIT at cache_turbo_valid.
     Mirrors nginx `proxy_ignore_headers Cache-Control`. The Set-Cookie floor is
@@ -2309,7 +2285,7 @@ def test_ignore_cache_control_overrides_floor(ng: Nginx, origin: Origin) -> None
 
 def test_ignore_cc_must_revalidate_keeps_stale_window(ng: Nginx,
                                                       origin: Origin) -> None:
-    """cache_turbo_ignore_cache_control on must neutralise the WHOLE response
+    """cache_turbo_cache_control ignore must neutralise the WHOLE response
     Cache-Control, including the must-revalidate token that would otherwise
     collapse the stale window at store. The origin emits
     "max-age=1, must-revalidate"; under /ccignmr/ (ignore_cc on, valid 1s, default
@@ -2330,20 +2306,6 @@ def test_ignore_cc_must_revalidate_keeps_stale_window(ng: Nginx,
          f"STALE at 2s, got X-Cache={h2.get('x-cache')} — window was collapsed")
     assert origin.hits == before, \
         "stale serve under ignore_cc unexpectedly hit origin (window collapsed?)"
-
-
-def test_x_cache_off_suppresses_header(ng: Nginx, origin: Origin) -> None:
-    """cache_turbo_x_cache off suppresses the X-Cache header while still serving
-    from cache. The second read carries NO X-Cache but DOES carry Age (Age is
-    RFC-meaningful and always emitted), which only the cache serve path sets — so
-    Age present is the proof it HIT despite the missing X-Cache."""
-    _, _, h1 = fetch(ng.port, "/xcoff/page")
-    assert "x-cache" not in h1, "first should miss"
-    _, _, h2 = fetch(ng.port, "/xcoff/page")
-    assert "x-cache" not in h2, \
-        f"x_cache off must suppress X-Cache on a HIT, got [{h2.get('x-cache')}]"
-    assert "age" in h2, \
-        "Age must still be emitted (served from cache) when x_cache is off"
 
 
 def test_valid_zero_is_forever(ng: Nginx, origin: Origin) -> None:
@@ -2442,10 +2404,11 @@ def test_206_never_cached(ng: Nginx, origin: Origin) -> None:
 
 
 def test_safe_key_distinct_sessionids(ng: Nginx, origin: Origin) -> None:
-    """COR-1: with cache_turbo_safe_key on, the default key is the full raw
-    request URI, so two distinct sessionid values get DISTINCT cache entries
-    instead of aliasing onto one stripped key (which could serve user A's page to
-    user B). The same sessionid still HITs its own entry."""
+    """Raw-key migration (was cache_turbo_safe_key): an explicit
+    cache_turbo_key $scheme$host$request_uri keeps the full raw query, so two
+    distinct sessionid values get DISTINCT cache entries instead of aliasing onto
+    one normalized key (which could serve user A's page to user B). The same
+    sessionid still HITs its own entry."""
     base = origin.hits
     _, ba, ha = fetch(ng.port, "/safekey/p?sessionid=AAA")
     assert "x-cache" not in ha, "first (sessionid=AAA) should miss"
@@ -2458,23 +2421,6 @@ def test_safe_key_distinct_sessionids(ng: Nginx, origin: Origin) -> None:
     assert ha2.get("x-cache") == "HIT" and ba2 == ba, \
         "the same sessionid must HIT its own entry"
 
-
-def test_vary_safe_refuses_varied_response(ng: Nginx, origin: Origin) -> None:
-    """SEC-4: with cache_turbo_vary_safe on and auto_vary off, a response that
-    carries a Vary header is refused (never stored), because the key does not
-    account for the varied axis — caching it would poison every client."""
-    base = origin.hits
-    _, _, h0 = fetch(ng.port, "/varysafe/p?v=ae")        # origin -> Vary: A-E
-    assert "x-cache" not in h0, "first should miss"
-    _, _, h1 = fetch(ng.port, "/varysafe/p?v=ae")
-    assert "x-cache" not in h1, \
-        f"a varied response must not be cached under vary_safe, got {h1.get('x-cache')}"
-    assert origin.hits == base + 2, "vary_safe wrongly cached a Vary response"
-    # control: a NON-varied response on the same location still caches normally.
-    _, _, h2 = fetch(ng.port, "/varysafe/plain")
-    _, _, h3 = fetch(ng.port, "/varysafe/plain")
-    assert h3.get("x-cache") == "HIT", \
-        f"a non-varied response must still cache under vary_safe, got {h3.get('x-cache')}"
 
 
 def test_conditional_inm_304(ng: Nginx, origin: Origin) -> None:
@@ -4144,7 +4090,8 @@ def test_normalize_strip_custom(ng: Nginx, origin: Origin) -> None:
 
 
 def test_normalize_strip_all(ng: Nginx, origin: Origin) -> None:
-    """cache_turbo_normalize_strip_all drops EVERY arg, so wholly different query
+    """cache_turbo_normalize_strip "*" drops EVERY arg (a bare '*' is a
+    zero-length prefix that matches every name), so wholly different query
     strings on the same path share one cache slot."""
     base = origin.hits
     _, b1, h1 = fetch(ng.port, "/na/x?anything=1&here=2")
@@ -4803,14 +4750,12 @@ def run_all(ng: Nginx, origin: Origin,
     test_precise_maxage_token_parse(ng)
     test_ignore_cache_control_overrides_floor(ng, origin)
     test_ignore_cc_must_revalidate_keeps_stale_window(ng, origin)
-    test_x_cache_off_suppresses_header(ng, origin)
     test_valid_zero_is_forever(ng, origin)
     test_vary_encoding_qvalue(ng, origin)
     test_auto_vary_unknown_axis_uncacheable(ng, origin)
     test_auto_vary_stale_marker_reachable(ng, origin)
     test_206_never_cached(ng, origin)
     test_safe_key_distinct_sessionids(ng, origin)
-    test_vary_safe_refuses_varied_response(ng, origin)
     test_conditional_inm_304(ng, origin)
     test_conditional_inm_list_short_first(ng, origin)
     test_conditional_inm_star(ng)
@@ -5012,8 +4957,7 @@ def main() -> int:
           "Accept-Encoding q-value (gzip;q=0 != gzip bucket), "
           "auto-Vary unknown-axis uncacheable, "
           "auto-Vary stale-marker still reachable, 206 never cached, "
-          "safe_key distinct sessionids (COR-1), "
-          "vary_safe refuses varied response (SEC-4), "
+          "raw-key distinct sessionids (explicit request_uri key), "
           "conditional 304 (v11: If-None-Match/*/mismatch, "
           "If-Modified-Since fresh/stale, INM-beats-IMS precedence), "
           "PURGE method, COR-5 auto-Vary variant purge (L1-only gen-bump), "

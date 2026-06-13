@@ -42,19 +42,18 @@ int
 LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 {
     /*
-     * First byte toggles strip_all (the "emit suffix only" early path);
-     * the rest is the query string. normalize_vary is held at 0 so the
-     * Vary-suffix path (which needs the live request) stays out — the
-     * attacker surface here is the arg splitter + buffer builder.
+     * The whole input is the query string. normalize_vary is held at 0 so the
+     * Vary-suffix path (which needs the live request) stays out — the attacker
+     * surface here is the arg splitter + buffer builder. The "emit suffix only"
+     * early path is reached on an empty input (r->args.len == 0).
      */
     ngx_http_cache_turbo_loc_conf_t clcf;
-    clcf.normalize_strip_all = (size && (data[0] & 1)) ? 1 : 0;
     clcf.normalize_vary      = 0;
     clcf.normalize_strip     = NGX_CONF_UNSET_PTR;
     g_fuzz_clcf = &clcf;
 
-    const uint8_t *args = (size > 1) ? data + 1 : NULL;
-    size_t         alen = (size > 1) ? size - 1 : 0;
+    const uint8_t *args = (size > 0) ? data : NULL;
+    size_t         alen = size;
 
     /* Exact-sized, non-NUL-terminated args buffer (>=1 byte, never NULL:
      * r->args.data is always a real buffer in production). */

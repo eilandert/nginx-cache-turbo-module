@@ -145,7 +145,6 @@ typedef struct {
 } ngx_http_request_t;
 
 typedef struct {
-    ngx_flag_t   normalize_strip_all;
     ngx_int_t    normalize_vary;
     void        *normalize_strip;
 } ngx_http_cache_turbo_loc_conf_t;
