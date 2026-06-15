@@ -101,7 +101,10 @@
 #define NGX_HTTP_CACHE_TURBO_CC_IGNORE   2
 
 /* Per-request serve outcome (ctx.status), surfaced by $cache_turbo_status.
- * MISS is 0 so a pcalloc'd ctx defaults to it; the serve/bypass paths override.
+ * Tokens mirror nginx $upstream_cache_status (HIT/MISS/EXPIRED/STALE/BYPASS).
+ * MISS is 0 so a pcalloc'd ctx defaults to it; the serve/bypass/expired paths
+ * override. EXPIRED = a cached entry was found past its serveable window and
+ * refetched (NOT a cold miss, NOT only-if-cached-504 which stays MISS).
  * Keep ngx_http_cache_turbo_status_str() in the .c in sync with these. */
 #define NGX_HTTP_CACHE_TURBO_ST_MISS     0
 #define NGX_HTTP_CACHE_TURBO_ST_HIT      1
@@ -691,7 +694,8 @@ typedef struct {
     /* Per-request serve outcome for $cache_turbo_status / access logging. One of
      * NGX_HTTP_CACHE_TURBO_ST_*; defaults to ST_MISS (0) via pcalloc and is
      * overridden to HIT/STALE at the X-Cache emit site, BYPASS on the
-     * auto-classify / cache_turbo_bypass paths, EXPIRED on an only-if-cached 504. */
+     * auto-classify / cache_turbo_bypass paths, EXPIRED when a cached entry is
+     * found past its serveable window (L1 or L2) and refetched from origin. */
     ngx_uint_t               status;
 } ngx_http_cache_turbo_ctx_t;
 

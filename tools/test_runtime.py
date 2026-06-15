@@ -843,6 +843,42 @@ http {{
             proxy_pass http://127.0.0.1:{origin_port}/;
         }}
 
+        # $cache_turbo_status STALE + EXPIRED: short fresh TTL (1s) so the
+        # default stale_mult 4 gives a 4s serveable window; beta 1 keeps the
+        # refresh dice at ~0 so a stale read is a clean STALE serve (not a
+        # refresh-to-HIT), and sleeping past 4s makes the entry EXPIRED.
+        location /ctstale/ {{
+            cache_turbo        main;
+            cache_turbo_key    $uri;
+            cache_turbo_valid  1s;
+            cache_turbo_beta   1;
+            add_header         X-CT-Status $cache_turbo_status always;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+        }}
+
+        # cc_mode (cache_turbo_cache_control) merge precedence: a child location
+        # with a CMS backend preset (cc_mode defaults to honor) under a parent
+        # that set `ignore` must resolve to HONOR, NOT inherit the parent ignore
+        # (the merged tri-state cannot represent "both" the way the old two-flag
+        # model accidentally did). honor respects the cacheability floor, so the
+        # origin's `private` response is NOT cached at the child; the parent
+        # (ignore) DOES cache it. Origin emits "private, max-age=60" for ccprivate.
+        location /ccinh/ {{
+            cache_turbo               main;
+            cache_turbo_key           $uri;
+            cache_turbo_valid         30s;
+            cache_turbo_cache_control ignore;
+            proxy_pass http://127.0.0.1:{origin_port}/;
+
+            location /ccinh/wp/ {{
+                cache_turbo         main;
+                cache_turbo_backend wordpress;
+                cache_turbo_key     $uri;
+                cache_turbo_valid   30s;
+                proxy_pass http://127.0.0.1:{origin_port}/;
+            }}
+        }}
+
         # no_store (v9): ?private=1 means the response is never stored
         location /nost/ {{
             cache_turbo          main;
@@ -2810,6 +2846,52 @@ def test_status_variable(ng: Nginx) -> None:
                           b2).group(1))
     assert after == before + 1, \
         f"bypasses_total should increment on a bypass: {before} -> {after}"
+
+
+def test_status_stale(ng: Nginx, origin: Origin) -> None:
+    """$cache_turbo_status = STALE while serving a stale copy. /ctstale/ has
+    beta 1 so the refresh dice ~never fires (the read stays a clean STALE serve
+    rather than flipping to a fresh HIT). Locks the ST_STALE arm of the var."""
+    fetch(ng.port, "/ctstale/s")                  # prime: MISS, fresh 1s
+    time.sleep(1.3)                               # past fresh, within the 4s stale
+    _, _, h = fetch(ng.port, "/ctstale/s")
+    assert h.get("x-ct-status") == "STALE", \
+        f"stale serve should report STALE, got {h.get('x-ct-status')}"
+    drain_origin(origin)       # settle any async bg refresh before the next test
+
+
+def test_status_expired(ng: Nginx, origin: Origin) -> None:
+    """$cache_turbo_status = EXPIRED when a cached entry is found past its whole
+    serveable window and refetched from origin — distinct from a cold MISS
+    (which test_status_variable covers). Locks the ST_EXPIRED arm + the
+    nginx-aligned semantics (EXPIRED != only-if-cached-504)."""
+    fetch(ng.port, "/ctstale/e")                  # prime: MISS, fresh 1s, stale to 4s
+    time.sleep(4.5)                               # past the entire 4s window
+    _, _, h = fetch(ng.port, "/ctstale/e")
+    assert h.get("x-ct-status") == "EXPIRED", \
+        f"expired-refetch should report EXPIRED, got {h.get('x-ct-status')}"
+    drain_origin(origin)
+
+
+def test_cc_mode_inheritance_child_preset_overrides_parent_ignore(
+        ng: Nginx, origin: Origin) -> None:
+    """cc_mode (cache_turbo_cache_control) merge precedence: a child with a CMS
+    backend preset (cc_mode defaults to honor) under a parent that set `ignore`
+    must resolve to HONOR, not inherit the parent's ignore. honor respects the
+    cacheability floor so the origin's `private` response is NOT cached at the
+    child; the parent (ignore) DOES cache it. Differential proves the child did
+    not inherit ignore (the old two-flag model would have cached the child too)."""
+    # parent (ignore): the private floor is bypassed -> cached -> HIT on re-read
+    fetch(ng.port, "/ccinh/ccprivate")
+    _, _, hp = fetch(ng.port, "/ccinh/ccprivate")
+    assert hp.get("x-cache") == "HIT", \
+        f"parent ignore must cache a private response; got {hp.get('x-cache')}"
+    # child (preset honor): the private floor is honored -> NOT cached -> no HIT
+    fetch(ng.port, "/ccinh/wp/ccprivate")
+    _, _, hc = fetch(ng.port, "/ccinh/wp/ccprivate")
+    assert hc.get("x-cache") != "HIT", \
+        ("child CMS-preset must resolve to honor (private NOT cached), not "
+         f"inherit parent ignore; got X-Cache={hc.get('x-cache')}")
 
 
 def test_no_store(ng: Nginx) -> None:
@@ -4818,6 +4900,9 @@ def run_all(ng: Nginx, origin: Origin,
     test_cache_and_purge_respect_access_control(ng)
     test_bypass(ng)
     test_status_variable(ng)
+    test_status_stale(ng, origin)
+    test_status_expired(ng, origin)
+    test_cc_mode_inheritance_child_preset_overrides_parent_ignore(ng, origin)
     test_no_store(ng)
     test_native_cache_headers_stripped(ng)
     test_admin_purge_post_with_body(ng)
@@ -5002,7 +5087,9 @@ def main() -> int:
           "conditional 304 (v11: If-None-Match/*/mismatch, "
           "If-Modified-Since fresh/stale, INM-beats-IMS precedence), "
           "PURGE method, COR-5 auto-Vary variant purge (L1-only gen-bump), "
-          "bypass + no_store, $cache_turbo_status (MISS/HIT/BYPASS + bypasses counter), "
+          "bypass + no_store, $cache_turbo_status (MISS/HIT/BYPASS + bypasses counter, "
+          "STALE serve, EXPIRED refetch), cc_mode inheritance (child preset honor "
+          "overrides parent ignore), "
           "native-cache headers stripped, "
           "admin purge w/ body, "
           "concurrency (R1), prometheus metrics (incl L2 hit/miss), "

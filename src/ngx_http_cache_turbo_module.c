@@ -1567,7 +1567,10 @@ ngx_http_cache_turbo_access_prologue(ngx_http_request_t *r,
     if (ngx_http_cache_turbo_request_revalidate(r)) {
         (void) ngx_atomic_fetch_add(&z->sh->misses, 1);
         if (ctx->req_only_if_cached) {
-            ctx->status = NGX_HTTP_CACHE_TURBO_ST_EXPIRED;
+            /* Nothing serveable without origin contact the client forbids:
+             * a cache miss from the client's view ($cache_turbo_status MISS,
+             * the pcalloc default). EXPIRED is reserved for the case where we
+             * DID find a cached entry but it was past its serveable window. */
             ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                            "cache_turbo: request revalidate + only-if-cached "
                            "\"%V\" -> 504", &r->uri);
@@ -1909,6 +1912,11 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
          * shared L2-consult/miss path below — another node may hold a fresher
          * copy in Redis, so we must check L2 before the origin (issue P6).
          *
+         * $cache_turbo_status: a cached entry WAS found but is past its
+         * serveable window -> EXPIRED (matches nginx $upstream_cache_status:
+         * expired-and-refetched, distinct from a true cold MISS). Overwritten
+         * to HIT/STALE below if L2 holds a serveable copy.
+         *
          * RFC 5861 §4 / RFC-2 stale-if-error (CTB4): before going to origin,
          * arm a serve-on-error snapshot if this blob still carries a window
          * (created + sie_ttl) that covers now. If the origin revalidation then
@@ -1916,6 +1924,8 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
          * instead of surfacing the error. Arming only STASHES — the L2 consult
          * below still runs first (a peer may hold a fresh copy). len > 0 skips a
          * stub; the !sie_armed guard makes the park/resume re-entries idempotent. */
+        ctx->status = NGX_HTTP_CACHE_TURBO_ST_EXPIRED;
+
         if (ctn->len > 0 && !ctx->sie_armed) {
             time_t    created = (time_t)
                 ngx_http_cache_turbo_get_u64(ctn->data + 24);
@@ -2007,6 +2017,11 @@ ngx_http_cache_turbo_access_handler(ngx_http_request_t *r)
                                        "key=%ui", &r->uri, (ngx_uint_t) hash);
                     }
                 }
+                /* L2 held this object but it is past its serveable window:
+                 * EXPIRED (a cached entry was found and refetched), not a cold
+                 * MISS. Covers the L1-absent / L1-evicted case where the L1
+                 * fall-through above never ran. */
+                ctx->status = NGX_HTTP_CACHE_TURBO_ST_EXPIRED;
                 ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                                "cache_turbo: L2 blob expired \"%V\" key=%ui "
                                "-> origin", &r->uri, (ngx_uint_t) hash);
@@ -5743,12 +5758,16 @@ static ngx_str_t  ngx_http_cache_turbo_active_name =
 
 
 /*
- * $cache_turbo_status — the per-request serve outcome, for access logging:
+ * $cache_turbo_status — the per-request serve outcome, for access logging.
+ * Tokens mirror nginx's $upstream_cache_status so the two can be graphed
+ * together:
  *   HIT     served fresh from L1/L2
  *   STALE   served stale while a refresh runs (incl. stale-if-error)
- *   MISS    went to origin (cold miss, store path, only-if-cached-absent)
+ *   EXPIRED a cached entry was found past its serveable window and refetched
+ *           from origin (distinct from a true cold miss)
+ *   MISS    no serveable entry anywhere -> origin (cold miss / store path), or
+ *           an only-if-cached request the cache could not satisfy (504)
  *   BYPASS  skipped to origin by cache_turbo_bypass or a CMS backend preset
- *   EXPIRED only-if-cached with nothing serveable -> 504
  * A request cache-turbo never engaged (cache off / not a main GET) resolves to
  * "-" (not_found). Drop it in a log_format, e.g.
  *   log_format ct '$request "$cache_turbo_status" $upstream_response_time';

@@ -352,11 +352,16 @@ variant. Off by default.
 > [What it will and won't cache](#what-it-will-and-wont-cache) — so encoding-keyed
 > caching is never actually needed.)
 
-> With auto-Vary **off**, the cache keys on the **request**, not on the
-> response's `Vary`. If your page differs by gzip-vs-brotli or
-> mobile-vs-desktop, either turn on `cache_turbo_auto_vary` or split the key
-> yourself with `cache_turbo_normalize_vary` (below) — otherwise the first
-> variant stored wins for everyone.
+> **If your origin emits `Vary`, turn `cache_turbo_auto_vary on`.** With
+> auto-Vary **off** (the default) the cache keys on the **request**, not on the
+> response's `Vary`, and there is **no safety net**: a `Vary:`-carrying response
+> is stored under a Vary-blind key and the first variant stored is served to
+> *every* client (gzip-vs-brotli, mobile-vs-desktop, language, …) — a
+> cache-poisoning / wrong-representation hazard (RFC 9110 §12.5.5). So for any
+> varied origin either enable `cache_turbo_auto_vary`, or fold the axis into the
+> key yourself with `cache_turbo_normalize_vary` (below) or an explicit
+> `cache_turbo_key`. (There is no `cache_turbo_vary_safe` refuse-to-store knob —
+> `auto_vary` is the supported mechanism.)
 
 ## CMS backends (`cache_turbo_backend`)
 
@@ -437,6 +442,14 @@ params (built-in denylist: `utm_*`, `fbclid`, `gclid`, `msclkid`, `mc_eid`,
 `cache_turbo_normalize_strip`, or nuke them all with
 `cache_turbo_normalize_strip *` (a bare `*` is a zero-length prefix that matches
 every arg name).
+
+> **Alias caveat.** Because the default key *strips* `sid`/`sessionid`/`ref` and
+> *sorts* the rest, two distinct URLs that differ only in a stripped param (e.g.
+> two `?sessionid=` values) collapse onto **one** entry. That is the point for
+> tracking junk, but it is wrong if the origin actually keys private content off
+> such a param without marking it `private`/`Set-Cookie`. For those origins use a
+> raw, no-strip/no-sort key so distinct queries never alias:
+> `cache_turbo_key $scheme$host$request_uri;`.
 
 ```nginx
 cache_turbo_key             $host$uri$cache_turbo_normalized_args;
@@ -789,7 +802,7 @@ http {
 | `$cache_turbo_normalized_args` | The request's query string with tracking params stripped and the rest sorted, plus the optional Vary bucket (`cache_turbo_normalize_vary`). The default cache key's args component. |
 | `$cache_turbo_active` | `1` when cache-turbo is engaged for this request (enabled, cacheable method, main request) **and** `cache_turbo_suppress_native on`; else `0`. Wire it into a stacked `proxy_cache` via `proxy_no_cache`/`proxy_cache_bypass` so the native cache defers. |
 | `$cache_turbo_beta` | The effective refresh `beta` ×1000 in force for this request (preset/explicit/autotuned). Handy for debugging/logging. |
-| `$cache_turbo_status` | The per-request serve outcome, for access logging: `HIT`, `STALE` (incl. stale-if-error), `MISS`, `BYPASS` (`cache_turbo_bypass` or a CMS backend preset), or `EXPIRED` (only-if-cached with nothing serveable → 504). `-` when cache-turbo never engaged. E.g. `log_format ct '$request "$cache_turbo_status" rt=$request_time';`. |
+| `$cache_turbo_status` | The per-request serve outcome, for access logging. Tokens mirror nginx's `$upstream_cache_status` so the two graph together: `HIT` (served fresh), `STALE` (served stale while refreshing, incl. stale-if-error), `EXPIRED` (a cached entry was found past its serveable window and refetched from origin), `MISS` (no serveable entry anywhere → origin, or an only-if-cached request the cache couldn't satisfy → 504), `BYPASS` (`cache_turbo_bypass` or a CMS backend preset skipped to origin). `-` when cache-turbo never engaged. E.g. `log_format ct '$request "$cache_turbo_status" rt=$request_time';`. |
 
 ### Admin endpoint verbs
 
