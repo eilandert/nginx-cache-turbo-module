@@ -21,7 +21,7 @@ name: Fuzzing
 
 on:
   schedule:
-    - cron: "11 5 1 * *"   # 05:11 on the 1st of each month
+    - cron: "41 3 1 * *"
   workflow_dispatch:
     inputs:
       duration:
@@ -30,7 +30,7 @@ on:
         default: "900"
 
 concurrency:
-  group: fuzz-${{ github.ref }}
+  group: fuzz-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:

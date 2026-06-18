@@ -5,10 +5,8 @@ env:
   NGINX_VERSION: "1.31.1"
 
 on:
-  # Heavy job: monthly on a schedule + manual only. NOT on every push/PR
-  # (build-test.yml carries the per-change static checks: cppcheck, -Werror).
   schedule:
-    - cron: "47 4 1 * *"   # 04:47 on the 1st of each month
+    - cron: "47 4 1 * *"
   workflow_dispatch: {}
 
 concurrency:
@@ -26,10 +24,6 @@ jobs:
     permissions:
       contents: read
       security-events: write
-      # codeql-action's finalize step GETs the workflow run (telemetry/status)
-      # via the Actions API; on a PRIVATE repo the default token 403s without
-      # this, failing the job even though analysis ran clean + upload:never.
-      actions: read
     steps:
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -57,7 +51,3 @@ jobs:
         uses: github/codeql-action/analyze@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4
         with:
           category: /language:c-cpp
-          # SARIF upload to code-scanning needs GitHub Advanced Security, which
-          # is unavailable on private repos. Analyze-only here; flip to the
-          # default (upload) when this repo goes public.
-          upload: never

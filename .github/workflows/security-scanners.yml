@@ -1,30 +1,23 @@
 name: Security Scanners
 
 # flawfinder + clang-tidy + semgrep over the C sources, SARIF uploaded to the
-# Security tab. Heavy job: monthly on a schedule + manual, PLUS an ADVISORY run
-# on every PR (CI-2). The per-PR run is non-blocking: every scan step ends in
-# `|| true` and the job is `continue-on-error`, so it can never gate a merge —
-# it only surfaces findings to the Security tab early instead of up to a month
-# later. The slow-cadence concern that kept this monthly is respected: the run
-# costs runner time but cannot stall a PR. build-test.yml still carries the fast
-# per-change static checks (cppcheck, clang --analyze, -Wall -Wextra -Wshadow
-# -Werror); this adds the deep scanners as advisory-only signal.
+# Security tab. Heavy job: monthly on a schedule + manual only. build-test.yml
+# carries the fast per-change static checks (cppcheck, clang --analyze, -Wall
+# -Wextra -Wshadow -Werror); this adds the deep scanners on a slow cadence.
 #
 # Third-party actions pinned to commit SHAs (same pins as the other workflows):
 # actions/checkout@v5             -> 93cb6efe18208431cddfb8368fd83d5badbf9bfd
 # actions/upload-artifact@v5      -> 330a01c490aca151604b8cf639adc76d48f6c5d4
 # actions/cache@v4                -> 0057852bfaa89a56745cba8c7296529d2fc39830
-# github/codeql-action@v4         -> 8aad20d150bbac5944a9f9d289da16a4b0d87c1e
+# github/codeql-action/upload-sarif@v4 -> 8aad20d150bbac5944a9f9d289da16a4b0d87c1e
 
 on:
   schedule:
-    - cron: "23 5 1 * *"   # 05:23 on the 1st of each month
-  pull_request:
-    branches: [main]       # CI-2: advisory per-PR run (continue-on-error below)
+    - cron: "17 4 1 * *"
   workflow_dispatch: {}
 
 concurrency:
-  group: security-${{ github.ref }}
+  group: security-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
